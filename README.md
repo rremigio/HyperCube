@@ -146,7 +146,7 @@ One of the two main use cases for HyperCube is intuitive/dynamic spectral fittin
 
 # Troubleshooting
 
-*work in progress*
+If you get the "UnboundLocalError: cannot access local variable 'piecewise_model' where it is not associated with a value" error, it means you need to add a model to the HyperCube_ModelFunctions.py file because it doesn't yet include a model for your Nregions+Nlines, e.g., it doesn't have one already for 3 continuum regions with one line each (Nregions=3,Nlines=3) -- you'd need to add it manually (following the syntax of the other models in that script).
 
 # Acknowledging HyperCube
 If you used HyperCube in your research, please consider acknowledging the use of the tool by including this text in your publications:
