@@ -77,7 +77,11 @@ The spectrum viewer panel shows the spectrum contained in the currently-selected
 ### Draw Continuum and Gaussians to Initialize a Model
 Select and lock onto a spaxel containing a spectrum with nice, bright emission lines (in **Fig. 1**, we've locked onto position x=16, y=10), then zoom into the Hα-[N II] line complex (6940--7040 Å). With the cursor hovered over the continuum at ~6950 Å, press the `d` key to start placing your linear continuum model. One end of the line remains locked at the initial position, while the free end follows the cursor. Move to the continuum at ~7030 Å and press the `d` key once more to lock in the continuum model; this will bring up the parameter window which we can ignore for now.
 
+<div align="center">
+  <picture>
 <img width="985" alt="Screenshot 2025-04-15 at 12 28 36 PM" src="https://github.com/user-attachments/assets/e0862f7a-3ea1-4185-8827-fb76939fa7d2" />
+  </picture>
+</div>
 
 **Figure 1:** <em>HyperCube visualizer window showing the white light image of IRAS F23365+3604 (left) and spectrum of spaxel (x,y)=(16,10) zoomed into the Hα-[N II] region of the spectrum (right). The solid green and orange dashed lines overlaid on the spectrum represent the currently-defined model and model components, respectively.</em>
 
@@ -99,13 +103,21 @@ For this simple example, let's leave the parameter limits at their initial value
 ### Inspecting the Fit
 First, let's visually inspect the model fit to the spectrum by bringing back the Visualizer window. Unlock the current spaxel in the white light image by pressing `L`, then, as the cursor moves around the image the Spectrum Viewer window will show the spectrum and the best fit model (**Fig. 3**). The total model is represented with a solid red line and the individual Gaussians are each assigned a unique color. The reduced chi-square value of the fit is shown to the top-right of the Spectrum Viewer panel. 
 
+<div align="center">
+  <picture>
 <img width="947" alt="Screenshot 2025-04-15 at 1 24 10 PM" src="https://github.com/user-attachments/assets/2cef7095-efaf-425b-a806-6a7d149482d8" />
+  </picture>
+</div>
 
 **Figure 3:** <em>After fitting the cube, the Spectrum Viewer panel (right) shows the spectrum + best-fitting model in the spaxel currently highlighted in the Image Viewer panel (left). The total model is shown in red, model components are shown with dashed lines colored-coded according to the Fit Parameters window. The reduced Chi-square value for the fit is shown to the top-right of the Spectrum Viewer panel.</em>
 
 To inspect the fitted values of each parameter for each model component, e.g., the continuum slope or the amplitude (flux density) of the Hα line, bring the Fit Parameters Window forward. Like the Spectrum Viewer panel, the fitted values will update in realtime to reflect the best-fit model in the currently-selected spaxel in the Image Viewer panel. Any of the parameter_fit buttons can be pressed to show the spatially-resolved map of that fitted parameter in the Image Viewer panel (**Fig. 4**). 
 
+<div align="center">
+  <picture>
 <img width="645" alt="Screenshot 2025-04-15 at 1 39 13 PM" src="https://github.com/user-attachments/assets/8b95f6ed-698c-49f4-b1dc-b8eb1fa4cf06" />
+  </picture>
+</div>
 
 **Figure 4:** <em>Visualizing the fitted values of your model spatially is as easy as clicking the button corresponding to the parameter.</em>
 
