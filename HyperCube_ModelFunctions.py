@@ -70,7 +70,17 @@ def model_chooser(Nregions,Nlines):
             pass
         if Nlines == 10:
             pass
-            
+    
+    if Nregions == 4:
+        if Nlines == 1:
+            pass
+        if Nlines == 2:
+            pass
+        if Nlines == 3:
+            pass
+        if Nlines == 8:
+            piecewise_model = piecewise_model_4regions_8gaussians
+    
     return piecewise_model
 
 
@@ -526,4 +536,42 @@ def piecewise_model_5regions_5gaussians(x,
 #---------
 
 
+def piecewise_model_4regions_8gaussians(x, 
+                                        x1_start, x1_end, x2_start, x2_end, x3_start, x3_end, x4_start, x4_end,
+                                        slope1, intercept1, slope2, intercept2, slope3, intercept3, slope4, intercept4,
+                                        amp1, cen1, sigma1,
+                                        amp2, cen2, sigma2,
+                                        amp3, cen3, sigma3,
+                                        amp4, cen4, sigma4,
+                                        amp5, cen5, sigma5,
+                                        amp6, cen6, sigma6,
+                                        amp7, cen7, sigma7,
+                                        amp8, cen8, sigma8,
+                                        NR1, NR2, NR3, NR4):
+
+    # Store Gaussian parameters
+    gaussians = [(amp1, cen1, sigma1), (amp2, cen2, sigma2), (amp3, cen3, sigma3), 
+                 (amp4, cen4, sigma4), (amp5, cen5, sigma5), (amp6, cen6, sigma6),
+                 (amp7, cen7, sigma7), (amp8, cen8, sigma8)]
+
+    # Identify regions
+    region1 = (x >= x1_start) & (x < x1_end)
+    region2 = (x >= x2_start) & (x < x2_end)
+    region3 = (x >= x3_start) & (x < x3_end)
+    region4 = (x >= x4_start) & (x < x4_end)
+
+    # Precompute Gaussians for each region
+    R1 = slope1 * x[region1] + intercept1 + sum_gaussians(x[region1], gaussians[:NR1], NR1)
+    R2 = slope2 * x[region2] + intercept2
+    R3 = slope3 * x[region3] + intercept3 + sum_gaussians(x[region3], gaussians[NR1:], NR2)
+    R4 = slope4 * x[region4] + intercept4 + sum_gaussians(x[region4], gaussians[NR2+NR3:], NR4)
+
+    # Assemble output
+    y_fit = np.zeros_like(x)
+    y_fit[region1] = R1
+    y_fit[region2] = R2
+    y_fit[region3] = R3
+    y_fit[region4] = R4
+
+    return y_fit
 
