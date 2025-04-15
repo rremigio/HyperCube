@@ -8,6 +8,28 @@
 
 HyperCube is a python-based spectral fitting tool designed to make integral field spectroscopic (IFS), or hyperspectral data analysis more interactive and intuitive, while preserving automation and repeatability. The tool combines a user-friendly [PyQT5](https://github.com/PyQt5) GUI with the robust and flexible fitting capabilities of [lmfit](https://github.com/lmfit/lmfit-py), and is particularly well-suited for interactive and batch process spectral modeling of 3D spectral data.
 
+
+---
+
+## Table of Contents
+1. [Installation](#installation)
+   - [Python Version](#python-version)
+   - [Standalone Version](#standalone-version)
+2. [Quick Start Guide](#quick-start-guide)
+3. [Interactive Usage Mode](#interactive-usage-mode)
+   - [Initiating Models Interactively](#initiating-models-interactively)
+   - [Adjusting Model Parameters Interactively](#adjusting-model-parameters-interactively)
+   - [Relational Constraints](#relational-constraints)
+4. [Pipeline Usage Mode](#pipeline-usage-mode)
+   - [Initiating Models with Configuration Files](#initiating-models-with-configuration-files)
+   - [Batch Processing](#batch-processing)
+4. [Troubleshooting](#troubleshooting)
+5. [Acknowledging HyperCube](#acknowledging-hypercube)
+
+---
+
+
+
 # Installation
 Installation and use of this tool has been tested on MacOS and Windows, it has not yet been tested on Linux operating systems. The first step is to clone the repository to a directory on your local machine where you have read/write/execute privileges. 
 
@@ -52,7 +74,29 @@ As the cursor is moved around the image, an orange rectangle indicates the curre
 ### Interacting the the Spectrum Viewer Panel
 The spectrum viewer panel shows the spectrum contained in the currently-selected spaxel. You can zoom into a portion of the spectrum by clicking and dragging across the spectrum. As you do, a grey rectangular region will indicate the range that will be zoomed to when you release click. The new horizontal (spectral) range reflects the one you selected, while the new vertical (signal or flux) range is auto-scaled to show the continuum and the peaks of any lines in that spectral window. Right-click anywhere on the spectrum to bring up a `reset zoom` button which can be clicked to set the spectrum viewer window to its original range.
 
-## Acknowledging HyperCube
+
+# Interactive Usage Mode
+
+### Initiating Models Interactively
+
+### Adjusting Model Parameters Interactively
+
+### Relational Constraints
+
+
+# Pipeline Usage Mode
+
+### Initiating Models with Configuration Files
+
+### Batch Processing
+
+*work in progress*
+
+# Troubleshooting
+
+*work in progress*
+
+# Acknowledging HyperCube
 If you used HyperCube in your research, please consider acknowledging the use of the tool by including this text in your publications:
 
 _This research has made use of HyperCube, the interactive analysis tool for integral field spectroscopic data, written by Justin A Kader._
