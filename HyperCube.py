@@ -520,6 +520,7 @@ class ViewerWindow(QMainWindow):
         self.fit_params_window = None  # Placeholder, initially None
         self.fits_header = None
         self.fits_data = None
+        self.is_1d_spectrum = False
         self.current_spaxel = None  # Stores the currently highlighted spaxel (x, y)
         self.locked = False  # Initially unlocked
         self.spectrum_cursor_pos = None  # Add tracking for spectrum cursor position
@@ -625,7 +626,7 @@ class ViewerWindow(QMainWindow):
         if self.locked:
             return  # Do nothing if locked
         
-        if event.inaxes:
+        if (event.inaxes) and (self.is_1d_spectrum == False):
             x, y = int(event.xdata), int(event.ydata)
             self.cursor_pos = (x, y)
             
@@ -731,92 +732,100 @@ class ViewerWindow(QMainWindow):
 
 
     def open_fits_file(self):
-        """Opens a FITS file and stores header & data"""
+        """Opens a FITS file and stores header & data, handling both 1D spectra and 3D cubes"""
         global FITS_HEADER, FITS_DATA, wavelengths, snr_map
         print('Opening file...')
         options = QFileDialog.Options()
         file_path, _ = QFileDialog.getOpenFileName(self, "Open File", "", "FITS Files (*.fits);;All Files (*)", options=options)
         
-        # file_path = '../../Images/IIIZw035/IIIZw035_coadd_BH1L.fits'
-        # file_path = '../../Images/IIIZw035/IIIZw035_coadd_BH1L_crop.fits'
-        # file_path = '../../Images/IIIZw035/IIIZw035_coadd_RH2L_crop.fits'
-        # file_path = '../../Images/IIIZw035/IIIZw035_coadd_RH2L_northernComp.fits'
-        # file_path = '../../Images/VV114/MUSE_Deep_20161013_WCSFix.fits'
-        # file_path = '../../Images/VV114/VV114_MUSE_Crop5.fits'
-        # file_path = '../../Images/Mrk273/Mrk273_coadd_BH3L.fits'
-        # file_path = '../../Images/IRAS_F09320+6134/UGC05101_coadd_BH1L.fits'
+        # file_path = '../Tables/Clump001_SingleExt_r0.1as.fits'
         
         if file_path:
             with fits.open(file_path) as hdul:
                 self.fits_header = None
                 self.fits_data = None
-        
-                # Try to find a valid WCS header
+                self.is_1d_spectrum = False  # Flag for 1D data
+    
+                # Try to find a valid data extension
                 for ext in range(len(hdul)):
                     header = hdul[ext].header
                     data = hdul[ext].data
-        
+    
                     # Skip extensions with no usable data
-                    if data is None or np.size(data) <= 1:
+                    if data is None:
                         continue
-                    
-                    # Check for common WCS keywords
-                    if all(key in header for key in ['CRVAL1', 'CRVAL2', 'CTYPE1', 'CTYPE2']):
-                        print(f"Using WCS from extension {ext}")
+                        
+                    # Check if data is 1D spectrum
+                    if data.ndim == 1:
+                        print(f"Found 1D spectrum in extension {ext}")
                         self.fits_header = header
                         self.fits_data = data
-                        break  # Stop searching once a valid WCS is found
-                
-                # If no valid WCS was found, default to the primary extension
-                if self.fits_header is None:
-                    print("No valid WCS found, defaulting to primary extension.")
-                    self.fits_header = hdul[0].header
-                    self.fits_data = hdul[0].data if np.size(hdul[0].data) > 1 else hdul[1].data
-                    
-                    
-                    
-                    
-                    
-                FITS_HEADER = self.fits_header
-                FITS_DATA = self.fits_data# * 1E19
-                print("FITS file loaded successfully!")
-                self.draw_image(FITS_DATA,cmap='Grays',scale='linear',from_fits=True)
-                
-                # Initialize WCS from the FITS header
-                self.wcs = WCS(self.fits_header)
-                
-                # Initiate SNR map
-                num_wavelengths, nx, ny = np.shape(FITS_DATA)  # Cube dimensions
-                snr_map = np.zeros((nx, ny)) + 1E8
-                
-                # Extract spectral information
-                spectral_unit_keys = ["CUNIT3", "BUNIT", "SPECSYS"]
-                specunit = None
-                for key in spectral_unit_keys:
-                    if key in FITS_HEADER:
-                        specunit = FITS_HEADER[key]
+                        self.is_1d_spectrum = True
                         break
+                    # Check for 3D cube with WCS
+                    elif data.ndim == 3 and all(key in header for key in ['CRVAL1', 'CRVAL2', 'CTYPE1', 'CTYPE2']):
+                        print(f"Using 3D cube from extension {ext}")
+                        self.fits_header = header
+                        self.fits_data = data
+                        break
+                
+                # Fallback to primary extension if no valid data found
+                if self.fits_header is None:
+                    print("No valid extension found, defaulting to primary.")
+                    self.fits_header = hdul[0].header
+                    self.fits_data = hdul[0].data if hdul[0].data is not None else hdul[1].data
+                    if self.fits_data.ndim == 1:
+                        self.is_1d_spectrum = True
     
-                if specunit:
-                    specunit = specunit.lower()
+                FITS_HEADER = self.fits_header
+                FITS_DATA = self.fits_data
                 
-                if specunit == 'angstrom': specunit = r'$\rm{\AA}$'
-                if specunit == 'micron': specunit = r'$\mu$m'
+                # Handle 1D spectrum case
+                if self.is_1d_spectrum:
+                    print("1D spectrum detected - special handling")
+                    # Create dummy 2D array for visualization
+                    dummy_2d = np.tile(FITS_DATA, (10, 1)).T  # Transposed for orientation
+                    self.draw_image(dummy_2d, cmap='Grays', scale='linear', from_fits=False)
+                    
+                    # Extract wavelength info from header
+                    if 'CRVAL1' in FITS_HEADER:
+                        wavelengths = (FITS_HEADER['CRVAL1'] + 
+                                     FITS_HEADER.get('CDELT1', 1) * 
+                                     (np.arange(len(FITS_DATA)) - FITS_HEADER.get('CRPIX1', 1) + 1))
+                    else:
+                        wavelengths = np.arange(len(FITS_DATA))
+                    
+                    # Initialize dummy WCS and SNR map
+                    self.wcs = WCS(naxis=2)
+                    snr_map = np.zeros((10, 10))  # Dummy SNR map
+                    
+                    # Show the spectrum
+                    spectrum = FITS_DATA
+                    self.update_spectrum_panel(spectrum)
+                    
+                else:  # 3D cube case
+                    print("3D datacube detected - standard handling")
+                    self.draw_image(FITS_DATA, cmap='Grays', scale='linear', from_fits=True)
+                    self.wcs = WCS(self.fits_header)
+                    
+                    # Initialize SNR map
+                    _, nx, ny = FITS_DATA.shape
+                    snr_map = np.zeros((nx, ny)) + 1E8
+                    
+                    # Extract spectral axis info
+                    spectral_sampling = FITS_HEADER.get('CDELT3', FITS_HEADER.get('CD3_3', 1))
+                    wavelengths = (FITS_HEADER['CRVAL3'] + 
+                                 spectral_sampling * 
+                                 (np.arange(FITS_DATA.shape[0]) - FITS_HEADER.get('CRPIX3', 1) + 1))
+    
+                # Extract observation info
+                source_name = FITS_HEADER.get('OBJECT', '')
+                source_redshift = FITS_HEADER.get('REDSHIFT', '')
+                resolving_power = FITS_HEADER.get('RESOLVINGP', '')
                 
-                # Determine spectral axis and sampling
-                spectral_sampling = FITS_HEADER.get('CDELT3', FITS_HEADER.get('CD3_3', None))
-                if spectral_sampling is None:
-                    raise ValueError("Unable to determine spectral sampling method")
-                
-                wavelengths = FITS_HEADER['CRVAL3'] + spectral_sampling * (np.arange(FITS_DATA.shape[0]) - FITS_HEADER['CRPIX3'] + 1)
-                
-                # Extract additional information for the observation
-                source_name = FITS_HEADER.get('OBJECT', '')  # Assuming 'OBJECT' holds the source name
-                source_redshift = FITS_HEADER.get('REDSHIFT', '')  # Assuming 'REDSHIFT' holds the redshift
-                resolving_power = FITS_HEADER.get('RESOLVINGP', '')  # Assuming 'RESOLVINGP' holds resolving power
-                
-                # Append extracted data to df_obs
+                # Update observation DataFrame
                 df_obs.loc[0] = [source_name, source_redshift, resolving_power]
+                print("FITS file loaded successfully!")
 
 
 
@@ -870,23 +879,24 @@ class ViewerWindow(QMainWindow):
         """Update the RA, Dec, X, Y, N values displayed on the buttons based on mouse position."""
         
         # Call pixel_to_ra_dec to get RA, Dec from pixel coordinates
-        ra, dec = self.pixel_to_ra_dec(x, y)
-        
-        # Convert RA and Dec to sexagesimal format
-        ra_sexagesimal = self.decimal_to_sexagesimal(ra, is_ra=True)  # Explicitly pass `is_ra=True`
-        dec_sexagesimal = self.decimal_to_sexagesimal(dec, is_ra=False)  # Explicitly pass `is_ra=False`
-        
-        # Update RA and Dec buttons with the calculated values
-        self.fit_params_window.ra_button.setText(f"RA: {ra_sexagesimal}")
-        self.fit_params_window.dec_button.setText(f"Dec: {dec_sexagesimal}")
-        
-        # Optionally, update other buttons like X, Y, N with appropriate values if needed
-        self.fit_params_window.x_button.setText(f"X: {x}")
-        self.fit_params_window.y_button.setText(f"Y: {y}")
-        
-        # If you have additional functionality for the N button, you can update it as needed.
-        n = self.get_spaxel_number(x, y)
-        self.fit_params_window.n_button.setText(f"N: {n}")
+        if self.is_1d_spectrum == False:
+            ra, dec = self.pixel_to_ra_dec(x, y)
+            
+            # Convert RA and Dec to sexagesimal format
+            ra_sexagesimal = self.decimal_to_sexagesimal(ra, is_ra=True)  # Explicitly pass `is_ra=True`
+            dec_sexagesimal = self.decimal_to_sexagesimal(dec, is_ra=False)  # Explicitly pass `is_ra=False`
+            
+            # Update RA and Dec buttons with the calculated values
+            self.fit_params_window.ra_button.setText(f"RA: {ra_sexagesimal}")
+            self.fit_params_window.dec_button.setText(f"Dec: {dec_sexagesimal}")
+            
+            # Optionally, update other buttons like X, Y, N with appropriate values if needed
+            self.fit_params_window.x_button.setText(f"X: {x}")
+            self.fit_params_window.y_button.setText(f"Y: {y}")
+            
+            # If you have additional functionality for the N button, you can update it as needed.
+            n = self.get_spaxel_number(x, y)
+            self.fit_params_window.n_button.setText(f"N: {n}")
         
         
         for line in self.spectrum_ax.get_lines():
@@ -1239,13 +1249,13 @@ class ViewerWindow(QMainWindow):
         dx = event.xdata - self.gaussian_x0
         dy = event.ydata
     
-        self.gaussian_sigma = max(0.01, abs(dx))  # Sigma changes with horizontal movement
+        self.gaussian_sigma = max(0.0001, abs(dx))  # Sigma changes with horizontal movement
     
         # Compute the continuum level at the Gaussian's center position
         y_continuum_x0 = self.m * self.gaussian_x0 + self.b
     
         # Adjust amplitude so that peak of the Gaussian reaches dy
-        self.gaussian_amplitude = max(0.001, dy - y_continuum_x0)
+        self.gaussian_amplitude = max(0.00001, dy - y_continuum_x0)
     
         # Generate updated Gaussian + Line function
         x_vals = np.linspace(self.x1, self.x2, 1000)
@@ -1421,8 +1431,10 @@ class ViewerWindow(QMainWindow):
                 line_obj.set_data(x_vals, y_new)
                 
             
-            
-            new_line, = self.spectrum_ax.plot(x_vals, y_new, color='red', lw=0.5,label=f'rChi2 = {row["rchisq"]}')
+            if self.is_1d_spectrum == False:
+                new_line, = self.spectrum_ax.plot(x_vals, y_new, color='red', lw=0.5,label=f'rChi2 = {row["rchisq"]}')
+            else:
+                new_line, = self.spectrum_ax.plot(x_vals, y_new, color='red', lw=0.5)
             df_cont.loc[np.int64(df_cont["region_ID"]) == region_ID, 'lineactor'] = new_line  # Update reference
             
             self.spectrum_ax.legend()
@@ -2715,10 +2727,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     def fit_spaxel(self,z,max_nfev=256,params_to_use=None):
         global df_fit, df, df_cont
         
-        spectrum = self.viewer_window.get_spectrum_at_spaxel(
-            self.viewer_window.current_spaxel[0], self.viewer_window.current_spaxel[1]
-        )
-        
+        if self.viewer_window.is_1d_spectrum == False:
+            spectrum = self.viewer_window.get_spectrum_at_spaxel(
+                self.viewer_window.current_spaxel[0], self.viewer_window.current_spaxel[1]
+            )
+        else:
+            spectrum = FITS_DATA
+            
         spectrum = np.nan_to_num(spectrum)
         
         # Constants for velocity calculation
@@ -2905,7 +2920,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     def fit_cube(self, refit=False, rchisq_thresh=None):
         global df, df_fit, fit_results, snr_mask, piecewise_model, line, new_results#,params
         
-        nx, ny = np.shape(FITS_DATA)[2], np.shape(FITS_DATA)[1]
+        if self.viewer_window.is_1d_spectrum == False:
+            nx, ny = np.shape(FITS_DATA)[2], np.shape(FITS_DATA)[1]
+        else:
+            nx = 1
+            ny = 1
+            
         total_spaxels = nx * ny
     
         app = QApplication.instance() or QApplication([])
@@ -3005,7 +3025,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     
         # print("\nParameters with Constraints:")
         # params.pretty_print()
-        
+        print(f'Nregions={Nregions}, Nlines={Nlines}')
         piecewise_model = Model(HyperCube_ModelFunctions.model_chooser(Nregions, Nlines))
         
         if len(fit_results) > 0 and not refit:
@@ -3147,6 +3167,18 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         df_fit['color'] = df_fit['LineID'].map(lineid_to_color)
         
         progress_window.close()
+        
+        self.viewer_window.update_buttons(0,0)
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         print("Fitting complete for entire cube.")
 
         
@@ -3971,7 +4003,11 @@ def main():
             splash.finish(viewer)
             viewer.show()
         
+<<<<<<< HEAD
+        QTimer.singleShot(100, show_main_window)
+=======
         QTimer.singleShot(2000, show_main_window)
+>>>>>>> 633dd5433d62a9cfbf5660ee803befbf0c8a11ca
         print("Timer set")
         
         print("Entering main loop")
