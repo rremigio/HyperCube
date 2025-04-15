@@ -112,9 +112,10 @@ To inspect the fitted values of each parameter for each model component, e.g., t
 If you are not satisfied with the fit, you can specify parameter limits or parameter constraints to obtain a better result. You can also reset your initial parameter guesses by pressing the red delete button at the far-right of each row of buttons, and retry drawing the Gaussian on the spectrum. In the current version, it is recommended to restart the program, load the FITS file, open the Fit Parameters window and use `Cmd-O` (mac) or `Ctr-O` (win) to load your original configuration.
 
 ### Outputting the Fit ###
-If you are satisfied with the cube fit, you can save the result to a csv table and/or a multi-extension FITS file. To do this, bring forward the Fit Parameters window and look at the Spectral Fitting panel. Here, you will find the `Save Cube Fit` and `Save Fit to FITS File` buttons, which output the fit to csv and FITS files, respectively. You can always view your fit result in HyperCube at a later time by opening the tool, loading the original FITS cube, opening the Fit Parameters window, and clicking `Load Cube Fit` button.
+If you are satisfied with the cube fit, you can save the result to a csv table and/or a multi-extension FITS file. To do this, bring forward the Fit Parameters window and look at the Spectral Fitting panel. Here, you will find the `Save Cube Fit` and `Save Fit to FITS File` buttons, which output the fit to csv and FITS files, respectively. You can always view your fit result in HyperCube at a later time by opening the tool, loading the original FITS cube, opening the Fit Parameters window, and clicking the `Load Cube Fit` button.
 
 # Interactive Usage Mode
+One of the two main use cases for HyperCube is intuitive/dynamic spectral fitting (or data exploration), the other being automated/batch spectral fitting (described below in the [Pipeline Usage Mode](#pipeline-usage-mode) section). In interactive mode, spectral fitting more or less follows the steps outlined in the [Quick Start Guide](#quick-start-guide), i.e., we dynamically place continuum+line sets using the cursor and specify parameter values, names, limits, and constraints using the interactive GUI. *This usage mode is ideal for quick exploration of data cubes where visual feedback is critical.*
 
 ### Initiating Models Interactively
 
