@@ -4003,11 +4003,9 @@ def main():
             splash.finish(viewer)
             viewer.show()
         
-<<<<<<< HEAD
+
         QTimer.singleShot(100, show_main_window)
-=======
-        QTimer.singleShot(2000, show_main_window)
->>>>>>> 633dd5433d62a9cfbf5660ee803befbf0c8a11ca
+
         print("Timer set")
         
         print("Entering main loop")
