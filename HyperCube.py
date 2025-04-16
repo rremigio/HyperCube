@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QPushButton, QLineEdit, QScrollArea, QGridLayout,
     QWidget, QLabel, QFrame, QMenu, QTextEdit, QMainWindow,
     QHBoxLayout, QMenuBar, QProgressBar, QDialog, QSplashScreen,
-    QAction, QSplitter, QFileDialog, QApplication)
+    QAction, QSplitter, QFileDialog, QApplication, QGroupBox, QMessageBox)
 from PyQt5.QtGui import QFontMetrics, QPixmap
 from PyQt5.QtGui import QKeySequence
 
@@ -732,100 +732,312 @@ class ViewerWindow(QMainWindow):
 
 
     def open_fits_file(self):
-        """Opens a FITS file and stores header & data, handling both 1D spectra and 3D cubes"""
+        """Opens a FITS file and stores header & data, handling both 1D spectra, 3D cubes, and bintables"""
         global FITS_HEADER, FITS_DATA, wavelengths, snr_map
         print('Opening file...')
         options = QFileDialog.Options()
         file_path, _ = QFileDialog.getOpenFileName(self, "Open File", "", "FITS Files (*.fits);;All Files (*)", options=options)
         
-        # file_path = '../Tables/Clump001_SingleExt_r0.1as.fits'
-        
         if file_path:
             with fits.open(file_path) as hdul:
                 self.fits_header = None
                 self.fits_data = None
-                self.is_1d_spectrum = False  # Flag for 1D data
+                self.is_1d_spectrum = False
+                self.is_bintable = False
+                self.column_names = []
+                self.has_explicit_wavelengths = False  # New flag to track if wavelengths are provided
     
-                # Try to find a valid data extension
+                # Check extensions for data type
                 for ext in range(len(hdul)):
                     header = hdul[ext].header
                     data = hdul[ext].data
     
-                    # Skip extensions with no usable data
                     if data is None:
                         continue
                         
-                    # Check if data is 1D spectrum
-                    if data.ndim == 1:
+                    # Check for binary table
+                    if header.get('XTENSION') == 'BINTABLE':
+                        print(f"Found binary table in extension {ext}")
+                        self.fits_header = header
+                        self.fits_data = data
+                        self.is_bintable = True
+                        self.is_1d_spectrum = True  # Treat as 1D spectrum
+                        self.column_names = [header.get(f'TTYPE{i}') for i in range(1, header.get('TFIELDS', 0)+1)]
+                        # Check if wavelength column exists in binary table
+                        if any(col and 'wave' in col.lower() for col in self.column_names):
+                            self.has_explicit_wavelengths = True
+                        break
+                    # Check for 1D spectrum
+                    elif data.ndim == 1:
                         print(f"Found 1D spectrum in extension {ext}")
                         self.fits_header = header
                         self.fits_data = data
                         self.is_1d_spectrum = True
+                        # Check if wavelengths are provided in header
+                        if any(key in header for key in ['CRVAL1', 'CDELT1', 'CD1_1']):
+                            wavelengths = self._construct_wavelengths_from_header()
+                            # self.has_explicit_wavelengths = False
                         break
-                    # Check for 3D cube with WCS
+                    # Check for 3D cube
                     elif data.ndim == 3 and all(key in header for key in ['CRVAL1', 'CRVAL2', 'CTYPE1', 'CTYPE2']):
                         print(f"Using 3D cube from extension {ext}")
                         self.fits_header = header
                         self.fits_data = data
                         break
-                
-                # Fallback to primary extension if no valid data found
+    
+                # Fallback to primary extension
                 if self.fits_header is None:
                     print("No valid extension found, defaulting to primary.")
                     self.fits_header = hdul[0].header
                     self.fits_data = hdul[0].data if hdul[0].data is not None else hdul[1].data
                     if self.fits_data.ndim == 1:
                         self.is_1d_spectrum = True
+                        if any(key in self.fits_header for key in ['CRVAL1', 'CDELT1', 'CD1_1']):
+                            self.has_explicit_wavelengths = True
     
                 FITS_HEADER = self.fits_header
                 FITS_DATA = self.fits_data
                 
-                # Handle 1D spectrum case
-                if self.is_1d_spectrum:
+                # Handle binary table case
+                if self.is_bintable:
+                    print("Binary table detected - showing column selection")
+                    self.show_column_selection_dialog()
+                    return  # Wait for user selection
+                    
+                # Handle regular 1D spectrum case
+                elif self.is_1d_spectrum:
                     print("1D spectrum detected - special handling")
-                    # Create dummy 2D array for visualization
-                    dummy_2d = np.tile(FITS_DATA, (10, 1)).T  # Transposed for orientation
-                    self.draw_image(dummy_2d, cmap='Grays', scale='linear', from_fits=False)
+                    self.process_1d_spectrum()
                     
-                    # Extract wavelength info from header
-                    if 'CRVAL1' in FITS_HEADER:
-                        wavelengths = (FITS_HEADER['CRVAL1'] + 
-                                     FITS_HEADER.get('CDELT1', 1) * 
-                                     (np.arange(len(FITS_DATA)) - FITS_HEADER.get('CRPIX1', 1) + 1))
-                    else:
-                        wavelengths = np.arange(len(FITS_DATA))
-                    
-                    # Initialize dummy WCS and SNR map
-                    self.wcs = WCS(naxis=2)
-                    snr_map = np.zeros((10, 10))  # Dummy SNR map
-                    
-                    # Show the spectrum
-                    spectrum = FITS_DATA
-                    self.update_spectrum_panel(spectrum)
-                    
-                else:  # 3D cube case
+                # Handle 3D cube case
+                else:
                     print("3D datacube detected - standard handling")
-                    self.draw_image(FITS_DATA, cmap='Grays', scale='linear', from_fits=True)
-                    self.wcs = WCS(self.fits_header)
-                    
-                    # Initialize SNR map
-                    _, nx, ny = FITS_DATA.shape
-                    snr_map = np.zeros((nx, ny)) + 1E8
-                    
-                    # Extract spectral axis info
-                    spectral_sampling = FITS_HEADER.get('CDELT3', FITS_HEADER.get('CD3_3', 1))
-                    wavelengths = (FITS_HEADER['CRVAL3'] + 
-                                 spectral_sampling * 
-                                 (np.arange(FITS_DATA.shape[0]) - FITS_HEADER.get('CRPIX3', 1) + 1))
+                    self.process_3d_cube()
     
                 # Extract observation info
-                source_name = FITS_HEADER.get('OBJECT', '')
-                source_redshift = FITS_HEADER.get('REDSHIFT', '')
-                resolving_power = FITS_HEADER.get('RESOLVINGP', '')
-                
-                # Update observation DataFrame
-                df_obs.loc[0] = [source_name, source_redshift, resolving_power]
-                print("FITS file loaded successfully!")
+                self.extract_observation_info()
+    
+    def show_column_selection_dialog(self):
+        """Create a dialog for selecting wavelength and flux columns from bintable"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Table Columns")
+        dialog.setMinimumWidth(500)  # Slightly wider for better button spacing
+        
+        layout = QVBoxLayout()
+        info_label = QLabel("This FITS file contains multiple columns. Please select:")
+        info_label.setStyleSheet("font-weight: bold; margin-bottom: 10px;")
+        layout.addWidget(info_label)
+        
+        # Wavelength selection
+        wave_group = QGroupBox("Select Wavelength Vector")
+        wave_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        wave_layout = QVBoxLayout()
+        wave_layout.setSpacing(10)
+        wave_layout.setContentsMargins(10, 25, 10, 15)  # More vertical padding
+        
+        self.wave_buttons = []
+        for i, name in enumerate(self.column_names):
+            btn = QPushButton(name)
+            btn.setCheckable(True)
+            btn.setStyleSheet("""
+                QPushButton {
+                    padding: 5px;
+                    border: 1px solid #888;
+                    border-radius: 4px;
+                    min-width: 80px;
+                }
+                QPushButton:checked {
+                    background-color: lime;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #45a049;
+                }
+            """)
+            btn.clicked.connect(lambda _, x=i: self.select_column(x, 'wave'))
+            self.wave_buttons.append(btn)
+            wave_layout.addWidget(btn)
+        wave_group.setLayout(wave_layout)
+        layout.addWidget(wave_group)
+        
+        # Flux selection
+        flux_group = QGroupBox("Select Flux Vector")
+        flux_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        flux_layout = QVBoxLayout()
+        flux_layout.setSpacing(10)
+        flux_layout.setContentsMargins(10, 25, 10, 15)  # More vertical padding
+        
+        self.flux_buttons = []
+        for i, name in enumerate(self.column_names):
+            btn = QPushButton(name)
+            btn.setCheckable(True)
+            btn.setStyleSheet("""
+                QPushButton {
+                    padding: 5px;
+                    border: 1px solid #888;
+                    border-radius: 4px;
+                    min-width: 80px;
+                }
+                QPushButton:checked {
+                    background-color: lime;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #45a049;
+                }
+            """)
+            btn.clicked.connect(lambda _, x=i: self.select_column(x, 'flux'))
+            self.flux_buttons.append(btn)
+            flux_layout.addWidget(btn)
+        flux_group.setLayout(flux_layout)
+        layout.addWidget(flux_group)
+        
+        # Confirm button
+        confirm_btn = QPushButton("Confirm Selection")
+        confirm_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px;
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        confirm_btn.clicked.connect(lambda: self.finalize_bintable_selection(dialog))
+        layout.addWidget(confirm_btn)
+        
+        dialog.setLayout(layout)
+        dialog.exec_()
+    
+    def select_column(self, index, col_type):
+        """Handle column selection (single selection per type)"""
+        buttons = self.wave_buttons if col_type == 'wave' else self.flux_buttons
+        for i, btn in enumerate(buttons):
+            # Store current style to preserve other properties
+            current_style = btn.styleSheet()
+            if i == index:
+                btn.setChecked(True)
+                # Add the checked style while preserving other styles
+                btn.setStyleSheet(current_style + """
+                    QPushButton {
+                        background-color: lime;
+                        font-weight: bold;
+                    }
+                """)
+            else:
+                btn.setChecked(False)
+                # Reset to base style
+                btn.setStyleSheet("""
+                    QPushButton {
+                        padding: 5px;
+                        border: 1px solid #888;
+                        border-radius: 4px;
+                        min-width: 80px;
+                    }
+                """)
+    
+    def finalize_bintable_selection(self, dialog):
+        """Process selected columns and continue with file loading"""
+        global wavelengths, FITS_DATA  # Declare globals
+        
+        try:
+            # Get selected columns
+            wave_idx = next((i for i, btn in enumerate(self.wave_buttons) if btn.isChecked()), -1)
+            flux_idx = next((i for i, btn in enumerate(self.flux_buttons) if btn.isChecked()), -1)
+            
+            if wave_idx == -1 or flux_idx == -1:
+                QMessageBox.warning(self, "Selection Error", 
+                                  "Please select both wavelength and flux columns")
+                return
+            
+            # Extract selected data - proper FITS binary table access
+            
+            # print(f'wavelength index selected: {wave_idx}')
+            # print(f'flux index selected: {flux_idx}')
+            wavelengths = self.fits_data[0][wave_idx]  # Direct column access
+            flux = self.fits_data[0][flux_idx]
+            
+            # Update global data references
+            FITS_DATA = flux
+            self.process_1d_spectrum()
+            self.extract_observation_info()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", 
+                               f"Failed to load selected columns:\n{str(e)}")
+        finally:
+            dialog.close()
+    
+    def _construct_wavelengths_from_header(self):
+        """Construct wavelength array from FITS header using WCS information"""
+        header = self.fits_header
+        naxis = header.get('NAXIS1', len(self.fits_data))
+        
+        # Try CDELT/CRVAL style first
+        if 'CRVAL1' in header and 'CDELT1' in header:
+            crval = header['CRVAL1']
+            cdelt = header['CDELT1']
+            crpix = header.get('CRPIX1', 1)  # Default to 1 if not present
+            return crval + cdelt * (np.arange(naxis) + 1 - crpix)
+        
+        # Try CD matrix style
+        elif 'CD1_1' in header:
+            cd11 = header['CD1_1']
+            crval = header.get('CRVAL1', 0)
+            crpix = header.get('CRPIX1', 1)
+            return crval + cd11 * (np.arange(naxis) + 1 - crpix)
+        
+        # Fallback to linear assumption if no WCS info found
+        else:
+            print("Warning: No valid WCS keywords found in header - using linear index")
+            return np.arange(naxis)
+    
+    
+    
+    def process_1d_spectrum(self):
+        """Common processing for all 1D spectra"""
+        global wavelengths, snr_map
+        
+        # Create dummy 2D array for visualization
+        dummy_2d = np.tile(FITS_DATA, (10, 1)).T
+        
+        # Initialize dummy WCS and SNR map
+        self.wcs = WCS(naxis=2)
+        snr_map = np.zeros((10, 10))
+        
+        # Show the spectrum
+        self.update_spectrum_panel(FITS_DATA)
+    
+    def process_3d_cube(self):
+        """Processing for 3D cubes"""
+        global wavelengths, snr_map
+        
+        self.draw_image(FITS_DATA, cmap='Grays', scale='linear', from_fits=True)
+        self.wcs = WCS(self.fits_header)
+        
+        # Initialize SNR map
+        _, nx, ny = FITS_DATA.shape
+        snr_map = np.zeros((nx, ny)) + 1E8
+        
+        # Extract spectral axis info
+        spectral_sampling = FITS_HEADER.get('CDELT3', FITS_HEADER.get('CD3_3', 1))
+        wavelengths = (FITS_HEADER['CRVAL3'] + 
+                     spectral_sampling * 
+                     (np.arange(FITS_DATA.shape[0]) - FITS_HEADER.get('CRPIX3', 1) + 1))
+    
+    def extract_observation_info(self):
+        """Extract common observation info"""
+        global df_obs
+        
+        source_name = FITS_HEADER.get('OBJECT', '')
+        source_redshift = FITS_HEADER.get('REDSHIFT', '')
+        resolving_power = FITS_HEADER.get('RESOLVINGP', '')
+        
+        df_obs.loc[0] = [source_name, source_redshift, resolving_power]
+        print("FITS file loaded successfully!")
 
 
 
@@ -3026,7 +3238,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         # print("\nParameters with Constraints:")
         # params.pretty_print()
         print(f'Nregions={Nregions}, Nlines={Nlines}')
-        piecewise_model = Model(HyperCube_ModelFunctions.model_chooser(Nregions, Nlines))
+        model_maker = HyperCube_ModelFunctions.PiecewiseModel(n_regions=Nregions, n_gaussians=Nlines)
+        piecewise_model = Model(model_maker.model_function)
+        # piecewise_model = Model(HyperCube_ModelFunctions.model_chooser(Nregions, Nlines))
         
         if len(fit_results) > 0 and not refit:
             fit_results = []
@@ -4003,9 +4217,7 @@ def main():
             splash.finish(viewer)
             viewer.show()
         
-
         QTimer.singleShot(100, show_main_window)
-
         print("Timer set")
         
         print("Entering main loop")
