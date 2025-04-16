@@ -1768,8 +1768,8 @@ class ViewerWindow(QMainWindow):
         self.canvas.figure.clear()
         self.ax = self.canvas.figure.add_subplot(111)
         self.ax.imshow(image, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-        self.ax.set_xlim(0,npix_x)
-        self.ax.set_ylim(0,npix_y)
+        # self.ax.set_xlim(0,npix_x)
+        # self.ax.set_ylim(0,npix_y)
         apply_mpl_qss_style(self.canvas.figure, self.ax, None)
 
         # Initialize red rectangle but keep it hidden initially
@@ -3491,7 +3491,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         
         progress_window.close()
         
-        self.viewer_window.update_buttons(np.int64(npix_x/2),np.int64(npix_y/2))
+        x=df_fit.iloc[0]['spaxel_x']
+        y=df_fit.iloc[0]['spaxel_y']
+        self.viewer_window.update_buttons(x,y)
         
         
         print("Fitting complete for entire cube.")
