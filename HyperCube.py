@@ -526,6 +526,8 @@ class ViewerWindow(QMainWindow):
         self.spectrum_cursor_pos = None  # Add tracking for spectrum cursor position
         self.spectrum_ax = None
         self.drawing_line = None
+        self.fluxscalefactor = 1 # Default flux scale factor
+        self.WLscalefactor = 1 # Default wavelength scale factor
         self.slope = 0  # Default slope
         self.intercept = 0  # Default intercept
         self.gaussian_active = False  # Toggle for Gaussian fitting
@@ -583,6 +585,17 @@ class ViewerWindow(QMainWindow):
         self.open_fit_params_button.setFixedSize(80, 30)
         self.open_fit_params_button.clicked.connect(self.open_fit_params_window)
         bottom_layout.addWidget(self.open_fit_params_button, alignment=Qt.AlignLeft)
+        
+        self.WLscalefactor_button = QPushButton("Wavelength Scale Factor", self)
+        self.WLscalefactor_button.setFixedSize(120, 30)
+        self.WLscalefactor_button.clicked.connect(self.press_scaleWL_button)
+        bottom_layout.addWidget(self.WLscalefactor_button, alignment=Qt.AlignLeft)
+        
+        self.fluxscalefactor_button = QPushButton("Flux Scale Factor", self)
+        self.fluxscalefactor_button.setFixedSize(120, 30)
+        self.fluxscalefactor_button.clicked.connect(self.press_scaleflux_button)
+        bottom_layout.addWidget(self.fluxscalefactor_button, alignment=Qt.AlignLeft)
+        
 
         # Spacer to push buttons apart
         bottom_layout.addStretch()
@@ -730,9 +743,34 @@ class ViewerWindow(QMainWindow):
         self.zoom_active = False
         self.spectrum_canvas.draw_idle()  # Ensure the reset happens immediately
 
+    
+
+    def press_scaleflux_button(self):
+        text_box = QLineEdit()
+        text_box.setText(str(self.fluxscalefactor))  # Set the initial value from the dataframe
+        text_box.show()
+        text_box.returnPressed.connect(lambda: self.scale_flux(text_box))
+        
+    def press_scaleWL_button(self):
+        text_box = QLineEdit()
+        text_box.setText(str(self.WLscalefactor))  # Set the initial value from the dataframe
+        text_box.show()
+        text_box.returnPressed.connect(lambda: self.scale_WL(text_box))
+
+    def scale_flux(self,text_box):
+        global FITS_DATA
+        self.fluxscalefactor = text_box.text()
+        FITS_DATA = FITS_DATA*np.float64(self.fluxscalefactor)
+        text_box.hide()
+        
+    def scale_WL(self,text_box):
+        global wavelengths
+        self.WLscalefactor = text_box.text()
+        wavelengths = wavelengths*np.float64(self.WLscalefactor)
+        text_box.hide()
 
     def open_fits_file(self):
-        """Opens a FITS file and stores header & data, handling both 1D spectra, 3D cubes, and bintables"""
+        """Opens a FITS file and stores header & data, handling 1D spectra, 3D cubes, and bintables"""
         global FITS_HEADER, FITS_DATA, wavelengths, snr_map
         print('Opening file...')
         options = QFileDialog.Options()
@@ -744,8 +782,9 @@ class ViewerWindow(QMainWindow):
                 self.fits_data = None
                 self.is_1d_spectrum = False
                 self.is_bintable = False
+                self.is_3d_cube = False
                 self.column_names = []
-                self.has_explicit_wavelengths = False  # New flag to track if wavelengths are provided
+                self.has_explicit_wavelengths = False
     
                 # Check extensions for data type
                 for ext in range(len(hdul)):
@@ -761,28 +800,37 @@ class ViewerWindow(QMainWindow):
                         self.fits_header = header
                         self.fits_data = data
                         self.is_bintable = True
-                        self.is_1d_spectrum = True  # Treat as 1D spectrum
+                        self.is_1d_spectrum = True
                         self.column_names = [header.get(f'TTYPE{i}') for i in range(1, header.get('TFIELDS', 0)+1)]
-                        # Check if wavelength column exists in binary table
                         if any(col and 'wave' in col.lower() for col in self.column_names):
                             self.has_explicit_wavelengths = True
                         break
+                    
                     # Check for 1D spectrum
                     elif data.ndim == 1:
                         print(f"Found 1D spectrum in extension {ext}")
                         self.fits_header = header
                         self.fits_data = data
                         self.is_1d_spectrum = True
-                        # Check if wavelengths are provided in header
                         if any(key in header for key in ['CRVAL1', 'CDELT1', 'CD1_1']):
                             wavelengths = self._construct_wavelengths_from_header()
-                            # self.has_explicit_wavelengths = False
                         break
-                    # Check for 3D cube
-                    elif data.ndim == 3 and all(key in header for key in ['CRVAL1', 'CRVAL2', 'CTYPE1', 'CTYPE2']):
-                        print(f"Using 3D cube from extension {ext}")
+                    
+                    # Check for 3D/4D cube (like ALMA data)
+                    elif data.ndim in [3, 4] and 'CTYPE3' in header and 'CRVAL3' in header:
+                        print(f"Found {data.ndim}D cube in extension {ext}")
                         self.fits_header = header
                         self.fits_data = data
+                        self.is_3d_cube = True
+                        
+                        # For ALMA-style cubes (1, nchan, ny, nx)
+                        if data.ndim == 4 and data.shape[0] == 1:  # Stokes axis
+                            self.fits_data = data[0]  # Remove stokes dimension
+                        
+                        # Generate wavelength array from header
+                        if 'CTYPE3' in header and header['CTYPE3'].startswith(('FREQ','VELO','VRAD','WAVE')):
+                            wavelengths = self._construct_wavelengths_from_header(axis=3)
+                            self.has_explicit_wavelengths = True
                         break
     
                 # Fallback to primary extension
@@ -798,21 +846,28 @@ class ViewerWindow(QMainWindow):
                 FITS_HEADER = self.fits_header
                 FITS_DATA = self.fits_data
                 
-                # Handle binary table case
+                # Handle different data types
                 if self.is_bintable:
                     print("Binary table detected - showing column selection")
                     self.show_column_selection_dialog()
-                    return  # Wait for user selection
+                    return
                     
-                # Handle regular 1D spectrum case
                 elif self.is_1d_spectrum:
-                    print("1D spectrum detected - special handling")
+                    print("1D spectrum detected")
+                    if not self.has_explicit_wavelengths:
+                        print("Warning: No wavelength info found - using pixel indices")
+                        wavelengths = np.arange(len(FITS_DATA))
                     self.process_1d_spectrum()
                     
-                # Handle 3D cube case
-                else:
-                    print("3D datacube detected - standard handling")
-                    self.process_3d_cube()
+                elif self.is_3d_cube:
+                    print(f"{FITS_DATA.ndim}D cube detected")
+                    if FITS_DATA.ndim == 3:  # (nchan, ny, nx)
+                        self.process_3d_cube()
+                        # For 3D cubes, create field selection dialog
+                    #     self.column_names = ['Flux']  # Default name
+                    #     self.show_column_selection_dialog()
+                    # else:
+                    #     self.process_3d_cube()
     
                 # Extract observation info
                 self.extract_observation_info()
@@ -971,29 +1026,37 @@ class ViewerWindow(QMainWindow):
         finally:
             dialog.close()
     
-    def _construct_wavelengths_from_header(self):
-        """Construct wavelength array from FITS header using WCS information"""
+    def _construct_wavelengths_from_header(self, axis=1):
+        """Construct wavelength array from FITS header for given axis"""
         header = self.fits_header
-        naxis = header.get('NAXIS1', len(self.fits_data))
+        naxis = header[f'NAXIS{axis}']
         
-        # Try CDELT/CRVAL style first
-        if 'CRVAL1' in header and 'CDELT1' in header:
-            crval = header['CRVAL1']
-            cdelt = header['CDELT1']
-            crpix = header.get('CRPIX1', 1)  # Default to 1 if not present
+        # Try standard WCS keywords
+        crval = header.get(f'CRVAL{axis}')
+        cdelt = header.get(f'CDELT{axis}')
+        crpix = header.get(f'CRPIX{axis}', 1)
+        
+        if None not in (crval, cdelt):
             return crval + cdelt * (np.arange(naxis) + 1 - crpix)
         
-        # Try CD matrix style
-        elif 'CD1_1' in header:
-            cd11 = header['CD1_1']
-            crval = header.get('CRVAL1', 0)
-            crpix = header.get('CRPIX1', 1)
-            return crval + cd11 * (np.arange(naxis) + 1 - crpix)
+        # Try CD matrix
+        cd = header.get(f'CD{axis}_{axis}')
+        if cd is not None:
+            return crval + cd * (np.arange(naxis) + 1 - crpix)
         
-        # Fallback to linear assumption if no WCS info found
-        else:
-            print("Warning: No valid WCS keywords found in header - using linear index")
-            return np.arange(naxis)
+        # Try PC matrix
+        pc = header.get(f'PC{axis}_{axis}')
+        if pc is not None and cdelt is not None:
+            return crval + pc * cdelt * (np.arange(naxis) + 1 - crpix)
+        
+        # Fallback for frequency axes
+        if header.get(f'CTYPE{axis}','').startswith('FREQ'):
+            restfreq = header.get('RESTFRQ', header.get('RESTFREQ'))
+            if restfreq is not None:
+                return (1 - np.arange(naxis) * header.get('CDELT3', 1) / restfreq * 299792.458)
+        
+        print(f"Warning: No valid WCS found for axis {axis} - using pixel indices")
+        return np.arange(naxis)
     
     
     
@@ -1042,18 +1105,27 @@ class ViewerWindow(QMainWindow):
 
 
     def pixel_to_ra_dec(self, x, y):
-        """Convert pixel coordinates (x, y) to RA, Dec using the WCS information from FITS header."""
-        # Ensure x, y are numpy arrays (needed for all_pix2world)
-        x = np.array(x)
-        y = np.array(y)
-    
-        # For 3D WCS, you need to provide the correct number of dimensions, so we will include a spectral coordinate (e.g., 0)
-        # Spectral axis (assuming 0, you can adjust this if needed)
-        z = np.zeros_like(x)  # If you have a 3D WCS with a spectral axis, use the corresponding z values
-    
-        # Use all_pix2world for the 3D WCS (x, y, z)
-        ra, dec, _ = self.wcs.all_pix2world(x, y, z, 0)  # 0 is for the spectral axis (CDELT3)
-    
+        """Convert pixel coordinates (x, y) to RA, Dec using the WCS information from FITS header.
+        Handles both 2D and 4D WCS (like ALMA data with Stokes parameter)."""
+        
+        # Ensure inputs are numpy arrays
+        x = np.atleast_1d(x)
+        y = np.atleast_1d(y)
+        
+        # Check WCS dimensionality
+        if self.wcs.naxis == 4:
+            # For 4D WCS (RA, Dec, Freq, Stokes) - ALMA case
+            z = np.zeros_like(x)  # Frequency axis (use 0 or reference pixel)
+            stokes = np.zeros_like(x)  # Stokes axis (I=0)
+            ra, dec, _, _ = self.wcs.all_pix2world(x, y, z, stokes, 0)
+        elif self.wcs.naxis == 3:
+            # For 3D WCS (RA, Dec, Freq)
+            z = np.zeros_like(x)  # Frequency axis
+            ra, dec, _ = self.wcs.all_pix2world(x, y, z, 0)
+        else:
+            # Standard 2D WCS
+            ra, dec = self.wcs.all_pix2world(x, y, 0)
+        
         return ra, dec
 
 
@@ -1095,8 +1167,8 @@ class ViewerWindow(QMainWindow):
             ra, dec = self.pixel_to_ra_dec(x, y)
             
             # Convert RA and Dec to sexagesimal format
-            ra_sexagesimal = self.decimal_to_sexagesimal(ra, is_ra=True)  # Explicitly pass `is_ra=True`
-            dec_sexagesimal = self.decimal_to_sexagesimal(dec, is_ra=False)  # Explicitly pass `is_ra=False`
+            ra_sexagesimal = self.decimal_to_sexagesimal(ra[0], is_ra=True)  # Explicitly pass `is_ra=True`
+            dec_sexagesimal = self.decimal_to_sexagesimal(dec[0], is_ra=False)  # Explicitly pass `is_ra=False`
             
             # Update RA and Dec buttons with the calculated values
             self.fit_params_window.ra_button.setText(f"RA: {ra_sexagesimal}")
@@ -1467,7 +1539,8 @@ class ViewerWindow(QMainWindow):
         y_continuum_x0 = self.m * self.gaussian_x0 + self.b
     
         # Adjust amplitude so that peak of the Gaussian reaches dy
-        self.gaussian_amplitude = max(0.00001, dy - y_continuum_x0)
+        minval = np.median(spectrum)
+        self.gaussian_amplitude = max(minval, dy - y_continuum_x0)
     
         # Generate updated Gaussian + Line function
         x_vals = np.linspace(self.x1, self.x2, 1000)
@@ -1525,13 +1598,13 @@ class ViewerWindow(QMainWindow):
                 'Rest Wavelength': [np.nan],
                 'Amp_0': [self.gaussian_amplitude],
                 'Amp_0_lowlim': [0],
-                'Amp_0_highlim': [9999],
+                'Amp_0_highlim': [np.inf],
                 'Centroid_0': [self.gaussian_x0],
-                'Centroid_0_lowlim': [-9999],
-                'Centroid_0_highlim': [9999],
+                'Centroid_0_lowlim': [-np.inf],
+                'Centroid_0_highlim': [np.inf],
                 'Sigma_0': [self.gaussian_sigma],
                 'Sigma_0_lowlim': [0],
-                'Sigma_0_highlim': [9999],
+                'Sigma_0_highlim': [np.inf],
                 'Amp_fit': [np.nan],
                 'Centroid_fit': [np.nan],
                 'Sigma_fit': [np.nan],
@@ -1666,8 +1739,11 @@ class ViewerWindow(QMainWindow):
                 
     def draw_image(self, data, cmap, scale, from_fits=False):
         """Generates and displays the white-light image in the left panel."""
+        global npix_x, npix_y
         if from_fits:
             image = np.nansum(data, axis=0)
+            npix_x = np.shape(image)[0]
+            npix_y = np.shape(image)[1]
         else:
             image = data
             if scale == 'log':
@@ -1686,10 +1762,14 @@ class ViewerWindow(QMainWindow):
     
         vmin = np.nanmedian(image) - 3 * np.nanstd(image)
         vmax = np.nanmedian(image) + 3 * np.nanstd(image)
+        
+        
     
         self.canvas.figure.clear()
         self.ax = self.canvas.figure.add_subplot(111)
         self.ax.imshow(image, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+        self.ax.set_xlim(0,npix_x)
+        self.ax.set_ylim(0,npix_y)
         apply_mpl_qss_style(self.canvas.figure, self.ax, None)
 
         # Initialize red rectangle but keep it hidden initially
@@ -2281,7 +2361,14 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     
                 # Insert an empty row to separate the sections
                 writer.writerow([])
+                
+                writer.writerow(['wavelength scale factor', 'flux scale factor'])
+                
+                writer.writerow([self.viewer_window.WLscalefactor,self.viewer_window.fluxscalefactor])
     
+                # Insert an empty row to separate the sections
+                writer.writerow([])
+                
                 # Write df_cont (Continuum parameters)
                 writer.writerow(df_cont.columns)  # Header for df_cont
                 writer.writerows(df_cont.values)  # Data for df_cont
@@ -2773,7 +2860,14 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 writer.writerow(df_obs.columns)  # Header for df_obs
                 writer.writerows(df_obs.values)  # Data for df_obs
     
-                # Insert an empty row for separation
+                # Insert an empty row to separate the sections
+                writer.writerow([])
+                
+                writer.writerow(['wavelength scale factor', 'flux scale factor'])
+                
+                writer.writerow([self.viewer_window.WLscalefactor,self.viewer_window.fluxscalefactor])
+    
+                # Insert an empty row to separate the sections
                 writer.writerow([])
                 
                 # Write df_cont (continuum information)
@@ -3058,64 +3152,79 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 
             
 
-    def calculate_snr_map(self, linewl, Nsigma, search_window_factor=5, continuum_offset_factor=20, continuum_width_factor=30):
+    def calculate_snr_map(self, linewl, Nsigma, search_window_width=None, continuum_offset=None, continuum_width=None):
         """
-        Calculate an SNR map and draw a red contour for the given Nsigma level, dynamically adjusting
-        the search window and continuum offset based on the pixel scale from the 'wavelengths' array.
-    
+        Calculate an SNR map using wavelength units (same as 'wavelengths' array).
+        
         Parameters:
-            linewl (float): Central wavelength of the emission line.
-            Nsigma (float): SNR threshold for contour drawing.
-            search_window_factor (int): Multiplier to scale the search window based on pixel scale.
-            continuum_offset_factor (int): Multiplier to scale the continuum offset based on pixel scale.
-            continuum_width_factor (int): Multiplier to scale the continuum width based on pixel scale.
-    
+            linewl (float or array-like): Central wavelength(s) of the emission line(s) 
+            Nsigma (float): SNR threshold for contour drawing
+            search_window_width (float): Width of search window around line center (in wavelength units)
+            continuum_offset (float): Offset from line center to start continuum regions (in wavelength units)
+            continuum_width (float): Width of continuum regions (in wavelength units)
+        
         Returns:
-            snr_map (numpy.ndarray): 2D array of max SNR values across emission lines for each spaxel.
+            snr_map (numpy.ndarray): 2D array of max SNR values across emission lines for each spaxel
         """
         global snr_map
-        num_wavelengths, nx, ny = np.shape(FITS_DATA)  # Cube dimensions
-        snr_map = np.zeros((nx, ny))  # Store max SNR for each spaxel
-    
-        # Calculate the pixel scale (delta_wavelength) from the 'wavelengths' array
-        delta_wavelength = wavelengths[1] - wavelengths[0]  # Assumes evenly spaced wavelengths
+        num_wavelengths, nx, ny = np.shape(FITS_DATA)
+        snr_map = np.zeros((nx, ny))
         
+        # Set default window sizes if not specified
+        if search_window_width is None:
+            search_window_width = 50 * np.median(np.diff(wavelengths))  # 10x wavelength step
+        
+        if continuum_offset is None:
+            continuum_offset = 60 * np.median(np.diff(wavelengths))  # 20x wavelength step
+        
+        if continuum_width is None:
+            continuum_width = 70 * np.median(np.diff(wavelengths))  # 30x wavelength step
+    
         print(f'Calculating S/N map for line_wl = {linewl}, masking at {Nsigma}-sigma!')
     
         for i in range(nx):
             for j in range(ny):
                 spectrum = FITS_DATA[:, i, j]
                 snr_values = []
+                
                 for index, row in df.iterrows():
-                    centroid_idx = int(np.round(row['Centroid_0']))  # Ensure it is a single integer
-    
-                    # Dynamically determine the search window size based on the pixel scale (delta_wavelength)
-                    search_window = int(search_window_factor * delta_wavelength)
-                    continuum_offset = int(continuum_offset_factor * delta_wavelength)
-                    continuum_width = int(continuum_width_factor * delta_wavelength)
+                    line_center = row['Centroid_0']  # Line center in wavelength units
                     
-                    # Define search window around centroid for peak detection
-                    mask = (wavelengths >= centroid_idx - search_window) & (wavelengths <= centroid_idx + search_window)
-                    indices_within_range = np.where(mask)[0]
-                    line_region = spectrum[indices_within_range]
-                    peak_flux = np.percentile(line_region, 95)  # 95th percentile peak flux
-    
-                    # Define continuum region (avoiding emission line)
-                    mask_left = (wavelengths >= centroid_idx - continuum_offset - continuum_width) & (wavelengths <= centroid_idx - continuum_offset)
-                    mask_right = (wavelengths <= centroid_idx + continuum_offset + continuum_width) & (wavelengths >= centroid_idx + continuum_offset)
-                    indices_left = np.where(mask_left)[0]
-                    indices_right = np.where(mask_right)[0]
-                    continuum_flux = np.concatenate([spectrum[indices_left], spectrum[indices_right]])
-    
-                    # Compute noise as the standard deviation of the continuum
-                    noise_level = np.std(continuum_flux)
-    
-                    # Compute SNR for this emission line
-                    snr = peak_flux / noise_level
-                    snr_values.append(snr)
-    
-                # Store the maximum SNR across all lines
-                snr_map[i, j] = np.max(snr_values)
+                    # Define line region
+                    line_mask = (wavelengths >= line_center - search_window_width/2) & \
+                               (wavelengths <= line_center + search_window_width/2)
+                    line_region = spectrum[line_mask]
+                    
+                    # Use robust maximum for peak flux
+                    peak_flux = np.percentile(line_region, 95) if len(line_region) > 0 else 0
+                    
+                    # Define continuum regions (both sides of line)
+                    left_cont_mask = (wavelengths >= line_center - continuum_offset - continuum_width) & \
+                                    (wavelengths <= line_center - continuum_offset)
+                    right_cont_mask = (wavelengths <= line_center + continuum_offset + continuum_width) & \
+                                     (wavelengths >= line_center + continuum_offset)
+                    
+                    # Combine continuum regions
+                    continuum_flux = np.concatenate([
+                        spectrum[left_cont_mask],
+                        spectrum[right_cont_mask]
+                    ])
+                    
+                    # Compute noise as MAD scaled to STD (robust against outliers)
+                    if len(continuum_flux) > 1:
+                        noise_level = 1.4826 * np.median(np.abs(continuum_flux - np.median(continuum_flux)))
+                    else:
+                        noise_level = np.nan
+                    
+                    # Compute SNR if valid
+                    if noise_level > 0 and not np.isnan(noise_level):
+                        snr = peak_flux / noise_level
+                        snr_values.append(snr)
+                    else:
+                        snr_values.append(0)
+                
+                # Store maximum SNR for this spaxel
+                snr_map[i, j] = np.nanmax(snr_values) if snr_values else 0
     
         # Draw the contour on the viewer window at the specified Nsigma level
         contour = self.viewer_window.ax.contour(snr_map, levels=[Nsigma], colors='red', linewidths=1.5)
@@ -3123,7 +3232,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         # Update the canvas
         self.viewer_window.canvas.draw()
         self.viewer_window.spectrum_canvas.draw_idle()
-    
+        
         return snr_map
 
 
@@ -3382,15 +3491,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         
         progress_window.close()
         
-        self.viewer_window.update_buttons(0,0)
-        
-        
-        
-        
-        
-        
-        
-        
+        self.viewer_window.update_buttons(np.int64(npix_x/2),np.int64(npix_y/2))
         
         
         print("Fitting complete for entire cube.")
@@ -3672,13 +3773,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 'Rest Wavelength': [np.nan],
                 'Amp_0': [self.gaussian_amplitude],
                 'Amp_0_lowlim': [0],
-                'Amp_0_highlim': [9999],
+                'Amp_0_highlim': [np.inf],
                 'Centroid_0': [self.gaussian_x0],
-                'Centroid_0_lowlim': [-9999],
-                'Centroid_0_highlim': [9999],
+                'Centroid_0_lowlim': [-np.inf],
+                'Centroid_0_highlim': [np.inf],
                 'Sigma_0': [self.gaussian_sigma],
                 'Sigma_0_lowlim': [0],
-                'Sigma_0_highlim': [9999],
+                'Sigma_0_highlim': [np.inf],
                 'Amp_fit': [np.nan],
                 'Centroid_fit': [np.nan],
                 'Sigma_fit': [np.nan],
@@ -4016,8 +4117,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                             (np.float64(df['Line_ID'])==np.int64(button_name.split('~')[0]))]['Centroid_0']
             self.viewer_window.ax.cla()
             self.viewer_window.draw_image(FITS_DATA,cmap='Grays',scale='linear',from_fits=True)
-            # snrmap = self.calculate_snr_map(linewl, snr_value, search_window=5, continuum_offset=20, continuum_width=30)
-            snrmap = self.calculate_snr_map(linewl, snr_value, search_window_factor=5, continuum_offset_factor=20, continuum_width_factor=30)
+            # snrmap = self.calculate_snr_map(linewl, snr_value, search_window_factor=5, continuum_offset_factor=20, continuum_width_factor=30)
+            snrmap = self.calculate_snr_map(linewl, snr_value, search_window_width=None, continuum_offset=None, continuum_width=None)
             self.update_button_value(frame_id, button_name, snr_value)
         if button_type == 'obs_button':
             new_value = np.float64(text_box.text()) if 'name' not in button_name else str(text_box.text())
