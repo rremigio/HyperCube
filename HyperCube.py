@@ -771,7 +771,7 @@ class ViewerWindow(QMainWindow):
 
     def open_fits_file(self):
         """Opens a FITS file and stores header & data, handling 1D spectra, 3D cubes, and bintables"""
-        global FITS_HEADER, FITS_DATA, wavelengths, snr_map
+        global FITS_HEADER, FITS_DATA, wavelengths, snr_map, spectrum
         print('Opening file...')
         options = QFileDialog.Options()
         file_path, _ = QFileDialog.getOpenFileName(self, "Open File", "", "FITS Files (*.fits);;All Files (*)", options=options)
@@ -800,6 +800,7 @@ class ViewerWindow(QMainWindow):
                         self.fits_header = header
                         self.fits_data = data
                         self.is_bintable = True
+                        spectrum = data
                         self.is_1d_spectrum = True
                         self.column_names = [header.get(f'TTYPE{i}') for i in range(1, header.get('TFIELDS', 0)+1)]
                         if any(col and 'wave' in col.lower() for col in self.column_names):
@@ -811,6 +812,7 @@ class ViewerWindow(QMainWindow):
                         print(f"Found 1D spectrum in extension {ext}")
                         self.fits_header = header
                         self.fits_data = data
+                        spectrum = data
                         self.is_1d_spectrum = True
                         if any(key in header for key in ['CRVAL1', 'CDELT1', 'CD1_1']):
                             wavelengths = self._construct_wavelengths_from_header()
@@ -1539,8 +1541,7 @@ class ViewerWindow(QMainWindow):
         y_continuum_x0 = self.m * self.gaussian_x0 + self.b
     
         # Adjust amplitude so that peak of the Gaussian reaches dy
-        minval = np.median(spectrum)
-        self.gaussian_amplitude = max(minval, dy - y_continuum_x0)
+        self.gaussian_amplitude = max(1E-20, dy - y_continuum_x0)
     
         # Generate updated Gaussian + Line function
         x_vals = np.linspace(self.x1, self.x2, 1000)
