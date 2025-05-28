@@ -814,6 +814,7 @@ class ViewerWindow(QMainWindow):
                         self.fits_data = data
                         spectrum = data
                         self.is_1d_spectrum = True
+                        self.has_explicit_wavelengths = True
                         if any(key in header for key in ['CRVAL1', 'CDELT1', 'CD1_1']):
                             wavelengths = self._construct_wavelengths_from_header()
                         break
@@ -1514,7 +1515,7 @@ class ViewerWindow(QMainWindow):
         # self.gaussian_sigma = 5  # Initial sigma
         # self.gaussian_amplitude = 1  # Initial amplitude
         self.gaussian_sigma = 20 * abs(wavelengths[1]-wavelengths[0])
-        self.gaussian_amplitude = 0.1 * abs(np.diff(self.spectrum_ax.get_ylim())[0])
+        self.gaussian_amplitude = 0.1 * (np.diff(self.spectrum_ax.get_ylim())[0])
     
         # Store Gaussian component lines for individual display
         self.gaussian_component_lines = []
@@ -1541,7 +1542,7 @@ class ViewerWindow(QMainWindow):
         y_continuum_x0 = self.m * self.gaussian_x0 + self.b
     
         # Adjust amplitude so that peak of the Gaussian reaches dy
-        self.gaussian_amplitude = max(1E-20, dy - y_continuum_x0)
+        self.gaussian_amplitude = dy - y_continuum_x0#max(1E-20, dy - y_continuum_x0)
     
         # Generate updated Gaussian + Line function
         x_vals = np.linspace(self.x1, self.x2, 1000)
@@ -2413,8 +2414,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     
                 # Split the CSV data into three sections
                 obs_data = rows[:empty_indices[0]]
-                cont_data = rows[empty_indices[0]+1:empty_indices[1]]
-                line_data = rows[empty_indices[1]+1:]
+                scale_data = rows[empty_indices[0]+1:empty_indices[1]]
+                cont_data = rows[empty_indices[1]+1:empty_indices[2]]
+                line_data = rows[empty_indices[2]+1:]
     
                 # Load Observation Data (df_obs)
                 df_obs_columns = obs_data[0]
@@ -2919,32 +2921,45 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             self.source_redshift_button.setText('Source Redshift: '+str(df_obs['redshift'].item()))
             self.resolving_power_button.setText('Resolving Power: '+str(df_obs['resolvingpower'].item()))
             
+            df_scale_header_index = split_indices[0] + 1
+            while df_scale_header_index < len(rows) and not any(rows[df_scale_header_index]):
+                df_scale_header_index += 1
+            
+            df_scale_data_start = df_scale_header_index + 1
+            df_scale_data_end = split_indices[1]
+            
+            df_scale = pd.DataFrame(rows[df_scale_data_start:df_scale_data_end], 
+                                  columns=rows[df_scale_header_index])
+            df_scale = df_scale.apply(pd.to_numeric, errors='ignore')
+            
+            
+            
             # Read df_cont (second section, after first empty row)
-            df_cont_header_index = split_indices[0] + 1
+            df_cont_header_index = split_indices[1] + 1
             while df_cont_header_index < len(rows) and not any(rows[df_cont_header_index]):
                 df_cont_header_index += 1
                 
             df_cont_data_start = df_cont_header_index + 1
-            df_cont_data_end = split_indices[1]
+            df_cont_data_end = split_indices[2]
             
             df_cont = pd.DataFrame(rows[df_cont_data_start:df_cont_data_end], 
                                   columns=rows[df_cont_header_index])
             df_cont = df_cont.apply(pd.to_numeric, errors='ignore')
             
             # Read df (third section, after second empty row)
-            df_header_index = split_indices[1] + 1
+            df_header_index = split_indices[2] + 1
             while df_header_index < len(rows) and not any(rows[df_header_index]):
                 df_header_index += 1
                 
             df_data_start = df_header_index + 1
-            df_data_end = split_indices[2]
+            df_data_end = split_indices[3]
             
             df = pd.DataFrame(rows[df_data_start:df_data_end], 
                              columns=rows[df_header_index])
             df = df.apply(pd.to_numeric, errors='ignore')
             
             # Read df_fit (fourth section, after third empty row)
-            df_fit_header_index = split_indices[2] + 1
+            df_fit_header_index = split_indices[3] + 1
             while df_fit_header_index < len(rows) and not any(rows[df_fit_header_index]):
                 df_fit_header_index += 1
                 
@@ -2953,6 +2968,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             df_fit = pd.DataFrame(rows[df_fit_data_start:], 
                                  columns=rows[df_fit_header_index])
             df_fit = df_fit.apply(pd.to_numeric, errors='ignore')
+            
+            if 'RA' not in df_fit.columns:
+                df_fit['RA'] = self.viewer_window.pixel_to_ra_dec(df_fit['spaxel_x'],df_fit['spaxel_y'])[0]
+                df_fit['Dec'] = self.viewer_window.pixel_to_ra_dec(df_fit['spaxel_x'],df_fit['spaxel_y'])[1]
             
             # Define column groups for conversion
             float_columns = [
@@ -3104,6 +3123,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 fit_entry = {
                     'spaxel_x': self.viewer_window.current_spaxel[0],
                     'spaxel_y': self.viewer_window.current_spaxel[1],
+                    'RA': self.viewer_window.pixel_to_ra_dec(self.viewer_window.current_spaxel[0],self.viewer_window.current_spaxel[1])[0],
+                    'Dec': self.viewer_window.pixel_to_ra_dec(self.viewer_window.current_spaxel[0],self.viewer_window.current_spaxel[1])[1],
                     'region_ID': region_id,
                     'LineName': line_name,
                     'LineID': line_id,
@@ -3459,7 +3480,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                             QApplication.processEvents()
         
                         self.viewer_window.current_spaxel = (i, j)
-                        self.fit_spaxel(z, max_nfev=256, params_to_use=params)
+                        self.fit_spaxel(z, max_nfev=512, params_to_use=params)
         
                         current_spaxel = i * ny + j + 1
                         progress_bar.setValue(current_spaxel)
