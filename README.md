@@ -71,7 +71,7 @@ This should launch the main application window. You can now load the IFS data us
 ### Interacting with the Image Viewer Panel
 As the cursor is moved around the image, an orange rectangle indicates the currently focused spaxel. You can lock the spaxel by pressing the `L` key. To unlock, move the cursor back to the image viewer panel and press `L` again.
 
-### Interacting the the Spectrum Viewer Panel
+### Interacting with the the Spectrum Viewer Panel
 The spectrum viewer panel shows the spectrum contained in the currently-selected spaxel. You can zoom into a portion of the spectrum by clicking and dragging across the spectrum. As you do, a grey rectangular region will indicate the range that will be zoomed to when you release click. The new horizontal (spectral) range reflects the one you selected, while the new vertical (signal or flux) range is auto-scaled to show the continuum and the peaks of any lines in that spectral window. Right-click anywhere on the spectrum to bring up a `reset zoom` button which can be clicked to set the spectrum viewer window to its original range.
 
 ### Draw Continuum and Gaussians to Initialize a Model
