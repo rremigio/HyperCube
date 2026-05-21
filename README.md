@@ -37,7 +37,7 @@ git clone https://github.com/jkader925/HyperCube.git
 ```
 This will create a "HyperCube" directory containing the distribution. Alternatively, download source files as a .zip and unpack to desired location.
 
-### Run from source
+### Source Version
 The tool was designed for quick and painless installation using `conda` environment management via the included environment file `hypercube.yml`. In a terminal, from your base conda environment, navigate to the new HyperCube directory and issue the following command:
 
 ```
@@ -46,7 +46,36 @@ conda env create -f hypercube.yml
 
 Conda will install all of the required packages automatically. If not using conda, you can manually install the required packages (listed in hypercube.yml) via `pip`.
 
-### Standalone app
+#### Updating the Source Version
+ 
+New releases may require additional packages. To bring your existing environment up to date, first get the latest code — if you cloned the repository with git:
+ 
+```
+git pull origin main
+```
+ 
+Or download the latest zip from the [Releases](https://github.com/jkader925/HyperCube/releases) page and replace the contents of your HyperCube folder with the new files. Then update your conda environment from your base conda environment:
+ 
+```
+conda env update -f hypercube.yml --prune
+```
+ 
+The `--prune` flag removes any packages that are no longer needed. If you run into environment conflicts, a clean rebuild is the most reliable fix:
+ 
+```
+conda env remove -n HyperCube
+conda env create -f hypercube.yml
+```
+ 
+Then launch as normal:
+ 
+```
+python hypercube.py
+```
+ 
+---
+
+### Hypercube (Standalone App)
 The repository also comes with a `hypercube.spec` file for use with [pyinstaller](https://github.com/pyinstaller/pyinstaller), in order to package a standalone app version of HyperCube. From a Python console (conda or otherwise), install pyinstaller:
 
 ```
@@ -61,6 +90,21 @@ pyinstaller hypercube.spec
 
 This will generate a `dist` folder which contains hypercube.app, which can be double-clicked to open the tool. You can create a shortcut to this application from anywhere on your machine.
 
+#### Updating the App Version
+ 
+The app does not update automatically — each new version requires a fresh build. First get the latest code by downloading the latest zip from the [Releases](https://github.com/jkader925/HyperCube/releases) page and replacing the contents of your HyperCube folder, or if you cloned with git:
+ 
+```
+git pull origin main
+```
+ 
+Then rebuild from your HyperCube directory:
+ 
+```
+pyinstaller hypercube.spec
+```
+ 
+This regenerates the `dist` folder with an updated `hypercube.app`. Replace your existing app with the new one from `dist/`. If you have a shortcut or dock icon pointing to the old app, update it to point to the newly built version.
 ---
  
 # Updating
