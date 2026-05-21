@@ -35,7 +35,7 @@ Installation and use of this tool has been tested on MacOS and Windows, it has n
 ```
 git clone https://github.com/jkader925/HyperCube.git
 ```
-This will create a "HyperCube" directory containing the distribution.
+This will create a "HyperCube" directory containing the distribution. Alternatively, download source files as a .zip and unpack to desired location.
 
 ### Run from source
 The tool was designed for quick and painless installation using `conda` environment management via the included environment file `hypercube.yml`. In a terminal, from your base conda environment, navigate to the new HyperCube directory and issue the following command:
