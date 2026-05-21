@@ -31,7 +31,11 @@ HyperCube is a python-based spectral fitting tool designed to make integral fiel
 
 
 # Installation
-Installation and use of this tool has been tested on MacOS and Windows, it has not yet been tested on Linux operating systems. The first step is to clone the repository to a directory on your local machine where you have read/write/execute privileges. 
+Installation and use of this tool has been tested on MacOS and Windows, it has not yet been tested on Linux operating systems. The first step is to clone the repository to a directory on your local machine where you have read/write/execute privileges:
+```
+git clone https://github.com/jkader925/HyperCube.git
+```
+This will create a "HyperCube" directory containing the distribution.
 
 ### Run from source
 The tool was designed for quick and painless installation using `conda` environment management via the included environment file `hypercube.yml`. In a terminal, from your base conda environment, navigate to the new HyperCube directory and issue the following command:
