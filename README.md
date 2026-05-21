@@ -13,8 +13,8 @@ HyperCube is a python-based spectral fitting tool designed to make integral fiel
 
 ## Table of Contents
 1. [Installation](#installation)
-   - [Source Version](#python-version)
-   - [Standalone Version](#standalone-version)
+   - [Source Version](#hypercube-source-version)
+   - [Standalone Version](#hypercube-standalone-version)
 2. [Quick Start Guide](#quick-start-guide)
 3. [Interactive Usage Mode](#interactive-usage-mode)
    - [Initiating Models Interactively](#initiating-models-interactively)
