@@ -4,8 +4,10 @@
 Created on Fri Mar 28 15:01:22 2025
 
 @author: justin
-__version__ = "0.1.0"
+   __version__ = "0.2.0"
 """
+
+
 
 import sys
 import numpy as np
@@ -28,12 +30,13 @@ from astropy.io import fits
 from astropy.wcs import WCS
 
 from PyQt5 import QtWidgets
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QSize
 from PyQt5.QtWidgets import (
     QVBoxLayout, QPushButton, QLineEdit, QScrollArea, QGridLayout,
     QWidget, QLabel, QFrame, QMenu, QTextEdit, QMainWindow,
     QHBoxLayout, QMenuBar, QProgressBar, QDialog, QSplashScreen,
-    QAction, QSplitter, QFileDialog, QApplication, QGroupBox, QMessageBox)
+    QAction, QSplitter, QFileDialog, QApplication, QGroupBox, QMessageBox,
+    QDockWidget, QComboBox, QScrollBar)
 from PyQt5.QtGui import QFontMetrics, QPixmap
 from PyQt5.QtGui import QKeySequence
 
@@ -70,9 +73,9 @@ global snr_map
 global snr_value
 snr_value = 0
 
-data_observation_init = {'sourcename': [],
-                    'redshift': [],
-                    'resolvingpower': []}
+data_observation_init = {'sourcename': [''],
+                    'redshift': [''],
+                    'resolvingpower': ['']}
 
 df_obs = pd.DataFrame(data_observation_init)
 
@@ -460,6 +463,74 @@ def generalized_model(x, slope, intercept, *gaussian_params):
 #         app.setStyleSheet(style)
 
 # Apply PyQt5-like styling to Matplotlib
+def _fmt(value, sig=4):
+    """Format a numeric value for button display.
+    Uses scientific notation when the absolute value is < 0.001 or >= 1e6,
+    otherwise uses up to `sig` significant figures.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if v == 0:
+        return "0"
+    if abs(v) < 0.001 or abs(v) >= 1e5:
+        return f"{v:.{sig-1}e}"
+    return f"{v:.{sig}g}"
+
+
+
+# ── Emission line library ──────────────────────────────────────────────────────
+_LINE_LIBRARY = None  # loaded lazily
+
+def _load_line_library():
+    """Load LineLibrary.csv from the HyperCube directory.
+
+    Expected columns (exact names):
+        wavelength_AA  : float, wavelength in Angstroms (range 770.409 – 10938.086)
+        ion            : str,   emission line name
+        IP_eV          : float, ionization potential in eV
+    """
+    global _LINE_LIBRARY
+    if _LINE_LIBRARY is not None:
+        return _LINE_LIBRARY
+    try:
+        lib_path = resource_path('LineLibrary.csv')
+        _LINE_LIBRARY = pd.read_csv(lib_path,
+                                    dtype={'wavelength_AA': float, 'ion': str, 'IP_eV': float})
+        print(f"Loaded line library: {len(_LINE_LIBRARY)} lines from {lib_path}")
+    except Exception as e:
+        print(f"Could not load LineLibrary.csv: {e}")
+        _LINE_LIBRARY = pd.DataFrame(columns=['wavelength_AA', 'ion', 'IP_eV'])
+    return _LINE_LIBRARY
+
+
+def _identify_line(obs_wavelength_AA, redshift):
+    """Given an observed wavelength and source redshift, identify the nearest line.
+
+    Computes rest_wav = obs_wav / (1 + z), then finds the nearest entry in
+    LineLibrary.csv by rest wavelength.
+    Returns (ion_name, rest_wav_AA) or ('', nan) if redshift is missing/invalid.
+    """
+    try:
+        z = float(redshift)
+    except (TypeError, ValueError):
+        return '', np.nan
+    if z <= 0 or not np.isfinite(z):
+        return '', np.nan
+
+    lib = _load_line_library()
+    if len(lib) == 0:
+        return '', np.nan
+
+    rest_wav = obs_wavelength_AA / (1.0 + z)
+    wavs = lib['wavelength_AA'].values.astype(float)
+    idx = np.argmin(np.abs(wavs - rest_wav))
+    ion_name   = str(lib.iloc[idx]['ion'])
+    nearest_wav = float(wavs[idx])
+    return ion_name, nearest_wav
+
+
 def apply_mpl_qss_style(fig, ax, line):
     """Apply a PyQt5-style QSS theme to the given Matplotlib figure, axes, and line."""
     
@@ -513,17 +584,47 @@ class FrameButton(QPushButton):
         self.col = col
         self.frame_id = frame_id  # Store frame information in the button
         self.feature = feature
+        # Expand horizontally so buttons fill their grid column as the dock is resized
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Fixed
+        )
+
+    def minimumSizeHint(self):
+        # Allow buttons to compress below their text width when the dock is narrow
+        hint = super().minimumSizeHint()
+        return QSize(0, hint.height())
 
 
 class ViewerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.fit_params_window = None  # Placeholder, initially None
+        self.fit_params_dock = None   # QDockWidget wrapper, initially None
         self.fits_header = None
         self.fits_data = None
         self.is_1d_spectrum = False
         self.current_spaxel = None  # Stores the currently highlighted spaxel (x, y)
         self.locked = False  # Initially unlocked
+        self._chanmap_active = False   # True while C is held
+        # Brightness/contrast drag state
+        self._bc_drag_active = False
+        # Background image display settings
+        self._bkg_cmap  = 'gray'
+        self._bkg_scale = 'Linear'
+        self._bkg_brightness = 0.0   # shift: fraction of data range
+        self._bkg_contrast  = 1.0   # scale multiplier on span
+        self._init_guess_spaxel = None   # (x, y) that has interactive init guesses
+        self._blue_rect = None            # blue rectangle marking that spaxel
+        self._bc_drag_start  = None   # (x, y) in axes data coords at press
+        self._bc_vmin0 = None         # vmin at drag start
+        self._bc_vmax0 = None         # vmax at drag start
+        self._chanmap_start  = None    # wavelength where C was pressed
+        self._chanmap_span   = None    # axvspan patch on spectrum_ax
+        self._chanmap_locked = False   # True after C released (selection fixed)
+        # Subtraction windows (X and V keys)
+        self._submap = {'x': {'active': False, 'start': None, 'span': None, 'locked': False},
+                        'v': {'active': False, 'start': None, 'span': None, 'locked': False}}
         self.spectrum_cursor_pos = None  # Add tracking for spectrum cursor position
         self.spectrum_ax = None
         self.drawing_line = None
@@ -549,67 +650,345 @@ class ViewerWindow(QMainWindow):
 
     def initUI(self):
         self.setWindowTitle("HyperCube")
-        self.setGeometry(100, 100, 1000, 600)
+        self.setGeometry(100, 100, 1200, 700)
 
         # Main layout
         main_layout = QVBoxLayout()
 
-        # Splitter for two large panels
+        # Horizontal splitter: cube image left (~30%), spectrum viewer right (~70%)
         self.splitter = QSplitter(Qt.Horizontal)
 
-        # Left panel for white-light image
+        # Left panel: cube image (square-ish)
         self.left_panel = QWidget(self)
         self.left_layout = QVBoxLayout(self.left_panel)
+        self.left_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_layout.setSpacing(0)
+
+        # ── Zoom toolbar ───────────────────────────────────────────────
+        zoom_bar = QHBoxLayout()
+        zoom_bar.setContentsMargins(4, 2, 4, 2)
+        zoom_bar.setSpacing(2)
+
+        self._cube_zoom_level = 1.0  # 1.0 = 100% (fit window)
+        self._zoom_levels = [1/32, 1/16, 1/8, 1/4, 1/2, 1, 2, 4, 8, 16, 32]
+
+        self.zoom_out_btn = QPushButton("−", self)
+        self.zoom_out_btn.setFixedSize(24, 24)
+        self.zoom_out_btn.setToolTip("Zoom out")
+        self.zoom_out_btn.clicked.connect(self._cube_zoom_out)
+        zoom_bar.addWidget(self.zoom_out_btn)
+
+        self.zoom_combo = QComboBox(self)
+        self.zoom_combo.setFixedHeight(24)
+        self.zoom_combo.setMinimumWidth(130)
+        self.zoom_combo.setMaximumWidth(160)
+        self.zoom_combo.addItems([
+            "Fit window", "Fit width", "Fit height",
+            "3.125%", "6.25%", "12.5%", "25%", "50%",
+            "100%", "200%", "400%", "800%", "1600%", "3200%"
+        ])
+        self.zoom_combo.setCurrentText("100%")
+        self.zoom_combo.setStyleSheet(
+            "QComboBox { color: #eff0f1; background-color: #3c3f41; border: 1px solid #555; padding: 0 4px; }"
+            "QComboBox::drop-down { border: none; }"
+            "QComboBox QAbstractItemView {"
+            "    color: #eff0f1;"
+            "    background-color: #3c3f41;"
+            "    selection-background-color: #d7801a;"
+            "    selection-color: #000000;"
+            "    border: 1px solid #555;"
+            "}"
+        )
+        self.zoom_combo.currentTextChanged.connect(self._cube_zoom_combo_changed)
+        zoom_bar.addWidget(self.zoom_combo)
+
+        self.zoom_in_btn = QPushButton("+", self)
+        self.zoom_in_btn.setFixedSize(24, 24)
+        self.zoom_in_btn.setToolTip("Zoom in")
+        self.zoom_in_btn.clicked.connect(self._cube_zoom_in)
+        zoom_bar.addWidget(self.zoom_in_btn)
+
+        # Thin separator between zoom and image scaling controls
+        _sep1 = QFrame(self); _sep1.setFrameShape(QFrame.VLine); _sep1.setFrameShadow(QFrame.Sunken)
+        zoom_bar.addWidget(_sep1)
+
+        # Stretch combo (clip level)
+        _combo_qss = (
+            "QComboBox { color: #eff0f1; background-color: #3c3f41; border: 1px solid #555; padding: 0 4px; }"
+            "QComboBox::drop-down { border: none; }"
+            "QComboBox QAbstractItemView {"
+            "    color: #eff0f1; background-color: #3c3f41;"
+            "    selection-background-color: #d7801a; selection-color: #000000;"
+            "    border: 1px solid #555;}"
+        )
+        self.stretch_combo = QComboBox(self)
+        self.stretch_combo.setFixedHeight(24)
+        self.stretch_combo.setMinimumWidth(75)
+        self.stretch_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.stretch_combo.addItems(["minmax", "99.9%", "99.5%", "99%", "98%", "95%", "manual"])
+        self.stretch_combo.setCurrentText("99%")
+        self.stretch_combo.setToolTip("Image stretch (clip level)")
+        self.stretch_combo.setStyleSheet(_combo_qss)
+        self.stretch_combo.currentTextChanged.connect(self._cube_redraw_with_current_settings)
+        zoom_bar.addWidget(self.stretch_combo)
+
+        # Scale combo (transfer function)
+        self.scale_combo = QComboBox(self)
+        self.scale_combo.setFixedHeight(24)
+        self.scale_combo.setMinimumWidth(75)
+        self.scale_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.scale_combo.addItems(["Linear", "Log", "Square root", "Squared", "Asinh"])
+        self.scale_combo.setCurrentText("Linear")
+        self.scale_combo.setToolTip("Image scaling (transfer function)")
+        self.scale_combo.setStyleSheet(_combo_qss)
+        self.scale_combo.currentTextChanged.connect(self._cube_redraw_with_current_settings)
+        zoom_bar.addWidget(self.scale_combo)
+
+        zoom_bar.addStretch()
+
+        # Thin separator before reset button
+        _sep_reset = QFrame(self)
+        _sep_reset.setFrameShape(QFrame.VLine)
+        _sep_reset.setFrameShadow(QFrame.Sunken)
+        zoom_bar.addWidget(_sep_reset)
+
+        # Reset view button
+        self.reset_view_btn = QPushButton("↺  Reset", self)
+        self.reset_view_btn.setFixedHeight(24)
+        self.reset_view_btn.setToolTip(
+            "Reset to original view: B/W colormap, default zoom and scaling"
+        )
+        self.reset_view_btn.clicked.connect(self._cube_reset_view)
+        zoom_bar.addWidget(self.reset_view_btn)
+
+        # (rotate/flip/coords buttons are in the right-side panel of the canvas grid)
+        self._cube_rotation = 0
+        self._cube_flip_h = False
+        self._cube_flip_v = False
+        self._cube_coords_mode = "xy"
+
+        # Cube colormap selector
+        _sep_cmap = QFrame(self); _sep_cmap.setFrameShape(QFrame.VLine); _sep_cmap.setFrameShadow(QFrame.Sunken)
+        zoom_bar.addWidget(_sep_cmap)
+
+        self.cube_cmap_combo = QComboBox(self)
+        self.cube_cmap_combo.setFixedHeight(24)
+        self.cube_cmap_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.cube_cmap_combo.addItems(['gray','gray_r','viridis','plasma','inferno','magma','hot','cool','Blues','Reds','Greens','bwr','seismic'])
+        self.cube_cmap_combo.setCurrentText('gray')
+        self.cube_cmap_combo.setToolTip("Cube image colormap")
+        self.cube_cmap_combo.setStyleSheet(
+            "QComboBox { color: #eff0f1; background-color: #3c3f41; border: 1px solid #555; padding: 0 4px; }"
+            "QComboBox::drop-down { border: none; }"
+            "QComboBox QAbstractItemView { color: #eff0f1; background-color: #3c3f41;"
+            "  selection-background-color: #d7801a; selection-color: #000; border: 1px solid #555; }"
+        )
+        self.cube_cmap_combo.currentTextChanged.connect(
+            lambda cmap: [setattr(self, '_last_cmap', cmap), self._cube_redraw_with_current_settings()]
+        )
+        zoom_bar.addWidget(self.cube_cmap_combo)
+
+        # Thin separator before background image controls
+        _sep_bkg = QFrame(self); _sep_bkg.setFrameShape(QFrame.VLine); _sep_bkg.setFrameShadow(QFrame.Sunken)
+        zoom_bar.addWidget(_sep_bkg)
+
+        self.bkg_image_btn = QPushButton("🌌 Bkg Image", self)
+        self.bkg_image_btn.setFixedHeight(24)
+        self.bkg_image_btn.setToolTip("Overlay HST background image (requires resolved source)")
+        self.bkg_image_btn.setEnabled(False)
+        self.bkg_image_btn.clicked.connect(self._show_bkg_image_dialog)
+        zoom_bar.addWidget(self.bkg_image_btn)
+
+        # Opacity slider for the cube overlay
+        self.cube_opacity_slider = QtWidgets.QSlider(Qt.Horizontal, self)
+        self.cube_opacity_slider.setRange(0, 100)
+        self.cube_opacity_slider.setValue(100)
+        self.cube_opacity_slider.setFixedWidth(80)
+        self.cube_opacity_slider.setFixedHeight(20)
+        self.cube_opacity_slider.setToolTip("Cube overlay opacity")
+        self.cube_opacity_slider.setVisible(False)  # shown after bkg image loaded
+        self.cube_opacity_slider.valueChanged.connect(self._cube_opacity_changed)
+        zoom_bar.addWidget(self.cube_opacity_slider)
+
+        zoom_bar_widget = QWidget()
+        zoom_bar_widget.setLayout(zoom_bar)
+        zoom_bar_widget.setFixedHeight(30)
+        self.left_layout.addWidget(zoom_bar_widget)
+        # ───────────────────────────────────────────────────────────────
+
         self.canvas = FigureCanvas(plt.Figure())  # Matplotlib figure canvas
-        self.left_layout.addWidget(self.canvas)
-        self.left_panel.setLayout(self.left_layout)  # Ensure layout is set
+        self._init_placeholder_canvas()  # Dark themed placeholder before FITS loaded
+
+        # Canvas + manual scrollbars in a grid layout
+        # QScrollArea with setWidgetResizable=True never overflows, so we
+        # use standalone QScrollBars wired directly to the axes pan logic.
+        canvas_grid = QWidget()
+        canvas_grid_layout = QGridLayout(canvas_grid)
+        canvas_grid_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_grid_layout.setSpacing(0)
+
+        self.cube_hbar = QScrollBar(Qt.Horizontal)
+        self.cube_vbar = QScrollBar(Qt.Vertical)
+        self.cube_hbar.setRange(0, 1000)
+        self.cube_vbar.setRange(0, 1000)
+        self.cube_hbar.setValue(500)
+        self.cube_vbar.setValue(500)
+        self.cube_hbar.setSingleStep(20)
+        self.cube_vbar.setSingleStep(20)
+        self.cube_hbar.setPageStep(100)
+        self.cube_vbar.setPageStep(100)
+        # Thicker, easier-to-grab scrollbars; hidden until zoomed in
+        _bar_qss = (
+            "QScrollBar:horizontal { height: 14px; }" 
+            "QScrollBar:vertical   { width:  14px; }"
+            "QScrollBar::handle:horizontal { min-width: 30px; }"
+            "QScrollBar::handle:vertical   { min-height: 30px; }"
+        )
+        self.cube_hbar.setStyleSheet(_bar_qss)
+        self.cube_vbar.setStyleSheet(_bar_qss)
+        self.cube_hbar.hide()
+        self.cube_vbar.hide()
+        self._cube_scrollbar_updating = False  # guard against feedback loops
+        self.cube_hbar.valueChanged.connect(self._cube_scrollbar_pan)
+        self.cube_vbar.valueChanged.connect(self._cube_scrollbar_pan)
+
+        # Side button column: rotate, flip, coords toggle
+        side_panel = QWidget()
+        side_layout = QVBoxLayout(side_panel)
+        side_layout.setContentsMargins(2, 4, 2, 4)
+        side_layout.setSpacing(4)
+        side_layout.setAlignment(Qt.AlignTop)
+
+        _side_btn_defs = [
+            ("⟳", "Rotate 90° clockwise (disabled)",        lambda: self._cube_rotate(90)),
+            ("⟲", "Rotate 90° counter-clockwise (disabled)", lambda: self._cube_rotate(-90)),
+            ("⇔", "Flip horizontal (disabled)",              lambda: self._cube_flip('h')),
+            ("⇕", "Flip vertical (disabled)",                lambda: self._cube_flip('v')),
+        ]
+        for label, tip, fn in _side_btn_defs:
+            b = QPushButton(label, self)
+            b.setFixedSize(28, 28)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            b.setEnabled(False)
+            side_layout.addWidget(b)
+
+        # Thin horizontal separator
+        _hsep = QFrame(); _hsep.setFrameShape(QFrame.HLine); _hsep.setFrameShadow(QFrame.Sunken)
+        side_layout.addWidget(_hsep)
+
+        self.coords_toggle_btn = QPushButton("X/Y", self)
+        self.coords_toggle_btn.setFixedSize(40, 28)
+        self.coords_toggle_btn.setToolTip("Toggle between X/Y pixel and RA/Dec axis labels")
+        self.coords_toggle_btn.clicked.connect(self._cube_toggle_coords)
+        side_layout.addWidget(self.coords_toggle_btn)
+
+        canvas_grid_layout.addWidget(self.canvas,    0, 0)
+        canvas_grid_layout.addWidget(side_panel,     0, 1)
+        canvas_grid_layout.addWidget(self.cube_vbar, 0, 2)
+        canvas_grid_layout.addWidget(self.cube_hbar, 1, 0)
+        canvas_grid_layout.setColumnStretch(0, 1)
+        canvas_grid_layout.setRowStretch(0, 1)
+        self.left_layout.addWidget(canvas_grid)
+        self.left_panel.setLayout(self.left_layout)
         self.splitter.addWidget(self.left_panel)
 
-        # Right panel for spectrum
+        # Right panel: spectrum viewer
         self.right_panel = QWidget(self)
         self.right_layout = QVBoxLayout(self.right_panel)
-        self.right_panel.setLayout(self.right_layout)  # Ensure layout is set
+        self.right_layout.setContentsMargins(0, 0, 0, 0)
+        self.right_layout.setSpacing(0)
+
+        # ── Channel map / spectrum toolbar (hidden until spectrum is loaded) ──
+        spec_bar = QHBoxLayout()
+        spec_bar.setContentsMargins(4, 2, 4, 2)
+        spec_bar.setSpacing(4)
+
+        # Navigation: shift selection box left/right
+        self.chanmap_prev_btn = QPushButton("−", self)
+        self.chanmap_prev_btn.setFixedSize(24, 24)
+        self.chanmap_prev_btn.setToolTip("Shift channel map selection left by 1 pixel")
+        self.chanmap_prev_btn.clicked.connect(lambda: self._chanmap_shift(-1))
+        spec_bar.addWidget(self.chanmap_prev_btn)
+
+        # Centre pixel: button that opens a dialog on click (no keyboard focus stealing)
+        self.chanmap_centre_btn = SpaxelButton("Pixel: —", "Channel centre")
+        self.chanmap_centre_btn.setFixedHeight(24)
+        self.chanmap_centre_btn.setMinimumWidth(90)
+        self.chanmap_centre_btn.setToolTip("Centre pixel of channel map selection — click to edit")
+        self.chanmap_centre_btn.clicked.connect(self._chanmap_centre_clicked)
+        spec_bar.addWidget(self.chanmap_centre_btn)
+
+        self.chanmap_next_btn = QPushButton("+", self)
+        self.chanmap_next_btn.setFixedSize(24, 24)
+        self.chanmap_next_btn.setToolTip("Shift channel map selection right by 1 pixel")
+        self.chanmap_next_btn.clicked.connect(lambda: self._chanmap_shift(+1))
+        spec_bar.addWidget(self.chanmap_next_btn)
+
+        spec_bar.addStretch()
+        self.spec_bar_widget = QWidget()
+        self.spec_bar_widget.setLayout(spec_bar)
+        self.spec_bar_widget.setFixedHeight(30)
+        self.spec_bar_widget.hide()  # shown when spectrum canvas first appears
+        self.right_layout.addWidget(self.spec_bar_widget)
+        # ───────────────────────────────────────────────────────────────
+
+        self.right_panel.setLayout(self.right_layout)
         self.splitter.addWidget(self.right_panel)
 
-        # Set equal size stretch factors (ensures both panels start equally sized)
-        self.splitter.setSizes([300, 300])  # Start with equal sizes
+        # Equal 50/50 split by default; user can drag the splitter to adjust
+        self.splitter.setSizes([600, 600])
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 1)
 
         main_layout.addWidget(self.splitter)
 
-        # Bottom buttons layout
-        bottom_layout = QHBoxLayout()
+        # ── Toolbar row: sits between the splitter panels and the window edge ──
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(6, 4, 6, 4)
+        toolbar.setSpacing(8)
 
-        # Small "Open Fit Params" button (lower-left corner)
-        self.open_fit_params_button = QPushButton("Fit Params", self)
-        self.open_fit_params_button.setFixedSize(80, 30)
-        self.open_fit_params_button.clicked.connect(self.open_fit_params_window)
-        bottom_layout.addWidget(self.open_fit_params_button, alignment=Qt.AlignLeft)
-        
-        self.WLscalefactor_button = QPushButton("Wavelength Scale Factor", self)
-        self.WLscalefactor_button.setFixedSize(120, 30)
+        # Left group: panel toggle + data-dependent tools
+        self.open_fit_params_button = QPushButton("▼  Fit Parameters", self)
+        self.open_fit_params_button.setFixedHeight(32)
+        self.open_fit_params_button.setToolTip("Toggle Fit Parameters panel")
+        self.open_fit_params_button.clicked.connect(self.toggle_fit_params_dock)
+        toolbar.addWidget(self.open_fit_params_button)
+
+        # Thin separator
+        sep = QFrame(self)
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        toolbar.addWidget(sep)
+
+        self.WLscalefactor_button = QPushButton("λ Scale", self)
+        self.WLscalefactor_button.setFixedHeight(32)
+        self.WLscalefactor_button.setToolTip("Wavelength scale factor")
+        self.WLscalefactor_button.setEnabled(False)  # enabled after FITS load
         self.WLscalefactor_button.clicked.connect(self.press_scaleWL_button)
-        bottom_layout.addWidget(self.WLscalefactor_button, alignment=Qt.AlignLeft)
-        
-        self.fluxscalefactor_button = QPushButton("Flux Scale Factor", self)
-        self.fluxscalefactor_button.setFixedSize(120, 30)
+        toolbar.addWidget(self.WLscalefactor_button)
+
+        self.fluxscalefactor_button = QPushButton("F Scale", self)
+        self.fluxscalefactor_button.setFixedHeight(32)
+        self.fluxscalefactor_button.setToolTip("Flux scale factor")
+        self.fluxscalefactor_button.setEnabled(False)  # enabled after FITS load
         self.fluxscalefactor_button.clicked.connect(self.press_scaleflux_button)
-        bottom_layout.addWidget(self.fluxscalefactor_button, alignment=Qt.AlignLeft)
-        
+        toolbar.addWidget(self.fluxscalefactor_button)
 
-        # Spacer to push buttons apart
-        bottom_layout.addStretch()
+        toolbar.addStretch()
 
-        # "Open FITS File" button (lower-right corner)
-        self.open_fits_button = QPushButton("Open FITS", self)
-        self.open_fits_button.setFixedSize(120, 40)
+        # Right: prominent Open FITS button
+        self.open_fits_button = QPushButton("  ⬆  Open FITS File", self)
+        self.open_fits_button.setFixedHeight(36)
+        self.open_fits_button.setStyleSheet(
+            "QPushButton { background-color: #d7801a; color: white; font-weight: bold;"
+            " border-radius: 6px; padding: 0 16px; }"
+            "QPushButton:hover { background-color: #ffa02f; }"
+        )
         self.open_fits_button.clicked.connect(self.open_fits_file)
-        bottom_layout.addWidget(self.open_fits_button, alignment=Qt.AlignRight)
+        toolbar.addWidget(self.open_fits_button)
 
-        # self.open_fits_file()
-
-        main_layout.addLayout(bottom_layout)
+        main_layout.addLayout(toolbar)
 
         # Set up central widget
         central_widget = QWidget()
@@ -619,6 +998,8 @@ class ViewerWindow(QMainWindow):
         # Set menu bar
         self.setMenuBar(self.create_menu_bar_VisualizerWindow())
 
+        # Handle and separator styles are defined in QDarkOrange_style.qss
+
         # Ensure the window comes to the front
         # self.show()
         self.raise_()
@@ -626,8 +1007,875 @@ class ViewerWindow(QMainWindow):
 
         # Enable mouse tracking for the white-light image
         self.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
+        self.canvas.mpl_connect('scroll_event', self._cube_on_scroll)
+        self.canvas.mpl_connect('button_press_event', self._cube_pan_start)
+        self.canvas.mpl_connect('button_press_event', self._cube_bc_press)
+        self.canvas.mpl_connect('motion_notify_event', self._cube_pan_move)
+        self.canvas.mpl_connect('motion_notify_event', self._cube_bc_drag)
+        self.canvas.mpl_connect('button_release_event', self._cube_pan_end)
+        self.canvas.mpl_connect('button_release_event', self._cube_bc_release)
+        self._cube_pan_active = False
+        self._cube_pan_start_pos = None
+        self._cube_pan_start_xlim = None
+        self._cube_pan_start_ylim = None
 
         self.cursor_pos = None
+
+    # ── Cube viewport zoom ────────────────────────────────────────────────────
+
+
+    def _cube_scrollbar_pan(self):
+        """Pan the cube axes from scrollbar position (0-1000 range)."""
+        if self._cube_scrollbar_updating:
+            return
+        if not hasattr(self, 'ax') or self.ax is None:
+            return
+        imgs = [c for c in self.ax.get_children()
+                if hasattr(c, 'get_extent') and callable(c.get_extent)]
+        if not imgs:
+            return
+
+        x0, x1, y0, y1 = imgs[0].get_extent()
+        img_w = abs(x1 - x0)
+        img_h = abs(y1 - y0)
+
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        view_w = abs(xlim[1] - xlim[0])
+        view_h = abs(ylim[1] - ylim[0])
+
+        pan_w = max(img_w - view_w, 0)
+        pan_h = max(img_h - view_h, 0)
+
+        frac_h = self.cube_hbar.value() / 1000.0
+        frac_v = 1.0 - self.cube_vbar.value() / 1000.0  # invert: 0=top
+
+        cx = x0 + view_w / 2 + frac_h * pan_w
+        cy = y0 + view_h / 2 + frac_v * pan_h
+
+        self.ax.set_xlim(cx - view_w / 2, cx + view_w / 2)
+        self.ax.set_ylim(cy - view_h / 2, cy + view_h / 2)
+        self.canvas.draw_idle()
+
+    def _cube_update_scrollbars(self):
+        """Sync scrollbar positions to current axes limits and show/hide them.
+        
+        Bars are only visible when the view is smaller than the image
+        (i.e. the user is zoomed in enough that parts of the image are hidden).
+        """
+        if not hasattr(self, 'ax') or self.ax is None:
+            return
+        if not hasattr(self, 'cube_hbar'):
+            return
+        imgs = [c for c in self.ax.get_children()
+                if hasattr(c, 'get_extent') and callable(c.get_extent)]
+        if not imgs:
+            return
+
+        x0, x1, y0, y1 = imgs[0].get_extent()
+        img_w = abs(x1 - x0)
+        img_h = abs(y1 - y0)
+
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        view_w = abs(xlim[1] - xlim[0])
+        view_h = abs(ylim[1] - ylim[0])
+
+        pan_w = img_w - view_w
+        pan_h = img_h - view_h
+
+        self._cube_scrollbar_updating = True
+
+        # Horizontal bar
+        if pan_w > 1e-6:
+            cx = (xlim[0] + xlim[1]) / 2
+            frac_h = np.clip((cx - (x0 + view_w / 2)) / pan_w, 0, 1)
+            self.cube_hbar.setValue(int(frac_h * 1000))
+            self.cube_hbar.show()
+        else:
+            self.cube_hbar.setValue(500)
+            self.cube_hbar.hide()
+
+        # Vertical bar
+        if pan_h > 1e-6:
+            cy = (ylim[0] + ylim[1]) / 2
+            frac_v = np.clip((cy - (y0 + view_h / 2)) / pan_h, 0, 1)
+            self.cube_vbar.setValue(int((1 - frac_v) * 1000))
+            self.cube_vbar.show()
+        else:
+            self.cube_vbar.setValue(500)
+            self.cube_vbar.hide()
+
+        self._cube_scrollbar_updating = False
+
+    def _cube_bc_press(self, event):
+        """Start brightness/contrast drag on left-click (button 1) in the cube axes."""
+        if event.button != 1 or event.inaxes != self.ax:
+            return
+        bkg = getattr(self, '_bkg_artist', None)
+        # Get clim from the cube image only (skip the background artist)
+        imgs = [c for c in self.ax.get_children()
+                if hasattr(c, 'get_clim') and callable(c.get_clim) and c is not bkg]
+        if not imgs:
+            return
+        self._bc_vmin0, self._bc_vmax0 = imgs[0].get_clim()
+        self._bc_drag_start  = (event.x, event.y)  # pixels, not data coords
+        self._bc_drag_active = True
+
+    def _cube_bc_drag(self, event):
+        """Adjust brightness (left/right) and contrast (up/down) during drag."""
+        if not self._bc_drag_active or event.inaxes != self.ax:
+            return
+        if event.x is None or event.y is None:
+            return
+
+        dx = event.x - self._bc_drag_start[0]   # pixels rightward
+        dy = event.y - self._bc_drag_start[1]   # pixels upward
+
+        span = self._bc_vmax0 - self._bc_vmin0
+        if span == 0:
+            span = 1.0
+
+        # Sensitivity: 300 px of drag = 1 full span shift/scale
+        # Up/down = brightness (shift midpoint); left/right = contrast (scale span)
+        brightness_shift = (dy / 300.0) * span   # up = brighter
+        contrast_scale   = 10 ** (dx / 300.0)    # right = wider range (less contrast)
+
+        mid = (self._bc_vmin0 + self._bc_vmax0) / 2 + brightness_shift
+        half = (span / 2) * contrast_scale
+
+        bkg = getattr(self, '_bkg_artist', None)
+        # Only adjust clim on the cube image — leave the background untouched
+        imgs = [c for c in self.ax.get_children()
+                if hasattr(c, 'set_clim') and callable(c.set_clim) and c is not bkg]
+        for img in imgs:
+            img.set_clim(mid - half, mid + half)
+        self.canvas.draw_idle()
+
+    def _cube_bc_release(self, event):
+        """End brightness/contrast drag."""
+        if event.button == 1:
+            self._bc_drag_active = False
+
+    def _cube_clamp_limits(self, xlim, ylim):
+        """Clamp xlim/ylim so the view never pans outside the image bounds."""
+        if not hasattr(self, 'ax') or self.ax is None:
+            return xlim, ylim
+        imgs = [c for c in self.ax.get_children()
+                if hasattr(c, 'get_extent') and callable(c.get_extent)]
+        if not imgs:
+            return xlim, ylim
+        x0, x1, y0, y1 = imgs[0].get_extent()
+        half_w = (xlim[1] - xlim[0]) / 2
+        half_h = (ylim[1] - ylim[0]) / 2
+        cx = np.clip((xlim[0] + xlim[1]) / 2, x0 + half_w, x1 - half_w)
+        cy = np.clip((ylim[0] + ylim[1]) / 2, y0 + half_h, y1 - half_h)
+        return (cx - half_w, cx + half_w), (cy - half_h, cy + half_h)
+
+    def _cube_on_scroll(self, event):
+        """Pan the cube image on trackpad/mouse scroll.
+        
+        Vertical scroll (step) pans up/down.
+        Horizontal scroll (guiEvent with angleDeltaX) pans left/right.
+        Hold Ctrl to pan horizontally on a one-axis scroll device.
+        """
+        if not hasattr(self, 'ax') or self.ax is None:
+            return
+        if event.inaxes != self.ax:
+            return
+
+        xlim = list(self.ax.get_xlim())
+        ylim = list(self.ax.get_ylim())
+        pan_frac = 0.1  # 10% of current view per scroll step
+
+        dx = (xlim[1] - xlim[0]) * pan_frac
+        dy = (ylim[1] - ylim[0]) * pan_frac
+
+        # Dominant-axis locking: whichever axis has the larger delta wins,
+        # preventing diagonal drift on trackpads.
+        vert_raw = 0
+        horiz_raw = 0
+        if hasattr(event, 'guiEvent') and event.guiEvent is not None:
+            ge = event.guiEvent
+            if hasattr(ge, 'angleDelta'):
+                horiz_raw = ge.angleDelta().x()
+                vert_raw  = ge.angleDelta().y()
+
+        if abs(horiz_raw) > abs(vert_raw) and horiz_raw != 0:
+            # Pure horizontal gesture → pan left/right only
+            direction = -1 if horiz_raw > 0 else 1
+            xlim[0] += direction * dx
+            xlim[1] += direction * dx
+        else:
+            # Vertical scroll (wheel or dominant vertical gesture) → pan up/down
+            if vert_raw != 0:
+                direction = 1 if vert_raw > 0 else -1
+            else:
+                direction = 1 if event.button == 'up' else -1
+            ylim[0] += direction * dy
+            ylim[1] += direction * dy
+
+        xlim, ylim = self._cube_clamp_limits(xlim, ylim)
+        self.ax.set_xlim(xlim)
+        self.ax.set_ylim(ylim)
+        self.canvas.draw_idle()
+        self._cube_update_scrollbars()
+
+    def _cube_pan_start(self, event):
+        """Begin middle-mouse-button drag pan."""
+        if event.button == 2 and event.inaxes == self.ax:
+            self._cube_pan_active = True
+            self._cube_pan_start_pos = (event.xdata, event.ydata)
+            self._cube_pan_start_xlim = list(self.ax.get_xlim())
+            self._cube_pan_start_ylim = list(self.ax.get_ylim())
+
+    def _cube_pan_move(self, event):
+        """Pan while middle-mouse button is held."""
+        if not self._cube_pan_active or event.inaxes != self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        dx = self._cube_pan_start_pos[0] - event.xdata
+        dy = self._cube_pan_start_pos[1] - event.ydata
+        xlim = [self._cube_pan_start_xlim[0] + dx,
+                self._cube_pan_start_xlim[1] + dx]
+        ylim = [self._cube_pan_start_ylim[0] + dy,
+                self._cube_pan_start_ylim[1] + dy]
+        xlim, ylim = self._cube_clamp_limits(xlim, ylim)
+        self.ax.set_xlim(xlim)
+        self.ax.set_ylim(ylim)
+        self.canvas.draw_idle()
+        self._cube_update_scrollbars()
+
+    def _cube_pan_end(self, event):
+        """End middle-mouse-button drag pan."""
+        if event.button == 2:
+            self._cube_pan_active = False
+            self._cube_pan_start_pos = None
+
+    def _cube_zoom_apply(self, zoom_level=None, mode=None):
+        """Apply zoom to the cube axes.
+        
+        zoom_level: float multiplier (1.0 = fit window, 2.0 = 200%, etc.)
+        mode: 'fit_window' | 'fit_width' | 'fit_height' | None (use zoom_level)
+        """
+        if not hasattr(self, 'ax') or self.ax is None:
+            return
+
+        # Natural extent of the image in data coords
+        imgs = [c for c in self.ax.get_children()
+                if hasattr(c, 'get_extent') and callable(c.get_extent)]
+        if not imgs:
+            return
+        x0, x1, y0, y1 = imgs[0].get_extent()  # (left, right, bottom, top)
+        img_w = abs(x1 - x0)
+        img_h = abs(y1 - y0)
+        cx = (x0 + x1) / 2
+        cy = (y0 + y1) / 2
+
+        canvas_w = self.canvas.width()
+        canvas_h = self.canvas.height()
+        if canvas_w == 0 or canvas_h == 0:
+            return
+
+        if mode == 'fit_window':
+            self.ax.set_xlim(x0, x1)
+            self.ax.set_ylim(y0, y1)
+            self._cube_zoom_level = 1.0
+        elif mode == 'fit_width':
+            # Scale so image width fills canvas; crop/pad height
+            scale = img_w / img_w  # width always fits
+            half_h = (img_w / canvas_w * canvas_h) / 2
+            self.ax.set_xlim(x0, x1)
+            self.ax.set_ylim(cy - half_h, cy + half_h)
+            self._cube_zoom_level = 1.0
+        elif mode == 'fit_height':
+            half_w = (img_h / canvas_h * canvas_w) / 2
+            self.ax.set_xlim(cx - half_w, cx + half_w)
+            self.ax.set_ylim(y0, y1)
+            self._cube_zoom_level = 1.0
+        else:
+            # Percentage zoom: zoom_level=1 shows the full image,
+            # zoom_level=2 shows half the image (2× magnification), etc.
+            half_w = img_w / (2 * zoom_level)
+            half_h = img_h / (2 * zoom_level)
+            # Keep centre fixed
+            cur_xlim = self.ax.get_xlim()
+            cur_ylim = self.ax.get_ylim()
+            cur_cx = (cur_xlim[0] + cur_xlim[1]) / 2
+            cur_cy = (cur_ylim[0] + cur_ylim[1]) / 2
+            # Clamp centre so we don't pan outside the image
+            cur_cx = np.clip(cur_cx, x0 + half_w, x1 - half_w)
+            cur_cy = np.clip(cur_cy, y0 + half_h, y1 - half_h)
+            self.ax.set_xlim(cur_cx - half_w, cur_cx + half_w)
+            self.ax.set_ylim(cur_cy - half_h, cur_cy + half_h)
+            self._cube_zoom_level = zoom_level
+
+        self.canvas.draw_idle()
+        self._cube_update_scrollbars()
+
+    def _cube_zoom_in(self):
+        lvls = self._zoom_levels
+        idx = min(range(len(lvls)), key=lambda i: abs(lvls[i] - self._cube_zoom_level))
+        new_idx = min(idx + 1, len(lvls) - 1)
+        self._cube_zoom_level = lvls[new_idx]
+        self._sync_zoom_combo()
+        self._cube_zoom_apply(zoom_level=self._cube_zoom_level)
+
+    def _cube_zoom_out(self):
+        lvls = self._zoom_levels
+        idx = min(range(len(lvls)), key=lambda i: abs(lvls[i] - self._cube_zoom_level))
+        new_idx = max(idx - 1, 0)
+        self._cube_zoom_level = lvls[new_idx]
+        self._sync_zoom_combo()
+        self._cube_zoom_apply(zoom_level=self._cube_zoom_level)
+
+    def _sync_zoom_combo(self):
+        """Update the combo text to reflect current zoom level without triggering signal."""
+        pct_map = {
+            1/32: "3.125%", 1/16: "6.25%", 1/8: "12.5%", 1/4: "25%",
+            1/2: "50%", 1: "100%", 2: "200%", 4: "400%",
+            8: "800%", 16: "1600%", 32: "3200%"
+        }
+        label = pct_map.get(self._cube_zoom_level, f"{int(self._cube_zoom_level*100)}%")
+        self.zoom_combo.blockSignals(True)
+        self.zoom_combo.setCurrentText(label)
+        self.zoom_combo.blockSignals(False)
+
+    def _cube_zoom_combo_changed(self, text):
+        mode_map = {
+            "Fit window": ("fit_window", 1.0),
+            "Fit width":  ("fit_width",  1.0),
+            "Fit height": ("fit_height", 1.0),
+        }
+        pct_map = {
+            "3.125%": 1/32, "6.25%": 1/16, "12.5%": 1/8, "25%": 1/4,
+            "50%": 1/2, "100%": 1, "200%": 2, "400%": 4,
+            "800%": 8, "1600%": 16, "3200%": 32
+        }
+        if text in mode_map:
+            mode, lvl = mode_map[text]
+            self._cube_zoom_level = lvl
+            self._cube_zoom_apply(mode=mode)
+        elif text in pct_map:
+            lvl = pct_map[text]
+            self._cube_zoom_level = lvl
+            self._cube_zoom_apply(zoom_level=lvl)
+
+    # ── Cube image transform (rotate/flip) ───────────────────────────────────
+
+    def _cube_get_transformed_data(self):
+        """Apply current rotation and flip to _last_data and return the result.
+
+        Verified empirically:
+          k=1 → 90° CW visual rotation  (with imshow origin=lower)
+          k=2 → 180°, k=3 → 270° CW
+        _cube_rotation stores k directly (0-3).
+        """
+        if not hasattr(self, '_last_data') or self._last_data is None:
+            return None
+        data = self._last_data
+        if getattr(self, '_last_from_fits', False):
+            img = np.nansum(data, axis=0).astype(np.float64)
+        else:
+            img = np.array(data, dtype=np.float64)
+
+        self._cube_orig_shape = img.shape  # (ny_orig, nx_orig)
+
+        k = getattr(self, '_cube_rotation', 0) % 4
+        if k:
+            img = np.rot90(img, k=k)
+
+        if getattr(self, '_cube_flip_h', False):
+            img = np.fliplr(img)
+        if getattr(self, '_cube_flip_v', False):
+            img = np.flipud(img)
+        return img
+
+    def _cube_transform_coords(self, xd, yd):
+        """Map display coords (after rotate/flip) back to original data coords.
+
+        Inverse formulas verified against np.rot90 + imshow(origin=lower):
+          k=0: x_orig=xd,          y_orig=yd
+          k=1: x_orig=nx_orig-1-yd, y_orig=xd
+          k=2: x_orig=nx_orig-1-xd, y_orig=ny_orig-1-yd
+          k=3: x_orig=yd,           y_orig=ny_orig-1-xd
+        Flips are applied before rotation in the forward pass, so undo after.
+        """
+        if not hasattr(self, '_cube_orig_shape'):
+            return int(round(xd)), int(round(yd))
+        ny_orig, nx_orig = self._cube_orig_shape
+
+        # Undo flips first (they were applied after rotation in the forward pass)
+        x, y = xd, yd
+        # Need the rotated shape to undo flips correctly
+        k = getattr(self, '_cube_rotation', 0) % 4
+        if k in (1, 3):
+            ny_rot, nx_rot = nx_orig, ny_orig
+        else:
+            ny_rot, nx_rot = ny_orig, nx_orig
+        if getattr(self, '_cube_flip_h', False):
+            x = nx_rot - 1 - x
+        if getattr(self, '_cube_flip_v', False):
+            y = ny_rot - 1 - y
+
+        # Undo rotation
+        if k == 0:
+            x_orig, y_orig = x, y
+        elif k == 1:
+            x_orig, y_orig = nx_orig - 1 - y, x
+        elif k == 2:
+            x_orig, y_orig = nx_orig - 1 - x, ny_orig - 1 - y
+        else:  # k == 3
+            x_orig, y_orig = y, ny_orig - 1 - x
+
+        return int(round(x_orig)), int(round(y_orig))
+
+    def _cube_redraw_transformed(self):
+        """Redraw the cube image with the current transform + toolbar settings."""
+        img = self._cube_get_transformed_data()
+        if img is None:
+            return
+        self._applying_transform = True
+        try:
+            self.draw_image(img, cmap=self._last_cmap, scale=self._last_scale, from_fits=False)
+        finally:
+            self._applying_transform = False
+
+    def _cube_rotate(self, degrees):
+        """Rotate the cube image. degrees=90 → CW, degrees=-90 → CCW."""
+        steps = (degrees // 90) % 4
+        self._cube_rotation = (getattr(self, '_cube_rotation', 0) + steps) % 4
+        self._cube_redraw_transformed()
+
+    def _cube_flip(self, axis):
+        """Flip the cube image horizontally ('h') or vertically ('v')."""
+        if axis == 'h':
+            self._cube_flip_h = not getattr(self, '_cube_flip_h', False)
+        else:
+            self._cube_flip_v = not getattr(self, '_cube_flip_v', False)
+        self._cube_redraw_transformed()
+
+    # ── Cube axis coord label toggle (X/Y ↔ RA/Dec) ──────────────────────────
+
+    def _cube_toggle_coords(self):
+        """Toggle cube axis tick labels between pixel X/Y and RA/Dec."""
+        if not hasattr(self, 'ax') or self.ax is None:
+            return
+        mode = getattr(self, '_cube_coords_mode', 'xy')
+        if mode == 'xy':
+            self._cube_coords_mode = 'radec'
+            self.coords_toggle_btn.setText('RA/Dec')
+            self._cube_apply_radec_labels()
+        else:
+            self._cube_coords_mode = 'xy'
+            self.coords_toggle_btn.setText('X/Y')
+            self._cube_apply_xy_labels()
+        self.canvas.draw_idle()
+
+    def _cube_apply_xy_labels(self):
+        """Set cube axes to plain pixel X/Y ticks."""
+        if not hasattr(self, 'ax') or self.ax is None:
+            return
+        self.ax.xaxis.set_major_formatter(plt.ScalarFormatter())
+        self.ax.yaxis.set_major_formatter(plt.ScalarFormatter())
+        self.ax.set_xlabel('X (pixels)')
+        self.ax.set_ylabel('Y (pixels)')
+        # Restore auto pixel ticks
+        self.ax.xaxis.set_major_locator(plt.AutoLocator())
+        self.ax.yaxis.set_major_locator(plt.AutoLocator())
+
+    def _cube_apply_radec_labels(self):
+        """Set cube axes to RA/Dec tick labels derived from WCS."""
+        if not hasattr(self, 'ax') or self.ax is None:
+            return
+        # Build tick positions and labels from the current pixel grid
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        # Sample ~5 evenly-spaced pixel positions across each axis
+        x_pix = np.linspace(max(0, int(xlim[0])), int(xlim[1]), 5).astype(int)
+        y_pix = np.linspace(max(0, int(ylim[0])), int(ylim[1]), 5).astype(int)
+
+        try:
+            ra_vals,  _ = self.pixel_to_ra_dec(x_pix, np.full_like(x_pix, int((ylim[0]+ylim[1])/2)))
+            _,  dec_vals = self.pixel_to_ra_dec(np.full_like(y_pix, int((xlim[0]+xlim[1])/2)), y_pix)
+
+            x_labels = [self.decimal_to_sexagesimal(float(r), is_ra=True)  for r in ra_vals]
+            y_labels = [self.decimal_to_sexagesimal(float(d), is_ra=False) for d in dec_vals]
+
+            self.ax.set_xticks(x_pix)
+            self.ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=7)
+            self.ax.set_yticks(y_pix)
+            self.ax.set_yticklabels(y_labels, fontsize=7)
+            self.ax.set_xlabel('RA (J2000)')
+            self.ax.set_ylabel('Dec (J2000)')
+        except Exception as e:
+            print(f"RA/Dec label error: {e}")
+            self._cube_apply_xy_labels()
+
+    # ── Background HST image overlay ──────────────────────────────────────────
+
+    def _show_bkg_image_dialog(self):
+        """Open dialog to select/fetch an HST background image and adjust its display."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Background Image')
+        dialog.setMinimumWidth(380)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(6)
+
+        # ── Band selection ────────────────────────────────────────────────────
+        layout.addWidget(QLabel('Select HST HiPS band:'))
+        _hips_i = 'https://alaskybis.cds.unistra.fr/HST-hips/filter_I_hips/'
+        _hips_b = 'https://alaskybis.cds.unistra.fr/HST-hips/filter_B_hips/'
+        i_btn   = QPushButton('HST  I-band');  i_btn.setFixedHeight(30)
+        b_btn   = QPushButton('HST  B-band');  b_btn.setFixedHeight(30)
+        _hips_cxo = 'https://cdaftp.cfa.harvard.edu/cxc-hips/'
+        cxo_btn = QPushButton('Chandra X-ray (broadband RGB)'); cxo_btn.setFixedHeight(30)
+        clr_btn = QPushButton('Clear background'); clr_btn.setFixedHeight(26)
+        layout.addWidget(i_btn)
+        layout.addWidget(b_btn)
+        layout.addWidget(cxo_btn)
+        layout.addWidget(clr_btn)
+        status = QLabel(''); status.setWordWrap(True)
+        layout.addWidget(status)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(sep)
+
+        # ── Display settings ──────────────────────────────────────────────────
+        layout.addWidget(QLabel('Background display settings:'))
+
+        _combo_qss = (
+            "QComboBox { color: #eff0f1; background-color: #3c3f41; border: 1px solid #555; padding: 0 4px; }"
+            "QComboBox::drop-down { border: none; }"
+            "QComboBox QAbstractItemView { color: #eff0f1; background-color: #3c3f41;"
+            "  selection-background-color: #d7801a; selection-color: #000; border: 1px solid #555; }"
+        )
+
+        # Colormap
+        cmap_row = QHBoxLayout()
+        cmap_row.addWidget(QLabel('Colormap:'))
+        bkg_cmap_combo = QComboBox()
+        bkg_cmap_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        bkg_cmap_combo.addItems(['gray','gray_r','viridis','plasma','inferno','magma','hot','cool','Blues','Reds','Greens','bwr','seismic'])
+        bkg_cmap_combo.setCurrentText(getattr(self, '_bkg_cmap', 'gray'))
+        bkg_cmap_combo.setStyleSheet(_combo_qss)
+        cmap_row.addWidget(bkg_cmap_combo)
+        layout.addLayout(cmap_row)
+
+        # Scale
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel('Scale:'))
+        bkg_scale_combo = QComboBox()
+        bkg_scale_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        bkg_scale_combo.addItems(['Linear','Log','Square root','Asinh'])
+        bkg_scale_combo.setCurrentText(getattr(self, '_bkg_scale', 'Linear'))
+        bkg_scale_combo.setStyleSheet(_combo_qss)
+        scale_row.addWidget(bkg_scale_combo)
+        layout.addLayout(scale_row)
+
+        # Brightness slider
+        bright_row = QHBoxLayout()
+        bright_row.addWidget(QLabel('Brightness:'))
+        bkg_bright_slider = QtWidgets.QSlider(Qt.Horizontal)
+        bkg_bright_slider.setRange(-100, 100)
+        bkg_bright_slider.setValue(int(getattr(self, '_bkg_brightness', 0.0) * 100))
+        bkg_bright_slider.setFixedHeight(20)
+        bright_row.addWidget(bkg_bright_slider)
+        layout.addLayout(bright_row)
+
+        # Contrast slider
+        contrast_row = QHBoxLayout()
+        contrast_row.addWidget(QLabel('Contrast:'))
+        bkg_contrast_slider = QtWidgets.QSlider(Qt.Horizontal)
+        bkg_contrast_slider.setRange(10, 300)
+        bkg_contrast_slider.setValue(int(getattr(self, '_bkg_contrast', 1.0) * 100))
+        bkg_contrast_slider.setFixedHeight(20)
+        contrast_row.addWidget(bkg_contrast_slider)
+        layout.addLayout(contrast_row)
+
+        # ── Live update helpers ───────────────────────────────────────────────
+        def _apply_display():
+            self._bkg_cmap       = bkg_cmap_combo.currentText()
+            self._bkg_scale      = bkg_scale_combo.currentText()
+            self._bkg_brightness = bkg_bright_slider.value() / 100.0
+            self._bkg_contrast   = bkg_contrast_slider.value() / 100.0
+            if getattr(self, '_bkg_data', None) is not None:
+                self._bkg_artist = None
+                self._draw_bkg_overlay()
+
+        bkg_cmap_combo.currentTextChanged.connect(lambda _: _apply_display())
+        bkg_scale_combo.currentTextChanged.connect(lambda _: _apply_display())
+        bkg_bright_slider.valueChanged.connect(lambda _: _apply_display())
+        bkg_contrast_slider.valueChanged.connect(lambda _: _apply_display())
+
+        def _fetch(hips_url, label):
+            status.setText(f'Fetching {label} image…')
+            dialog.repaint()
+            try:
+                self._load_hips_background(hips_url, label, status, dialog)
+            except Exception as e:
+                status.setText(f'Error: {e}')
+
+        i_btn.clicked.connect(lambda: _fetch(_hips_i, 'HST I-band'))
+        cxo_btn.clicked.connect(lambda: _fetch(_hips_cxo, 'Chandra X-ray'))
+        b_btn.clicked.connect(lambda: _fetch(_hips_b, 'HST B-band'))
+        clr_btn.clicked.connect(lambda: [self._clear_bkg_image(), dialog.accept()])
+
+        close_btn = QPushButton('Close')
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        dialog.exec_()
+
+    def _load_hips_background(self, hips_url, label, status_label, dialog):
+        """Fetch a HiPS cutout matched to the cube WCS and display it behind the cube."""
+        global FITS_HEADER, FITS_DATA
+
+        # Build a minimal WCS from the cube header
+        try:
+            from astropy.wcs import WCS as AstroWCS
+            from astropy.io.fits import Header as FITSHeader
+            # Use only the 2D spatial axes from the header
+            h = FITSHeader(FITS_HEADER)
+            # Make a clean 2-axis WCS header
+            wcs_keys = ['NAXIS1','NAXIS2','CRPIX1','CRPIX2','CRVAL1','CRVAL2',
+                        'CDELT1','CDELT2','CTYPE1','CTYPE2','CD1_1','CD1_2',
+                        'CD2_1','CD2_2','PC1_1','PC1_2','PC2_1','PC2_2']
+            wcs_h = FITSHeader()
+            wcs_h['NAXIS'] = 2
+            wcs_h['WCSAXES'] = 2
+            for k in wcs_keys:
+                if k in h:
+                    wcs_h[k] = h[k]
+            if 'NAXIS1' not in wcs_h and FITS_DATA is not None:
+                wcs_h['NAXIS1'] = FITS_DATA.shape[-1]
+                wcs_h['NAXIS2'] = FITS_DATA.shape[-2]
+            wcs2d = AstroWCS(wcs_h)
+        except Exception as e:
+            if status_label: status_label.setText(f'WCS error: {e}')
+            return
+
+        # Fetch via astroquery.hips2fits.query_with_wcs
+        try:
+            from astroquery.hips2fits import hips2fits
+            print(f"Querying hips2fits for: {hips_url}")
+            # PNG-only HiPS (e.g. Chandra RGB) needs format='jpg'; FITS HiPS use 'fits'
+            _fmt = 'jpg' if 'cxc-hips' in hips_url or 'cxc_hips' in hips_url else 'fits'
+            result = hips2fits.query_with_wcs(
+                hips=hips_url,
+                wcs=wcs2d,
+                format=_fmt,
+                min_cut=0.5,
+                max_cut=99.5,
+                stretch='linear',
+            )
+            # FITS → HDUList; JPG/PNG → numpy array
+            if _fmt == 'fits':
+                bkg_data = result[0].data if hasattr(result, '__getitem__') else result.data
+            else:
+                bkg_data = np.array(result)  # (ny, nx, 3) or (3, ny, nx)
+            print(f"hips2fits returned data shape: {np.array(bkg_data).shape}")
+        except ImportError:
+            # Fallback: plain HTTP fetch of the hips2fits endpoint
+            import urllib.request, io
+            nx = int(wcs2d.pixel_shape[0] if wcs2d.pixel_shape else
+                     FITS_DATA.shape[-1] if FITS_DATA is not None else 256)
+            ny = int(wcs2d.pixel_shape[1] if wcs2d.pixel_shape else
+                     FITS_DATA.shape[-2] if FITS_DATA is not None else 256)
+            ra  = float(wcs2d.wcs.crval[0])
+            dec = float(wcs2d.wcs.crval[1])
+            cdelt = abs(float(wcs2d.wcs.cdelt[0])) if wcs2d.wcs.cdelt[0] != 0 else 1/3600
+            fov = cdelt * max(nx, ny)
+            # Strip trailing slash for the hips parameter
+            _hips_param = hips_url.rstrip('/')
+            url = (f'https://alaskybis.cds.unistra.fr/hips-image-services/hips2fits?'
+                   f'hips={urllib.request.quote(_hips_param)}'
+                   f'&width={nx}&height={ny}&fov={fov:.6f}'
+                   f'&ra={ra:.6f}&dec={dec:.6f}&projection=TAN'
+                   f'&format=fits')
+            req = urllib.request.Request(url, headers={'User-Agent': 'HyperCube/1.0'})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read()
+            from astropy.io import fits as astrofits
+            with astrofits.open(io.BytesIO(raw)) as hdul:
+                bkg_data = hdul[0].data
+
+        if bkg_data is None:
+            if status_label: status_label.setText('No data returned.')
+            return
+
+        # If RGB/RGBA (PNG HiPS like Chandra), convert to grayscale luminosity
+        bkg_data = np.array(bkg_data)
+        if bkg_data.ndim == 3:
+            if bkg_data.shape[0] in (3, 4):   # (bands, ny, nx) from astroquery
+                rgb = bkg_data[:3].astype(np.float64)
+            elif bkg_data.shape[2] in (3, 4): # (ny, nx, bands)
+                rgb = bkg_data[:, :, :3].astype(np.float64).transpose(2, 0, 1)
+            else:
+                rgb = bkg_data.astype(np.float64)
+            # ITU-R BT.601 luminosity
+            bkg_data = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+
+        # Store and display
+        self._bkg_data = bkg_data.astype(np.float64)
+        self._bkg_label = label
+        self._draw_bkg_overlay()
+        self.cube_opacity_slider.setVisible(True)
+
+        if status_label:
+            status_label.setText(f'✓  {label} loaded ({bkg_data.shape[1]}×{bkg_data.shape[0]} px)')
+
+    def _draw_bkg_overlay(self):
+        """Render the background image and cube overlay on self.ax."""
+        if not hasattr(self, '_bkg_data') or self._bkg_data is None:
+            return
+        if not hasattr(self, 'ax') or self.ax is None:
+            return
+
+        bkg = self._bkg_data.copy()
+        bmin, bmax = np.nanpercentile(bkg, [1, 99])
+
+        # Apply scale (transfer function)
+        scale = getattr(self, '_bkg_scale', 'Linear')
+        bkg = bkg - bmin  # shift to zero
+        bkg = np.where(bkg > 0, bkg, 0.0)
+        if scale == 'Log':
+            bkg = np.log1p(bkg)
+        elif scale == 'Square root':
+            bkg = np.sqrt(bkg)
+        elif scale == 'Asinh':
+            med = np.nanmedian(bkg[bkg > 0]) if np.any(bkg > 0) else 1.0
+            bkg = np.arcsinh(bkg / (med or 1.0))
+
+        # Normalise to [0,1]
+        vmax = np.nanpercentile(bkg, 99)
+        if vmax > 0:
+            bkg = np.clip(bkg / vmax, 0, 1)
+        else:
+            bkg = np.zeros_like(bkg)
+
+        # Apply brightness and contrast
+        brightness = getattr(self, '_bkg_brightness', 0.0)
+        contrast   = getattr(self, '_bkg_contrast',   1.0)
+        mid = 0.5
+        bkg_norm = np.clip((bkg - mid) * contrast + mid + brightness, 0, 1)
+
+        # Remove any existing bkg artist
+        if hasattr(self, '_bkg_artist') and self._bkg_artist is not None:
+            try: self._bkg_artist.remove()
+            except: pass
+        self._bkg_artist = self.ax.imshow(
+            bkg_norm, origin='lower', cmap=getattr(self, '_bkg_cmap', 'gray'),
+            extent=self.ax.images[0].get_extent() if self.ax.images else None,
+            zorder=0, alpha=1.0
+        )
+        # Set cube image alpha from slider
+        opacity = self.cube_opacity_slider.value() / 100.0
+        for img in self.ax.images:
+            if img is not self._bkg_artist:
+                img.set_alpha(opacity)
+                img.set_zorder(1)
+        self.canvas.draw_idle()
+
+    def _cube_opacity_changed(self, value):
+        """Update cube overlay alpha when slider moves."""
+        if not hasattr(self, 'ax') or self.ax is None:
+            return
+        alpha = value / 100.0
+        bkg_artist = getattr(self, '_bkg_artist', None)
+        for img in self.ax.images:
+            if img is not bkg_artist:
+                img.set_alpha(alpha)
+        self.canvas.draw_idle()
+
+    def _clear_bkg_image(self):
+        """Remove the background image and reset cube opacity."""
+        if hasattr(self, '_bkg_artist') and self._bkg_artist is not None:
+            try: self._bkg_artist.remove()
+            except: pass
+            self._bkg_artist = None
+        self._bkg_data = None
+        # Restore full opacity on cube
+        if hasattr(self, 'ax') and self.ax is not None:
+            for img in self.ax.images:
+                img.set_alpha(1.0)
+            self.canvas.draw_idle()
+        self.cube_opacity_slider.setVisible(False)
+        self.cube_opacity_slider.setValue(100)
+
+    def _cube_reset_view(self):
+        """Reset the cube viewport to its state at FITS load time:
+        - B/W (gray) colormap
+        - Linear scaling, 99% stretch
+        - Fit-window zoom (full image visible)
+        """
+        if not hasattr(self, '_last_data') or self._last_data is None:
+            return
+
+        # Reset toolbar combos (blockSignals to avoid double-redraw)
+        self.scale_combo.blockSignals(True)
+        self.stretch_combo.blockSignals(True)
+        self.scale_combo.setCurrentText("Linear")
+        self.stretch_combo.setCurrentText("99%")
+        self.scale_combo.blockSignals(False)
+        self.stretch_combo.blockSignals(False)
+
+        # Redraw with gray cmap, original data
+        self.draw_image(
+            FITS_DATA if hasattr(self, '_last_from_fits') and self._last_from_fits else self._last_data,
+            cmap='gray',
+            scale='linear',
+            from_fits=True
+        )
+
+        # Reset zoom to fit window
+        self._cube_zoom_apply(mode='fit_window')
+        self._sync_zoom_combo()
+
+    def _cube_redraw_with_current_settings(self):
+        """Redraw the cube image using current toolbar stretch and scale settings."""
+        if not hasattr(self, '_last_data') or self._last_data is None:
+            return
+        self.draw_image(
+            self._last_data,
+            cmap=self._last_cmap,
+            scale=self._last_scale,
+            from_fits=self._last_from_fits
+        )
+
+    def _init_placeholder_canvas(self):
+        """Draw the HyperCube logo centred on a dark canvas before a FITS file is loaded."""
+        fig = self.canvas.figure
+        fig.patch.set_facecolor('#2b2b2b')
+        ax = fig.add_subplot(111)
+        ax.set_facecolor('#2b2b2b')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        try:
+            logo_path = resource_path('hypercube_logo.png')
+            logo = plt.imread(logo_path)
+            # Place logo in a centred inset axes so it scales with the window
+            logo_ax = fig.add_axes([0.25, 0.2, 0.5, 0.5])
+            logo_ax.imshow(logo)
+            logo_ax.axis('off')
+        except Exception:
+            # Fallback to text if image can't be loaded
+            ax.text(0.5, 0.55, 'HYPERCUBE',
+                    transform=ax.transAxes, ha='center', va='center',
+                    fontsize=28, fontweight='bold', color='#d7801a',
+                    fontfamily='monospace')
+
+        ax.text(0.5, 0.1, 'Open a FITS file to begin',
+                transform=ax.transAxes, ha='center', va='center',
+                fontsize=11, color='#888888')
+
+        fig.tight_layout(pad=0)
+        self.canvas.draw()
 
     def set_fit_params_window(self, fit_params_window):
         """Store the reference to FitParamsWindow after it's created."""
@@ -639,9 +1887,15 @@ class ViewerWindow(QMainWindow):
         """Update rectangle position and spectrum in right panel."""
         if self.locked:
             return  # Do nothing if locked
+        if getattr(self, '_bc_drag_active', False):
+            return  # Suppress spaxel update during brightness/contrast drag
         
         if (event.inaxes) and (self.is_1d_spectrum == False):
-            x, y = int(event.xdata), int(event.ydata)
+            # Round to nearest integer spaxel centre in display coords.
+            _xd = int(np.floor(event.xdata + 0.5))
+            _yd = int(np.floor(event.ydata + 0.5))
+            # Map display coords back to original data coords (undo rotate/flip)
+            x, y = self._cube_transform_coords(_xd, _yd)
             self.cursor_pos = (x, y)
             
             if self.fits_data is not None:
@@ -654,18 +1908,92 @@ class ViewerWindow(QMainWindow):
                 self.red_rect.set_visible(True)
                 self.canvas.draw_idle()
                 
-                # Now update the button texts with the new cursor position
+                # Always update the spaxel info overlay on the image
+                self.update_spaxel_overlay(x, y)
+                
+                # Update fit result buttons in the side panel (only when it exists)
                 if self.fit_params_window is not None:
                     self.update_buttons(x, y)
 
 
 
 
+    def _spectrum_hbar_pan(self, value):
+        """Pan the spectrum axes horizontally from the scrollbar position (0-1000)."""
+        if not hasattr(self, 'spectrum_ax') or self.spectrum_ax is None:
+            return
+        if not hasattr(self, '_spec_wav_min') or self._spec_wav_min is None:
+            return
+        xlim = self.spectrum_ax.get_xlim()
+        view_w = xlim[1] - xlim[0]
+        full_w = self._spec_wav_max - self._spec_wav_min
+        pan_range = full_w - view_w
+        if pan_range <= 0:
+            return
+        frac = value / 1000.0
+        new_x0 = self._spec_wav_min + frac * pan_range
+        self.spectrum_ax.set_xlim(new_x0, new_x0 + view_w)
+        self.spectrum_canvas.draw_idle()
+
+    def _spectrum_update_hbar(self):
+        """Sync the spectrum scrollbar to the current xlim.
+        Shows/hides it based on whether the view is zoomed in."""
+        if not hasattr(self, 'spec_hbar') or not hasattr(self, 'spectrum_ax'):
+            return
+        if self.spectrum_ax is None or not hasattr(self, '_spec_wav_min'):
+            return
+        xlim = self.spectrum_ax.get_xlim()
+        view_w = xlim[1] - xlim[0]
+        full_w = self._spec_wav_max - self._spec_wav_min
+        pan_range = full_w - view_w
+        if pan_range <= 1e-6:
+            self.spec_hbar.hide()
+            return
+        self.spec_hbar.show()
+        frac = (xlim[0] - self._spec_wav_min) / pan_range
+        self.spec_hbar.blockSignals(True)
+        self.spec_hbar.setValue(int(np.clip(frac, 0, 1) * 1000))
+        self.spec_hbar.blockSignals(False)
+
     def on_spectrum_mouse_move(self, event):
         """Handle mouse movement in the spectrum plot."""
         if event.inaxes == self.spectrum_ax:
             # Update the cursor position in the spectrum plot
             self.spectrum_cursor_pos = (event.xdata, event.ydata)
+
+            # Update channel map span while C is held
+            if self._chanmap_active and self._chanmap_span is not None and event.xdata is not None:
+                pass  # handled below
+            # Update any active subtraction window spans
+            if event.xdata is not None:
+                for _key, _sm in self._submap.items():
+                    if _sm['active'] and _sm['span'] is not None:
+                        _x0 = min(_sm['start'], event.xdata)
+                        _x1 = max(_sm['start'], event.xdata)
+                        _xy = _sm['span'].get_xy()
+                        _n = len(_xy)
+                        _xy[:, 0] = [_x0, _x0, _x1, _x1, _x0][:_n]
+                        _sm['span'].set_xy(_xy)
+            # Update channel map span while C is held (main)
+            if self._chanmap_active and self._chanmap_span is not None and event.xdata is not None:
+                wav = event.xdata
+                x0 = min(self._chanmap_start, wav)
+                x1 = max(self._chanmap_start, wav)
+                xy = self._chanmap_span.get_xy()
+                # axvspan polygon is either 4 or 5 vertices depending on mpl version
+                n = len(xy)
+                xs = [x0, x0, x1, x1, x0][:n]
+                xy[:, 0] = xs
+                self._chanmap_span.set_xy(xy)
+                self.spectrum_canvas.draw_idle()
+
+            # Update wavelength/flux overlay
+            if hasattr(self, 'spectrum_info_text') and event.xdata is not None:
+                _pix = int(np.argmin(np.abs(wavelengths - event.xdata))) if wavelengths is not None else "—"
+                self.spectrum_info_text.set_text(
+                    f"px  {_pix}\n\u03bb  {event.xdata:.4f}\nF  {event.ydata:.4e}"
+                )
+                self.spectrum_canvas.draw_idle()
     
             # If we are in the middle of drawing a line, update the line's end position
             if self.drawing_line and self.current_line:
@@ -704,6 +2032,7 @@ class ViewerWindow(QMainWindow):
             if zoom_end_x is not None and self.zoom_start_x != zoom_end_x:
                 x_min, x_max = min(self.zoom_start_x, zoom_end_x), max(self.zoom_start_x, zoom_end_x)
                 self.spectrum_ax.set_xlim(x_min, x_max)
+                self._spectrum_update_hbar()
                 self.zoom_limits = (x_min, x_max)  # Store zoom limits globally
                 self.zoom_active = True
     
@@ -1082,7 +2411,7 @@ class ViewerWindow(QMainWindow):
         """Processing for 3D cubes"""
         global wavelengths, snr_map
         
-        self.draw_image(FITS_DATA, cmap='Grays', scale='linear', from_fits=True)
+        self.draw_image(FITS_DATA, cmap='gray', scale='linear', from_fits=True)
         self.wcs = WCS(self.fits_header)
         
         # Initialize SNR map
@@ -1105,8 +2434,99 @@ class ViewerWindow(QMainWindow):
         
         df_obs.loc[0] = [source_name, source_redshift, resolving_power]
         print("FITS file loaded successfully!")
+        # Enable data-dependent toolbar buttons now that a file is loaded
+        self.WLscalefactor_button.setEnabled(True)
+        self.fluxscalefactor_button.setEnabled(True)
+        # Prompt user to confirm / resolve the source name from NED
+        # Use QTimer to let the main window finish painting before showing the dialog
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(300, self._prompt_source_on_load)
 
 
+
+    def _prompt_source_on_load(self):
+        """Show the source information dialog after a FITS file is loaded.
+        If FitParamsWindow is open, delegate to it; otherwise call standalone version.
+        """
+        if self.fit_params_window is not None:
+            self.fit_params_window._show_source_dialog()
+        else:
+            # Build a minimal standalone dialog matching FitParamsWindow._show_source_dialog
+            global df_obs, FITS_HEADER
+            current_name = str(df_obs.loc[0, 'sourcename']) if len(df_obs) > 0 else ''
+            dialog = QDialog(self)
+            dialog.setWindowTitle('Source Information')
+            dialog.setMinimumWidth(420)
+            layout = QVBoxLayout(dialog)
+            layout.setSpacing(10)
+            layout.addWidget(QLabel('Source name:'))
+            name_edit = QLineEdit(current_name)
+            name_edit.setPlaceholderText('e.g. NGC 1068')
+            layout.addWidget(name_edit)
+            resolve_name_btn  = QPushButton('Resolve name  (NED)')
+            resolve_coord_btn = QPushButton('Resolve coordinates  (NED)')
+            layout.addWidget(resolve_name_btn)
+            layout.addWidget(resolve_coord_btn)
+            status = QLabel(''); status.setWordWrap(True)
+            layout.addWidget(status)
+            btn_row = QHBoxLayout()
+            ok_btn = QPushButton('OK'); ok_btn.setDefault(True)
+            cancel_btn = QPushButton('Cancel')
+            btn_row.addWidget(ok_btn); btn_row.addWidget(cancel_btn)
+            layout.addLayout(btn_row)
+
+            def _apply(ned_name, ned_z):
+                name_edit.setText(ned_name)
+                df_obs.loc[0, 'sourcename'] = ned_name
+                df_obs.loc[0, 'redshift']   = ned_z
+                # Enable the background image button now that source is resolved
+                if hasattr(self, 'bkg_image_btn'):
+                    self.bkg_image_btn.setEnabled(True)
+
+            def _by_name():
+                name = name_edit.text().strip()
+                if not name: status.setText('Enter a name first.'); return
+                status.setText(f'Querying NED for "{name}"...'); dialog.repaint()
+                try:
+                    from astroquery.ipac.ned import Ned
+                    r = Ned.query_object(name)
+                    ned_name = str(r['Object Name'][0])
+                    ned_z    = float(r['Redshift'][0])
+                    _apply(ned_name, ned_z)
+                    status.setText(f'✓  {ned_name}   z = {ned_z:.6f}')
+                except Exception as e:
+                    status.setText(f'NED query failed: {e}')
+
+            def _by_coords():
+                try:
+                    ra  = float(FITS_HEADER.get('CRVAL1', ''))
+                    dec = float(FITS_HEADER.get('CRVAL2', ''))
+                except: status.setText('Could not read RA/Dec from FITS header.'); return
+                status.setText(f'Querying NED at RA={ra:.4f}, Dec={dec:.4f}...'); dialog.repaint()
+                try:
+                    from astroquery.ipac.ned import Ned
+                    import astropy.units as u
+                    from astropy.coordinates import SkyCoord
+                    coord = SkyCoord(ra=ra, dec=dec, unit='deg')
+                    r = Ned.query_region(coord, radius=0.5 * u.arcmin)
+                    if len(r) == 0: raise ValueError('No objects found')
+                    ned_name = str(r['Object Name'][0])
+                    ned_z    = float(r['Redshift'][0])
+                    _apply(ned_name, ned_z)
+                    status.setText(f'✓  {ned_name}   z = {ned_z:.6f}')
+                except Exception as e:
+                    status.setText(f'NED query failed: {e}')
+
+            def _commit():
+                df_obs.loc[0, 'sourcename'] = name_edit.text().strip()
+                dialog.accept()
+
+            resolve_name_btn.clicked.connect(_by_name)
+            resolve_coord_btn.clicked.connect(_by_coords)
+            ok_btn.clicked.connect(_commit)
+            name_edit.returnPressed.connect(_commit)
+            cancel_btn.clicked.connect(dialog.reject)
+            dialog.exec_()
 
     def pixel_to_ra_dec(self, x, y):
         """Convert pixel coordinates (x, y) to RA, Dec using the WCS information from FITS header.
@@ -1163,182 +2583,41 @@ class ViewerWindow(QMainWindow):
 
 
     
+    def update_spaxel_overlay(self, x, y):
+        """Update the RA/Dec/X/Y/N text overlay on the cube image. Always called on mouse move."""
+        if self.is_1d_spectrum:
+            return
+        ra, dec = self.pixel_to_ra_dec(x, y)
+        ra_sexagesimal  = self.decimal_to_sexagesimal(ra[0],  is_ra=True)
+        dec_sexagesimal = self.decimal_to_sexagesimal(dec[0], is_ra=False)
+        n = self.get_spaxel_number(x, y)
+        if hasattr(self, 'spaxel_info_text'):
+            self.spaxel_info_text.set_text(
+                f"RA  {ra_sexagesimal}\n"
+                f"Dec {dec_sexagesimal}\n"
+                f"X {x}   Y {y}   N {n}"
+            )
+            self.canvas.draw_idle()
+
     def update_buttons(self, x, y):
-        """Update the RA, Dec, X, Y, N values displayed on the buttons based on mouse position."""
-        
-        # Call pixel_to_ra_dec to get RA, Dec from pixel coordinates
-        if self.is_1d_spectrum == False:
-            ra, dec = self.pixel_to_ra_dec(x, y)
-            
-            # Convert RA and Dec to sexagesimal format
-            ra_sexagesimal = self.decimal_to_sexagesimal(ra[0], is_ra=True)  # Explicitly pass `is_ra=True`
-            dec_sexagesimal = self.decimal_to_sexagesimal(dec[0], is_ra=False)  # Explicitly pass `is_ra=False`
-            
-            # Update RA and Dec buttons with the calculated values
-            self.fit_params_window.ra_button.setText(f"RA: {ra_sexagesimal}")
-            self.fit_params_window.dec_button.setText(f"Dec: {dec_sexagesimal}")
-            
-            # Optionally, update other buttons like X, Y, N with appropriate values if needed
-            self.fit_params_window.x_button.setText(f"X: {x}")
-            self.fit_params_window.y_button.setText(f"Y: {y}")
-            
-            # If you have additional functionality for the N button, you can update it as needed.
-            n = self.get_spaxel_number(x, y)
-            self.fit_params_window.n_button.setText(f"N: {n}")
-        
-        
-        for line in self.spectrum_ax.get_lines():
-            if line.get_label() != "_child0":  # Keep Line2D(_child0)
-                line.remove()
-        self.spectrum_canvas.draw()
-        
-        # self.rebuild_plot(0,from_file=False,show_init=False,show_fit=True,x=x,y=y)
+        """Refresh fit-result values in the Fit Parameters side panel for spaxel (x, y).
+        Only called when fit_params_window exists."""
+        # Only clear non-spectrum curves when NOT on the init-guess spaxel,
+        # so interactive initial guesses persist while the user stays there.
+        on_init_spaxel = (self._init_guess_spaxel is not None and
+                          int(x) == self._init_guess_spaxel[0] and
+                          int(y) == self._init_guess_spaxel[1])
+        if not on_init_spaxel:
+            for line in self.spectrum_ax.get_lines():
+                if line.get_label() != "_child0":
+                    line.remove()
+            self.gaussian_component_lines.clear()
+            self.spectrum_canvas.draw()
+
         for region_ID in np.unique(np.int64(df_cont['region_ID'])):
-            # df_cont.loc[(df_cont["region_ID"] == region_ID)]['lineactor'].item().remove()
-            self.rebuild_plot(region_ID,from_file=False,show_init=False,show_fit=True,x=x,y=y)
-
-
-        # Mapping from button keys to the column names in df_fit
-        key_to_column_mapping = {
-            'Slope_fit': 'slope_fit',
-            'Intercept_fit': 'intercept_fit',
-            'Line_Name': 'LineName',
-            'Amp_fit': 'amp_fit',
-            'Centroid_fit': 'cen_fit',
-            'Sigma_fit': 'sigma_fit',
-            'v_fit': 'vel_fit'
-        }
-        # print(self.fit_params_window.buttons_dict.items())
-        for key, button in self.fit_params_window.buttons_dict.items():
-            
-            # Only process keys related to 'fit'
-            if ('fit' in key[1]) or ('Line_Name' in key[1]):
-                
-                # Extract the region_ID and gaussian_number from the key
-                region_ID = key[0]
-                
-                if 'continuum' in key[1]:
-                    if key[1].split('~')[1] == 'Slope_fit':
-                        column_name = 'cont_region'+str(region_ID+1)+'_slope_fit'
-                        try:# Query the corresponding value from df_fit for the selected region_ID and gaussian_number
-                            dfslice = df_fit.loc[(np.int64(df_fit['spaxel_x']) == x) &
-                                               (np.int64(df_fit['spaxel_y']) == y) &
-                                               (np.int64(df_fit['region_ID']) == np.int64(region_ID))]
-                            value = dfslice.iloc[0][column_name]
-                        except:
-                            value = ''
-                    if key[1].split('~')[1] == 'Intercept_fit':
-                        column_name = 'cont_region'+str(region_ID+1)+'_intercept_fit'
-                        try:# Query the corresponding value from df_fit for the selected region_ID and gaussian_number
-                            dfslice = df_fit.loc[(np.int64(df_fit['spaxel_x']) == x) &
-                                               (np.int64(df_fit['spaxel_y']) == y) &
-                                               (np.int64(df_fit['region_ID']) == np.int64(region_ID))]
-                            value = dfslice.iloc[0][column_name]
-                        except:
-                            value = ''
-                
-                    # print(column_name,value)
-                    # if 'Name' not in column_name:
-                    #     button.setStyleSheet("""
-                    #         font-family: "Segoe UI";
-                    #         font-size: 10pt;
-                    #         border: 2px solid;
-                    #         border-color: green;
-                    #         border-radius: 5px;
-                    #         padding-right: 10px;
-                    #         padding-left: 10px;
-                    #         padding-top: 5px;
-                    #         padding-bottom: 5px;
-                    #         background-color: limegreen;
-                    #         highlight-color; limegreen;
-                    #         color: k;
-                    #         font: bold;
-                    #         width: 64px;
-                    #     """)
-                    # Set the button's text
-                    if type(value) == str:
-                        button.setText(value)
-                    else:
-                        button.setText(str(round(value, 3)))
-                
-                
-                # Now update the gaussian parameter buttons:
-                    
-                gaussian_number_str = key[1].split('~')[0]
-                
-                try:
-                    gaussian_number = float(gaussian_number_str)
-                except ValueError:
-                    continue  # Skip this button if it's not a valid number
-        
-                # Check if the button's key has a matching mapping in key_to_column_mapping
-                if key[1].split('~')[1] in key_to_column_mapping:
-                    # Get the corresponding column name
-                    column_name = key_to_column_mapping[key[1].split('~')[1]]
-                    # print(column_name)
-        
-                    # # Check if the column exists in df_fit
-                    if column_name in df_fit.columns:
-                        try:# Query the corresponding value from df_fit for the selected region_ID and gaussian_number
-                            dfslice = df_fit.loc[(np.int64(df_fit['spaxel_x']) == x) &
-                                               (np.int64(df_fit['spaxel_y']) == y) &
-                                               (np.int64(df_fit['region_ID']) == np.int64(region_ID)) & 
-                                                (np.int64(df_fit['LineID']) == np.int64(gaussian_number))]
-                            value = dfslice[column_name].item()
-                            plotcolor = dfslice['color'].item()
-                            if 'Name' in column_name:
-                                button.setStyleSheet(f"""
-                                        background-color: {plotcolor};
-                                        color: k;
-                                    """)
-                        except:
-                            value = ''
-                # Set the button's style
-                # print(column_name,value)
-
-                # if 'Name' not in column_name:
-                #     button.setStyleSheet("""
-                #         font-family: "Segoe UI";
-                #         font-size: 10pt;
-                #         border: 2px solid;
-                #         border-color: green;
-                #         border-radius: 5px;
-                #         padding-right: 10px;
-                #         padding-left: 10px;
-                #         padding-top: 5px;
-                #         padding-bottom: 5px;
-                #         background-color: limegreen;
-                #         highlight-color; limegreen;
-                #         color: k;
-                #         font: bold;
-                #         width: 64px;
-                #     """)
-                # else:
-                #     button.setStyleSheet(f"""
-                #         font-family: "Segoe UI";
-                #         font-size: 10pt;
-                #         border: 2px solid;
-                #         border-color: green;
-                #         border-radius: 5px;
-                #         padding-right: 10px;
-                #         padding-left: 10px;
-                #         padding-top: 5px;
-                #         padding-bottom: 5px;
-                #         background-color: {plotcolor};
-                #         highlight-color; limegreen;
-                #         color: k;
-                #         font: bold;
-                #         width: 64px;
-                #     """)
-                # Set the button's text
-                if type(value) == str:
-                    button.setText(value)
-                else:
-                    button.setText(str(round(value, 3)))
-            else:
-                pass
-                # print(f"Column {column_name} not found in df_fit!")
-
+            show_init = on_init_spaxel  # redraw init curves when back on home spaxel
+            self.rebuild_plot(region_ID, from_file=False,
+                              show_init=show_init, show_fit=(not show_init), x=x, y=y)
 
     def get_spaxel_number(self, x, y):
         """Get the spaxel number for the given pixel coordinates."""
@@ -1378,9 +2657,34 @@ class ViewerWindow(QMainWindow):
                 # Ensure canvas reflects the QSS style (PyQt5-level styling)
                 self.spectrum_canvas.setStyleSheet("background-color: #2E3440; border: none;")
                 
+                # Wavelength/flux overlay (top-right corner, mirrors the cube RA/Dec overlay)
+                self.spectrum_info_text = self.spectrum_ax.text(
+                    0.01, 0.99, '',
+                    transform=self.spectrum_ax.transAxes,
+                    verticalalignment='top', horizontalalignment='left',
+                    fontsize=8, color='white',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.5, edgecolor='none')
+                )
+
+                # Reveal the spectrum toolbar now that we have a spectrum
+                self.spec_bar_widget.show()
                 # Add the Matplotlib canvas to the layout
                 layout = self.right_panel.layout()
                 layout.addWidget(self.spectrum_canvas)
+
+                # Horizontal pan scrollbar below the spectrum
+                self.spec_hbar = QScrollBar(Qt.Horizontal)
+                self.spec_hbar.setRange(0, 1000)
+                self.spec_hbar.setValue(500)
+                self.spec_hbar.setSingleStep(10)
+                self.spec_hbar.setPageStep(100)
+                self.spec_hbar.setFixedHeight(14)
+                self.spec_hbar.setStyleSheet(
+                    "QScrollBar:horizontal { height: 14px; }"
+                    "QScrollBar::handle:horizontal { min-width: 30px; }"
+                )
+                self.spec_hbar.valueChanged.connect(self._spectrum_hbar_pan)
+                layout.addWidget(self.spec_hbar)
 
             # Update the data instead of recreating the plot
             self.spectrum_line.set_xdata(wavelengths)
@@ -1389,6 +2693,9 @@ class ViewerWindow(QMainWindow):
             if not self.zoom_active:
                 # Default full range
                 self.spectrum_ax.set_xlim(wavelengths.min(), wavelengths.max())
+                self._spec_wav_min = float(wavelengths.min())
+                self._spec_wav_max = float(wavelengths.max())
+                self._spectrum_update_hbar()
                 y_min, y_max = np.nanmin(spectrum), np.nanmax(spectrum)
             else:
                 # Get the zoomed x-axis range
@@ -1408,6 +2715,200 @@ class ViewerWindow(QMainWindow):
             # Refresh the figure
             self.spectrum_canvas.draw()
 
+    def _chanmap_update_centre_display(self):
+        """Update the centre-pixel button label from the current span limits."""
+        global wavelengths
+        if self._chanmap_span is None or wavelengths is None:
+            self.chanmap_centre_btn.setText("Pixel: —")
+            return
+        xy = self._chanmap_span.get_xy()
+        wav0 = xy[:, 0].min()
+        wav1 = xy[:, 0].max()
+        wav_centre = (wav0 + wav1) / 2
+        pix = np.argmin(np.abs(wavelengths - wav_centre))
+        self.chanmap_centre_btn.setText(f"Pixel: {pix}")
+
+    def _chanmap_shift(self, delta_pix):
+        """Shift the locked channel map selection by delta_pix pixels."""
+        global wavelengths
+        if not self._chanmap_locked or self._chanmap_span is None or wavelengths is None:
+            return
+        xy = self._chanmap_span.get_xy()
+        wav0 = xy[:, 0].min()
+        wav1 = xy[:, 0].max()
+        half_w = (wav1 - wav0) / 2
+        wav_centre = (wav0 + wav1) / 2
+
+        pix_centre = np.argmin(np.abs(wavelengths - wav_centre))
+        new_pix = int(np.clip(pix_centre + delta_pix, 0, len(wavelengths) - 1))
+        new_centre = wavelengths[new_pix]
+
+        new_wav0 = new_centre - half_w
+        new_wav1 = new_centre + half_w
+        n = len(xy)
+        xs = [new_wav0, new_wav0, new_wav1, new_wav1, new_wav0][:n]
+        xy[:, 0] = xs
+        self._chanmap_span.set_xy(xy)
+        self.spectrum_canvas.draw_idle()
+        self._chanmap_update_centre_display()
+        self._compute_channel_map(new_wav0, new_wav1)
+
+    def _chanmap_centre_clicked(self):
+        """Open a dialog to enter a new centre pixel — avoids keyboard focus stealing."""
+        global wavelengths
+        if not self._chanmap_locked or self._chanmap_span is None or wavelengths is None:
+            return
+        xy = self._chanmap_span.get_xy()
+        wav0 = xy[:, 0].min()
+        wav1 = xy[:, 0].max()
+        current_pix = int(np.argmin(np.abs(wavelengths - (wav0 + wav1) / 2)))
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Set centre pixel")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"Centre pixel (current: {current_pix})"))
+        text_box = QLineEdit(str(current_pix))
+        text_box.selectAll()
+        layout.addWidget(text_box)
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        def _apply():
+            try:
+                pix = int(np.clip(int(text_box.text()), 0, len(wavelengths) - 1))
+            except ValueError:
+                return
+            half_w = (wav1 - wav0) / 2
+            new_centre = wavelengths[pix]
+            new_wav0 = new_centre - half_w
+            new_wav1 = new_centre + half_w
+            n = len(xy)
+            xs = [new_wav0, new_wav0, new_wav1, new_wav1, new_wav0][:n]
+            xy[:, 0] = xs
+            self._chanmap_span.set_xy(xy)
+            self.spectrum_canvas.draw_idle()
+            self._chanmap_update_centre_display()
+            self._compute_channel_map(new_wav0, new_wav1)
+            dialog.accept()
+
+        ok_btn.clicked.connect(_apply)
+        text_box.returnPressed.connect(_apply)
+        cancel_btn.clicked.connect(dialog.reject)
+        dialog.exec_()
+
+    def keyReleaseEvent(self, event):
+        """Release C/X/V to lock selections; C=line window, X/V=continuum windows."""
+        # Handle subtraction window release (X or V)
+        if event.key() in (Qt.Key_X, Qt.Key_V) and not event.isAutoRepeat():
+            key_char = 'x' if event.key() == Qt.Key_X else 'v'
+            sm = self._submap[key_char]
+            if sm['active']:
+                sm['active'] = False
+                if self.spectrum_cursor_pos and sm['start'] is not None:
+                    wav_end = self.spectrum_cursor_pos[0]
+                    w0 = min(sm['start'], wav_end)
+                    w1 = max(sm['start'], wav_end)
+                    if abs(w1 - w0) < 1e-6:
+                        # Tap = clear this window
+                        if sm['span'] is not None:
+                            try: sm['span'].remove()
+                            except ValueError: pass
+                        sm['span'] = None
+                        sm['locked'] = False
+                        self.spectrum_canvas.draw_idle()
+                    else:
+                        sm['locked'] = True
+                self._compute_channel_map_with_subtraction()
+
+        if event.key() == Qt.Key_C and self._chanmap_active and not event.isAutoRepeat():
+            self._chanmap_active = False
+            if self.spectrum_cursor_pos and self._chanmap_start is not None:
+                wav_end = self.spectrum_cursor_pos[0]
+                wav0 = min(self._chanmap_start, wav_end)
+                wav1 = max(self._chanmap_start, wav_end)
+                if abs(wav1 - wav0) < 1e-6:
+                    # Zero-width tap: clear selection and restore white-light
+                    if self._chanmap_span is not None:
+                        try: self._chanmap_span.remove()
+                        except ValueError: pass
+                        self._chanmap_span = None
+                    self._chanmap_locked = False
+                    # Also clear all subtraction windows
+                    for _sm in self._submap.values():
+                        if _sm['span'] is not None:
+                            try: _sm['span'].remove()
+                            except ValueError: pass
+                        _sm.update({'span': None, 'locked': False, 'active': False, 'start': None})
+                    self.chanmap_centre_btn.setText("Pixel: —")
+                    self.spectrum_canvas.draw_idle()
+                    self.draw_image(FITS_DATA, self._last_cmap, self._last_scale, from_fits=True)
+                else:
+                    self._chanmap_locked = True
+                    self._compute_channel_map(wav0, wav1)
+                    self._chanmap_update_centre_display()
+
+    def _compute_channel_map(self, wav0, wav1):
+        """Store the current line window limits and trigger the full (subtracted) map."""
+        self._chanmap_wav0 = wav0
+        self._chanmap_wav1 = wav1
+        self._compute_channel_map_with_subtraction()
+
+    def _compute_channel_map_with_subtraction(self):
+        """Compute the (optionally continuum-subtracted) channel map and display it.
+
+        Line map  = sum of flux within the C window [wav0, wav1] per spaxel.
+        Continuum = mean flux per channel, averaged across any locked X/V windows,
+                    then scaled to the number of channels in the C window.
+        Result    = Line map − Continuum  (if at least one subtraction window exists)
+                  = Line map              (if no subtraction windows are locked)
+        """
+        global wavelengths
+        if self.fits_data is None or wavelengths is None:
+            return
+        if not hasattr(self, '_chanmap_wav0'):
+            return
+
+        wav0, wav1 = self._chanmap_wav0, self._chanmap_wav1
+        line_mask = (wavelengths >= wav0) & (wavelengths <= wav1)
+        if not np.any(line_mask):
+            return
+
+        n_line = line_mask.sum()
+        line_map = np.nansum(self.fits_data[line_mask, :, :], axis=0)
+
+        # Gather locked subtraction windows
+        cont_estimates = []
+        for key_char, sm in self._submap.items():
+            if sm['locked'] and sm['span'] is not None:
+                xy = sm['span'].get_xy()
+                sw0, sw1 = xy[:, 0].min(), xy[:, 0].max()
+                cont_mask = (wavelengths >= sw0) & (wavelengths <= sw1)
+                n_cont = cont_mask.sum()
+                if n_cont > 0:
+                    # Mean flux per channel in this window → scale to line width
+                    mean_per_chan = np.nansum(self.fits_data[cont_mask, :, :], axis=0) / n_cont
+                    cont_estimates.append(mean_per_chan)
+
+        cmap  = getattr(self, '_last_cmap',  'gray')
+        scale = getattr(self, '_last_scale', 'linear')
+
+        if cont_estimates:
+            # Average the sideband estimates then scale to line window width
+            cont_map = np.mean(cont_estimates, axis=0) * n_line
+            result = line_map - cont_map
+            print(f"Continuum-subtracted map: {n_line} line ch, "
+                  f"{len(cont_estimates)} sideband(s)")
+        else:
+            result = line_map
+            print(f"Channel map: {n_line} channels [{wav0:.2f} – {wav1:.2f}]")
+
+        self.draw_image(result, cmap, scale)
+
     def keyPressEvent(self, event):
         key = event.text().lower()
 
@@ -1417,6 +2918,10 @@ class ViewerWindow(QMainWindow):
             # Toggle the locking state
             self.locked = not self.locked
             print(f"Lock {'enabled' if self.locked else 'disabled'}")
+            # Red when locked, orange when free
+            if hasattr(self, 'red_rect'):
+                self.red_rect.set_edgecolor('#cc2222' if self.locked else '#d7801a')
+                self.canvas.draw_idle()
         
         if event.key() == Qt.Key_F:
             print(df)
@@ -1427,7 +2932,7 @@ class ViewerWindow(QMainWindow):
             # self.spectrum_canvas.draw_idle()  # Efficient redrawing
             
             
-        if event.key() == Qt.Key_D:
+        if event.key() == Qt.Key_D and not event.isAutoRepeat():
             # Start or finish drawing a line in the spectrum plot
             if not self.drawing_line:
                 # Start drawing a line: store the first point (cursor position)
@@ -1460,14 +2965,62 @@ class ViewerWindow(QMainWindow):
                 else:
                     df_cont = pd.concat([df_cont, df_cont_new], ignore_index=True)
                 
-                # When opening the FitParamsWindow, pass the current_line
-                if len(df_cont) == 1:
-                    self.fit_params_window = FitParamsWindow(viewer_window=self, df=df, df_cont=df_cont, current_line=self.current_line)
-                    self.fit_params_window.show()
-                if len(df_cont) > 1:
-                    self.fit_params_window.add_spectral_frame(f"Spectral Region {len(df_cont)}",df_cont,df,ID=len(df_cont)-1,addframe=True)
+                # Ensure the Fit Parameters dock is open, then add the new spectral region frame
+                self._ensure_fit_params_open_and_add_region()
+                # Mark this spaxel with a blue square immediately on continuum placement
+                if self.current_spaxel is not None:
+                    self._init_guess_spaxel = (int(self.current_spaxel[0]), int(self.current_spaxel[1]))
+                    if self._blue_rect is not None:
+                        self._blue_rect.set_xy((self._init_guess_spaxel[0] - 0.5,
+                                                self._init_guess_spaxel[1] - 0.5))
+                        self._blue_rect.set_visible(True)
+                        self.canvas.draw_idle()
 
-        if event.key() == Qt.Key_G:
+        if event.key() == Qt.Key_C and not event.isAutoRepeat():
+            # Always start a fresh selection immediately on press.
+            # If a previous locked box exists, discard it without a separate clear step.
+            if not hasattr(self, 'spectrum_cursor_pos') or not self.spectrum_cursor_pos:
+                pass  # cursor not over spectrum — do nothing
+            else:
+                wav = self.spectrum_cursor_pos[0]
+                if wav is not None:
+                    # Clear any existing span
+                    if self._chanmap_span is not None:
+                        try: self._chanmap_span.remove()
+                        except ValueError: pass
+                        self._chanmap_span = None
+                    # Start new selection immediately at current cursor wavelength
+                    self._chanmap_active = True
+                    self._chanmap_locked = False
+                    self._chanmap_start  = wav
+                    self._chanmap_span = self.spectrum_ax.axvspan(
+                        wav, wav,
+                        alpha=0.25, color='#4fc3f7', zorder=0
+                    )
+                    self.spectrum_canvas.draw_idle()
+
+        # X and V keys: subtraction windows (only when channel map is locked)
+        if event.key() in (Qt.Key_X, Qt.Key_V) and not event.isAutoRepeat():
+            if not self._chanmap_locked:
+                pass  # No channel window yet — ignore
+            elif hasattr(self, 'spectrum_cursor_pos') and self.spectrum_cursor_pos:
+                wav = self.spectrum_cursor_pos[0]
+                key_char = 'x' if event.key() == Qt.Key_X else 'v'
+                sm = self._submap[key_char]
+                # Clear existing span for this key
+                if sm['span'] is not None:
+                    try: sm['span'].remove()
+                    except ValueError: pass
+                    sm['span'] = None
+                sm['active'] = True
+                sm['locked'] = False
+                sm['start']  = wav
+                sm['span'] = self.spectrum_ax.axvspan(
+                    wav, wav, alpha=0.20, color='#ef5350', zorder=0
+                )
+                self.spectrum_canvas.draw_idle()
+
+        if event.key() == Qt.Key_G and not event.isAutoRepeat():
             if not self.gaussian_active:
                 # First press of 'g': Start Gaussian fitting
                 x_cursor, y_cursor = self.spectrum_cursor_pos  # Get cursor position
@@ -1595,10 +3148,31 @@ class ViewerWindow(QMainWindow):
         else:
             line_id = np.max(np.int64(df['Line_ID']))+1
         
+        # Auto-identify the line using the line library and source redshift
+        _z        = df_obs.loc[0, 'redshift'] if len(df_obs) > 0 else ''
+        _ion, _rest_wav = _identify_line(self.gaussian_x0, _z)
+        # Build base name: ion + rest wavelength subscript
+        if _ion and np.isfinite(_rest_wav):
+            _base_name = f'{_ion}_{int(round(_rest_wav))}'
+        elif _ion:
+            _base_name = _ion
+        else:
+            _base_name = f'Line {len(df.loc[df["region_ID"]==region_ID])}'
+        # If the base name already exists in df, append _b, _c, _d … to disambiguate
+        existing_names = set(df['Line_Name'].astype(str).tolist())
+        _line_name = _base_name
+        if _line_name in existing_names:
+            for _letter in 'bcdefghijklmnopqrstuvwxyz':
+                _candidate = f'{_base_name}_{_letter}'
+                if _candidate not in existing_names:
+                    _line_name = _candidate
+                    break
+        _rest_wav_store = _rest_wav if np.isfinite(_rest_wav) else np.nan
+
         df_new = pd.DataFrame({'Line_ID': [line_id],
-                'Line_Name': [f'Line '+str(len(df.loc[df["region_ID"]==region_ID]))],
+                'Line_Name': [_line_name],
                 'SNR': [0],
-                'Rest Wavelength': [np.nan],
+                'Rest Wavelength': [_rest_wav_store],
                 'Amp_0': [self.gaussian_amplitude],
                 'Amp_0_lowlim': [0],
                 'Amp_0_highlim': [np.inf],
@@ -1618,6 +3192,15 @@ class ViewerWindow(QMainWindow):
         
         
         df = pd.concat([df,df_new])
+
+        # Mark this spaxel with a blue square on the cube viewport
+        if self.current_spaxel is not None:
+            self._init_guess_spaxel = (int(self.current_spaxel[0]), int(self.current_spaxel[1]))
+            if self._blue_rect is not None:
+                self._blue_rect.set_xy((self._init_guess_spaxel[0] - 0.5,
+                                        self._init_guess_spaxel[1] - 0.5))
+                self._blue_rect.set_visible(True)
+                self.canvas.draw_idle()
 
         self.fit_params_window.on_addline_button_click(df,frame_id=region_ID)
         
@@ -1720,12 +3303,33 @@ class ViewerWindow(QMainWindow):
                 
             
             if self.is_1d_spectrum == False:
-                new_line, = self.spectrum_ax.plot(x_vals, y_new, color='red', lw=0.5,label=f'rChi2 = {row["rchisq"]}')
+                new_line, = self.spectrum_ax.plot(x_vals, y_new, color='red', lw=0.5, label=f'rChi2 = {row["rchisq"]}')
             else:
                 new_line, = self.spectrum_ax.plot(x_vals, y_new, color='red', lw=0.5)
             df_cont.loc[np.int64(df_cont["region_ID"]) == region_ID, 'lineactor'] = new_line  # Update reference
             
             self.spectrum_ax.legend()
+
+            # ── Push fitted values into the parameter buttons ─────────────
+            # df_fit uses 'LineID' and df uses 'Line_ID'; match on both.
+            if self.fit_params_window is not None:
+                fp = self.fit_params_window
+                for _, frow in region.iterrows():
+                    lid = np.int64(frow['LineID'])
+                    # Button key prefix is the Line_ID from df
+                    prefix = str(lid)
+                    _map = {
+                        f'{prefix}~Amp_fit':      frow.get('amp_fit', np.nan),
+                        f'{prefix}~Centroid_fit': frow.get('cen_fit', np.nan),
+                        f'{prefix}~v_fit':        frow.get('vel_fit', np.nan),
+                        f'{prefix}~Sigma_fit':    frow.get('sigma_fit', np.nan),
+                    }
+                    for btn_name, val in _map.items():
+                        key = (np.int64(region_ID), btn_name)
+                        if key in fp.buttons_dict:
+                            fp.buttons_dict[key].setText(
+                                _fmt(val) if np.isfinite(float(val)) else "—"
+                            )
 
         # Redraw dynamically
         self.spectrum_ax.figure.canvas.draw_idle()
@@ -1742,42 +3346,102 @@ class ViewerWindow(QMainWindow):
                 
     def draw_image(self, data, cmap, scale, from_fits=False):
         """Generates and displays the white-light image in the left panel."""
+        self._last_cmap  = cmap
+        self._last_scale = scale
+        self._last_from_fits = from_fits
+        # Only update _last_data when called from a real data load (not from
+        # _cube_redraw_transformed, which passes already-transformed 2D data).
+        # _cube_redraw_transformed sets _applying_transform=True before calling.
+        if not getattr(self, '_applying_transform', False):
+            self._last_data = data
+            # Cache the original 2D shape for coord inverse transform
+            if from_fits and hasattr(data, 'ndim') and data.ndim == 3:
+                self._cube_orig_shape = (data.shape[1], data.shape[2])  # (ny, nx)
+            elif not from_fits and hasattr(data, 'ndim') and data.ndim == 2:
+                self._cube_orig_shape = data.shape
         global npix_x, npix_y
         if from_fits:
-            image = np.nansum(data, axis=0)
+            image = np.nansum(data, axis=0).astype(np.float64)
             npix_x = np.shape(image)[0]
             npix_y = np.shape(image)[1]
         else:
-            image = data
-            if scale == 'log':
-                image = np.log10(image)
-        
-        
-        min_value = np.nanmin(image)
-        if min_value < 0:
-            image += abs(min_value)
-        
-        # Filter out extreme outliers using percentiles
-        lower_bound, upper_bound = np.nanpercentile(image, [5, 95])
-        
-        # Clip the image data to reduce the influence of extreme outliers
-        image = np.clip(image, lower_bound, upper_bound)
-    
-        vmin = np.nanmedian(image) - 3 * np.nanstd(image)
-        vmax = np.nanmedian(image) + 3 * np.nanstd(image)
-        
-        
-    
+            image = np.array(data, dtype=np.float64)
+
+        # ── Apply transfer function (scale) ───────────────────────────
+        # Prefer toolbar setting; fall back to passed-in scale arg
+        tf = getattr(self, 'scale_combo', None)
+        tf_name = tf.currentText() if tf else scale
+
+        # Shift to positive before non-linear transforms
+        min_val = np.nanmin(image)
+        if min_val < 0:
+            image = image - min_val
+
+        if tf_name == 'Log':
+            image = np.log10(np.where(image > 0, image, np.nan))
+        elif tf_name == 'Square root':
+            image = np.sqrt(np.where(image >= 0, image, np.nan))
+        elif tf_name == 'Squared':
+            image = image ** 2
+        elif tf_name == 'Asinh':
+            scale_factor = np.nanpercentile(image, 99) or 1.0
+            image = np.arcsinh(image / scale_factor)
+        # Linear: no transform
+
+        # ── Apply stretch (clip level) ────────────────────────────────
+        st = getattr(self, 'stretch_combo', None)
+        st_name = st.currentText() if st else 'minmax'
+
+        stretch_map = {
+            'minmax': (0, 100),
+            '99.9%':  (0.05, 99.95),
+            '99.5%':  (0.25, 99.75),
+            '99%':    (0.5,  99.5),
+            '98%':    (1,    99),
+            '95%':    (2.5,  97.5),
+        }
+        if st_name == 'manual':
+            vmin = getattr(self, '_manual_vmin', np.nanmin(image))
+            vmax = getattr(self, '_manual_vmax', np.nanmax(image))
+        else:
+            lo_pct, hi_pct = stretch_map.get(st_name, (0.5, 99.5))  # default 99% clip
+            finite = image[np.isfinite(image)]
+            if len(finite) == 0:
+                vmin, vmax = 0, 1
+            else:
+                vmin = np.percentile(finite, lo_pct)
+                vmax = np.percentile(finite, hi_pct)
+
         self.canvas.figure.clear()
         self.ax = self.canvas.figure.add_subplot(111)
         self.ax.imshow(image, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-        # self.ax.set_xlim(0,npix_x)
-        # self.ax.set_ylim(0,npix_y)
         apply_mpl_qss_style(self.canvas.figure, self.ax, None)
+        self.ax.grid(False)  # No grid on the cube image
 
         # Initialize red rectangle but keep it hidden initially
         self.red_rect = patches.Rectangle((0, 0), 1, 1, linewidth=1.5, edgecolor='#d7801a', facecolor='none', visible=False)
         self.ax.add_patch(self.red_rect)
+        self._blue_rect = patches.Rectangle((0, 0), 1, 1, linewidth=2.0, edgecolor='#4fc3f7', facecolor='none', visible=False)
+        self.ax.add_patch(self._blue_rect)
+        # Restore blue rect position if an init-guess spaxel was previously set
+        if getattr(self, '_init_guess_spaxel', None) is not None:
+            _ix, _iy = self._init_guess_spaxel
+            self._blue_rect.set_xy((_ix - 0.5, _iy - 0.5))
+            self._blue_rect.set_visible(True)
+
+        # Overlay text for spaxel info (top-left corner of the image axes)
+        self.spaxel_info_text = self.ax.text(
+            0.01, 0.99, '',
+            transform=self.ax.transAxes,
+            verticalalignment='top', horizontalalignment='left',
+            fontsize=8, color='white',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.5, edgecolor='none')
+        )
+        # Restore background image overlay if one was loaded
+        if getattr(self, '_bkg_data', None) is not None:
+            self._bkg_artist = None  # force redraw since axes were cleared
+            self._draw_bkg_overlay()
+
         self.canvas.draw()
 
 
@@ -1875,12 +3539,96 @@ class ViewerWindow(QMainWindow):
         super().showEvent(event)
 
 
-    def open_fit_params_window(self):
-        """Opens the FitParamsWindow when the button is clicked"""
-        if self.fit_params_window is None or not self.fit_params_window.isVisible():
-            self.fit_params_window = FitParamsWindow(viewer_window=self, df=df, df_cont=df_cont, current_line='')
-            self.fit_params_window.show()
+    def _ensure_fit_params_open_and_add_region(self):
+        """Called after each interactive continuum draw (D-key).
         
+        Guarantees:
+        1. The Fit Parameters dock is created and visible (never accidentally closes it).
+        2. The newly-added spectral region frame is always appended to the panel.
+        """
+        new_id = len(df_cont) - 1  # index of the region just added
+
+        if self.fit_params_dock is None:
+            # First ever open: create the dock. FitParamsWindow.__init__ will
+            # call add_spectral_frame for region 0 via its own init logic.
+            self.toggle_fit_params_dock()
+            # __init__ only adds region 0; if somehow more regions exist, add them
+            for extra_id in range(1, len(df_cont)):
+                self.fit_params_window.add_spectral_frame(
+                    f"Spectral Region {extra_id + 1}", df_cont, df, ID=extra_id, addframe=False
+                )
+        else:
+            # Dock already exists — make sure it is visible (never hide it here)
+            if not self.fit_params_dock.isVisible():
+                self.fit_params_dock.show()
+                self.resizeDocks([self.fit_params_dock], [self.width() // 2], Qt.Horizontal)
+                self.open_fit_params_button.setText("Fit Params \u25c0")
+            # Always add the new region frame explicitly
+            self.fit_params_window.add_spectral_frame(
+                f"Spectral Region {new_id + 1}", df_cont, df, ID=new_id, addframe=False
+            )
+
+    def toggle_fit_params_dock(self):
+        """Toggle the Fit Parameters panel between docked and hidden states.
+        
+        First call: creates FitParamsWindow and docks it on the right side of
+        ViewerWindow as a QDockWidget.  Subsequent calls show/hide the dock so
+        the viewer layout is never obscured by a floating window.
+        """
+        # --- First-time creation ---
+        if self.fit_params_dock is None:
+            # Create the FitParamsWindow (still a QMainWindow; we just embed it)
+            self.fit_params_window = FitParamsWindow(
+                viewer_window=self, df=df, df_cont=df_cont, current_line=''
+            )
+
+            # Wrap it in a QDockWidget
+            self.fit_params_dock = QDockWidget("Fit Parameters", self)
+            self.fit_params_dock.setObjectName("FitParamsDock")
+            self.fit_params_dock.setAllowedAreas(
+                Qt.BottomDockWidgetArea | Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea
+            )
+            # Embed the central widget of FitParamsWindow (the scroll area etc.)
+            self.fit_params_dock.setWidget(self.fit_params_window.centralWidget())
+            self.fit_params_dock.setFeatures(
+                QDockWidget.DockWidgetMovable |
+                QDockWidget.DockWidgetFloatable |
+                QDockWidget.DockWidgetClosable
+            )
+            # Keep the button label in sync when the user closes the dock via its X
+            self.fit_params_dock.visibilityChanged.connect(self._on_dock_visibility_changed)
+
+            self.addDockWidget(Qt.BottomDockWidgetArea, self.fit_params_dock)
+            # Size the dock to ~40% of the window height
+            self.resizeDocks([self.fit_params_dock], [self.height() * 2 // 5], Qt.Vertical)
+            self.open_fit_params_button.setText("▲  Fit Parameters")
+            return
+
+        # --- Toggle visibility on subsequent calls ---
+        if self.fit_params_dock.isVisible():
+            self.fit_params_dock.hide()
+            self.open_fit_params_button.setText("▼  Fit Parameters")
+        else:
+            self.fit_params_dock.show()
+            # Re-apply height whenever the dock is shown again
+            self.resizeDocks([self.fit_params_dock], [self.height() * 2 // 5], Qt.Vertical)
+            self.open_fit_params_button.setText("▲  Fit Parameters")
+
+    def _on_dock_visibility_changed(self, visible):
+        """Keep the toggle button label in sync when dock is closed via its own X button."""
+        if visible:
+            self.open_fit_params_button.setText("▲  Fit Parameters")
+        else:
+            self.open_fit_params_button.setText("▼  Fit Parameters")
+
+    def open_fit_params_window(self):
+        """Opens the FitParamsWindow when the button is clicked.
+        
+        Kept for backwards-compatibility (e.g. calls from other code paths).
+        Delegates to the dock toggle so behaviour is consistent.
+        """
+        self.toggle_fit_params_dock()
+
     def closeEvent(self, event):
         """Override closeEvent to ensure the console is still active after closing the window"""
         app = QApplication.instance()
@@ -1912,16 +3660,23 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         # Scroll Area
         self.scroll_area = QScrollArea(self.main_widget)
         self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         layout.addWidget(self.scroll_area)
 
         # Container for frames inside the scroll area
         self.scroll_container = QWidget()
-        self.scroll_layout = QVBoxLayout(self.scroll_container)
-        self.scroll_layout.setSpacing(20)
-        self.scroll_container.setLayout(self.scroll_layout)
+        # Vertical layout: obs toolbar at top, then one spectral region card per row
+        self.outer_scroll_layout = QVBoxLayout(self.scroll_container)
+        self.outer_scroll_layout.setSpacing(8)
+        self.outer_scroll_layout.setContentsMargins(4, 4, 4, 4)
+        # scroll_layout alias points to same layout for compatibility
+        self.scroll_layout = self.outer_scroll_layout
+        self.scroll_container.setLayout(self.outer_scroll_layout)
+        self.scroll_container.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
         self.scroll_area.setWidget(self.scroll_container)
 
-        self.add_spaxel_info_frame('Observation Data', df_cont, df, df_obs)
+        self._build_obs_and_fit_toolbar(df_obs)
         
         if len(df_cont) == 0:
             self.spectral_count = 0
@@ -1930,7 +3685,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             self.add_spectral_frame("Spectral Region 1", df_cont, df, ID=0, addframe=False)
 
         self.setGeometry(100, 100, 1200, 400)
-        self.show()
+        # Note: visibility is now managed by the QDockWidget in ViewerWindow.
 
     def create_menu_bar_FitParamsWindow(self):
         """Creates the menu bar for this window"""
@@ -1997,7 +3752,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                        if (col_name == 'Continuum Name') or (type(df_cont.iloc[row, col]) == str):
                              button_text = str(df_cont.iloc[row, col]) if 'fit' not in col_name.lower() else ''
                        else:
-                             button_text = str(round(df_cont.iloc[row, col],4)) if 'fit' not in col_name.lower() else ''
+                             button_text = _fmt(df_cont.iloc[row, col]) if 'fit' not in col_name.lower() else ''
                        button = FrameButton(button_text, row, col, regionID, button_name)
                        # button.setStyleSheet("""
                        #     font-family: "Segoe UI";
@@ -2043,9 +3798,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                        
                        if col == 6:
                             button_name = 'continuum_delete'
-                            delete_region_button = FrameButton('-', row, col, regionID, button_name)
+                            delete_region_button = FrameButton('x', row, col, regionID, button_name)
                             delete_region_button.setStyleSheet("""
-                                background-color: lightcoral;
+                                background-color: lightcoral; color: black;
                                 color: k;
                             """)
                             
@@ -2127,7 +3882,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 button_name = str(np.int64(df_region.iloc[row]['Line_ID']))+'~'+str(col_name)
                 if col_name in ['Rest Wavelength', 'Amp_0', 'Centroid_0', 'Sigma_0']:
                     df_region.iloc[row][col_name] = np.float64(df_region.iloc[row][col_name])
-                    button_text = str(round(df_region.iloc[row][col_name],3))
+                    button_text = _fmt(df_region.iloc[row][col_name])
                 else:
                     
                     if ('fit' in col_name.lower()) | ('SNR' in col_name) | ('Rest' in col_name):
@@ -2148,8 +3903,6 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 #     color: black;
                 #     font: bold;
                 # """)
-                button.setFixedWidth(76)
-                
                 if 'fit' in col_name:  # Check the 'fit' column
                     # button.setStyleSheet("""
                     #     font-family: "Segoe UI";
@@ -2174,111 +3927,15 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 
                 line_id = np.float64(df_region.iloc[row]['Line_ID'])
                 line_id = np.int64(line_id)
+
+            # Delete button at the rightmost position of each line row
+            del_line_btn = FrameButton('x', row, len(button_columns), regionID, f'del_line_{line_id}')
+            del_line_btn.setFixedHeight(24)
+            del_line_btn.setStyleSheet("background-color: lightcoral; color: black;")
+            del_line_btn.clicked.connect(partial(self.on_deleteline_button_click, frame_id=regionID, line_id=line_id))
+            grid_layout.addWidget(del_line_btn, main_row_index, len(button_columns))
+            self.buttons_dict[(regionID, f'del_line_{line_id}')] = del_line_btn
                 
-                '''
-                # Add lower and upper limit buttons for specific columns
-                if col_name in ['Amp_0', 'Centroid_0', 'Sigma_0']:
-                    limits_container = QWidget()
-                    limits_layout = QHBoxLayout()
-                    limits_container.setLayout(limits_layout)
-                    
-                    # **REMOVE BORDERS** from limits_container
-                    limits_container.setStyleSheet("border: none;")
-                    
-                    
-                    # Lower limit button
-                    button_name_lowerlim = str(line_id)+'~'+col_name + '_lowlim'
-                    button_text_lowerlim = str(df_region.iloc[row][col_name+'_lowlim'])
-                    button_lowlim = FrameButton(button_text_lowerlim, row+1, col, regionID, button_name_lowerlim)
-                    # button_lowlim.setStyleSheet("""
-                    #     font-family: "Segoe UI";
-                    #     font-size: 8pt;
-                    #     border: 2px solid;
-                    #     border-color: steelblue;
-                    #     border-radius: 5px;
-                    #     padding: 5px 10px;
-                    #     background-color: lightskyblue;
-                    #     color: black;
-                    #     font: bold;
-                    #     padding: 0px;  /* Remove padding */
-                    #     margin: 0px;   /* Remove margins */
-                    #     text-align: center;
-                    # """)
-                    button_lowlim.setFixedWidth(38)
-                    button_lowlim.setFixedHeight(button_height)  # Ensure consistent height
-    
-                    # Upper limit button
-                    
-                    button_name_upperlim = str(line_id)+'~'+col_name + '_highlim'
-                    button_text_upperlim = str(df_region.iloc[row][col_name+'_highlim'])
-                    button_highlim = FrameButton(button_text_upperlim, row+1, col, regionID, button_name_upperlim)
-                    # button_highlim.setStyleSheet("""
-                    #     font-family: "Segoe UI";
-                    #     font-size: 8pt;
-                    #     border: 2px solid;
-                    #     border-color: steelblue;
-                    #     border-radius: 5px;
-                    #     padding: 5px 10px;
-                    #     background-color: lightskyblue;
-                    #     color: black;
-                    #     font: bold;
-                    #     padding: 0px;  /* Remove padding */
-                    #     margin: 0px;   /* Remove margins */
-                    #     text-align: center;
-                    # """)
-
-                    button_highlim.setFixedWidth(38)
-                    button_highlim.setFixedHeight(button_height)  # Ensure consistent height
-    
-                    button_lowlim.setMinimumSize(38, 24)
-                    button_highlim.setMinimumSize(38, 24)
-    
-    
-                    # Add both buttons inside the container with spacing
-                    limits_layout.addWidget(button_lowlim)
-                    limits_layout.addWidget(button_highlim)
-    
-                    # Adjust margins of the limits_layout to shift the buttons around
-                    limits_layout.setContentsMargins(0, 0, 24, 0)  
-                    
-        
-                    # **Adjust padding between buttons**
-                    # limits_layout.setSpacing(16)  # Change this value to adjust spacing
-                    
-                    # limits_container.setStyleSheet("background-color: transparent; border: none;")
-                    # limits_container.setStyleSheet("background-color: yellow;")
-
-                    # Add the limits_container to the grid layout
-                    grid_layout.addWidget(limits_container, limits_row_index, col)
-    
-                    # Store button references
-                    self.buttons_dict[(regionID, button_name_lowerlim)] = button_lowlim
-                    self.buttons_dict[(regionID, button_name_upperlim)] = button_highlim
-                    
-                    button_lowlim.clicked.connect(partial(self.on_button_click, data_frame=df, frame_id=regionID, button_name=button_name_lowerlim))
-                    button_highlim.clicked.connect(partial(self.on_button_click, data_frame=df, frame_id=regionID, button_name=button_name_upperlim))
-                    
-                    
-                    '''
-
-                # # Add a delete button at the last column
-                if col_name == 'Sigma_fit':
-                    button_name = 'line_' + str(row+1)
-                    delete_line_button = FrameButton('-', row, col, regionID, button_name)
-                    delete_line_button.setStyleSheet("""
-                        background-color: lightcoral;
-                        color: black;
-                    """)
-                    
-                    delete_line_button.clicked.connect(partial(self.on_deleteline_button_click, 
-                                                                frame_id=regionID, 
-                                                                line_id=line_id))
-                    
-                    # delete_line_button.clicked.connect(partial(self.on_addline_button_click,data_frame=df, frame_id=regionID))
-                    grid_layout.addWidget(delete_line_button, main_row_index, col+1)
-
-
-
     def on_fit_button_click(self, frame_id, button_name):
         print(f'frame ID: {frame_id}, button name: {button_name}')
 
@@ -2326,10 +3983,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
             # print('shape of img array'+str(np.shape(image_array)))
 
-            if df_param == 'amp_fit': 
-                cmap='viridis'
-                scale='log'
-                # image_array = np.nan_to_num(image_array,nan=abs(np.nanmedian(image_array)))
+            if df_param == 'amp_fit':
+                cmap = 'viridis'
+                # Use linear scale: log10 of ~1e-18 values collapses to NaN after clipping
+                scale = 'linear'
             if df_param == 'cen_fit': 
                 cmap='bwr'
                 scale='linear'
@@ -2510,274 +4167,125 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             # for col, val in df_cont.iloc[0].items():  # Assuming a single row
             #     print(f"{col}: {val}")
 
-    def add_spaxel_info_frame(self, title_text, df_cont, df, df_obs):
+    def _build_obs_and_fit_toolbar(self, df_obs):
+        """Build a compact single-row toolbar at the top of the scroll area.
         
+        Left side: editable observation fields (Source, z, R).
+        Right side: fit action buttons in a horizontal row.
+        A '+ Spectral Region' button sits at the far right.
+        Everything lives in a slim QFrame added to scroll_layout.
+        """
         frame = QFrame()
         frame.setFrameShape(QFrame.StyledPanel)
         frame.setFrameShadow(QFrame.Raised)
-        frame.setObjectName(f"observation_data")
-        frame.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        # frame.setStyleSheet("""
-        # border: 2px solid black;
-        # background-color: snow;
-        # border-radius: 15px;  /* Adjust the value to change the roundness */
-        # padding: 10px;        /* Optional: Adds spacing inside the frame */
-        # """)
-        
-        # Main layout for the frame
-        main_layout = QHBoxLayout(frame)
-    
-        # Title
-        title = QLabel(title_text)
-        title.setAlignment(Qt.AlignCenter)
-        # title.setStyleSheet("""
-        #     font-family: "Segoe UI";
-        #     font-size: 16pt;
-        #     border: none;
-        #     padding-right: 10px;
-        #     padding-left: 10px;
-        #     padding-top: 5px;
-        #     padding-bottom: 5px;
-        #     background-color: snow;
-        #     color: black;
-        #     font: bold;
-        #     width: 64px;
-        # """)
-    
-        # Create the left frame to hold buttons and labels
-        button_frame = QFrame()
-        button_frame.setFrameShape(QFrame.StyledPanel)
-        button_frame.setFrameShadow(QFrame.Raised)
-        button_frame.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
-        button_layout = QVBoxLayout(button_frame)
-        
-        # Define the rows of information with labels and buttons
-        spaxel_info_rows = [['RA', 'Dec'], ['Pixel X', 'Pixel Y'], ['Pixel N']]  # Group the labels and buttons into pairs
-        
-        # Create buttons here for later use
-        self.ra_button = SpaxelButton('RA: ', 'RA')
-        self.dec_button = SpaxelButton('Dec: ', 'Dec')
-        self.x_button = SpaxelButton('X: ', 'X')
-        self.y_button = SpaxelButton('Y: ', 'Y')
-        self.n_button = SpaxelButton('N: ', 'N')
-        
-        # Loop through and create rows for labels and buttons
-        for row in spaxel_info_rows:
-            # Create a horizontal layout for the labels
-            label_layout = QHBoxLayout()
-        
-            for label_name in row:
-                # Create label
-                label = QLabel(label_name)
-                # label.setStyleSheet("""
-                #     font-family: "Segoe UI";
-                #     font-size: 12pt;
-                #     border: none;
-                #     padding-right: 10px;
-                #     padding-left: 10px;
-                #     padding-top: 5px;
-                #     padding-bottom: 5px;
-                #     background-color: snow;
-                #     color: black;
-                #     font: bold;
-                #     width: 64px;
-                # """)
-                label_layout.addWidget(label)  # Add label to horizontal layout
-            
-            # Add label layout (side-by-side) to the main button layout
-            button_layout.addLayout(label_layout)
-        
-            # Create a horizontal layout for the buttons (below the labels)
-            button_layout_2 = QHBoxLayout()
-            
-            for label_name in row:
-                # Dynamically add the correct button for each label
-                if label_name == 'RA':
-                    button = self.ra_button
-                elif label_name == 'Dec':
-                    button = self.dec_button
-                elif label_name == 'Pixel X':
-                    button = self.x_button
-                elif label_name == 'Pixel Y':
-                    button = self.y_button
-                elif label_name == 'Pixel N':
-                    button = self.n_button
-                else:
-                    button = SpaxelButton('test', label_name)  # fallback for any other label name
-        
-                # button.setStyleSheet("""
-                #     font-family: "Segoe UI";
-                #     font-size: 10pt;
-                #     border: 2px solid;
-                #     border-color: black;
-                #     border-radius: 5px;
-                #     padding-right: 10px;
-                #     padding-left: 10px;
-                #     padding-top: 5px;
-                #     padding-bottom: 5px;
-                #     color: k;
-                #     font: bold;
-                #     width: 12px;
-                # """)
-                
-                # Adjust the width of the button
-                button.setFixedWidth(120)  # Set a fixed width for the button (adjust this value as needed)
-                button_layout_2.addWidget(button)  # Add button to horizontal layout (side-by-side)
-        
-            # Add button layout (side-by-side) to the main button layout
-            button_layout.addLayout(button_layout_2)
+        frame.setObjectName('obs_toolbar_frame')
+        frame.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(8, 4, 8, 4)
+        row.setSpacing(6)
 
-    
-        # Add the button frame to the left side of the main layout
-        main_layout.addWidget(button_frame)
-    
-        # Main content area (right side)
-        content_frame = QFrame()
-        content_frame.setFrameShape(QFrame.StyledPanel)
-        content_frame.setFrameShadow(QFrame.Raised)
-        content_layout = QVBoxLayout(content_frame)
-    
-        # Add the title to the content frame
-        content_layout.addWidget(title)
-    
-        # Add other content or widgets to the main content frame here
-        # ...
-        self.source_name_button = SpaxelButton('Source Name: ', 'Source Name')  # New button
-        self.source_redshift_button = SpaxelButton('Source Redshift: ', 'Source Redshift')  # New button
-        self.resolving_power_button = SpaxelButton('Resolving Power: ', 'Resolving Power')  # New button
+        # ── Observation fields ──────────────────────────────────────────────
+        _name = df_obs.loc[0, 'sourcename']    if len(df_obs) > 0 else ''
+        _z    = df_obs.loc[0, 'redshift']      if len(df_obs) > 0 else ''
+        _rp   = df_obs.loc[0, 'resolvingpower'] if len(df_obs) > 0 else ''
 
-        # Add the source information to the content layout
-        self.source_name_button.setText(f"Source Name: {df_obs.loc[0, 'sourcename']}")
-        self.source_redshift_button.setText(f"Source Redshift: {df_obs.loc[0, 'redshift']}")
-        self.resolving_power_button.setText(f"Resolving Power: {df_obs.loc[0, 'resolvingpower']}")
-        
-        # for button in [self.source_name_button,self.source_redshift_button,self.resolving_power_button]:
-        #     button.setStyleSheet("""
-        #         font-family: "Segoe UI";
-        #         font-size: 10pt;
-        #         border: 2px solid;
-        #         border-color: steelblue;
-        #         border-radius: 5px;
-        #         padding-right: 10px;
-        #         padding-left: 10px;
-        #         padding-top: 5px;
-        #         padding-bottom: 5px;
-        #         background-color: lightskyblue;
-        #         color: k;
-        #         font: bold;
-        #         width: 12px;
-        #     """)
-        
-        
-        
-        self.source_name_button.clicked.connect(partial(self.on_button_click, data_frame=df_obs, frame_id=0, button_name='sourcename'))
-        self.source_redshift_button.clicked.connect(partial(self.on_button_click, data_frame=df_obs, frame_id=0, button_name='redshift'))
-        self.resolving_power_button.clicked.connect(partial(self.on_button_click, data_frame=df_obs, frame_id=0, button_name='resolvingpower'))
+        self.source_name_button    = SpaxelButton(f'Source: {_name}',  'Source Name')
+        self.source_redshift_button= SpaxelButton(f'z: {_z}',          'Source Redshift')
+        self.resolving_power_button= SpaxelButton(f'R: {_rp}',         'Resolving Power')
 
+        for btn in [self.source_name_button,
+                    self.source_redshift_button,
+                    self.resolving_power_button]:
+            btn.setFixedHeight(28)
+            row.addWidget(btn)
 
-        # Add the observation buttons to the content layout
-        content_layout.addWidget(self.source_name_button)
-        content_layout.addWidget(self.source_redshift_button)
-        content_layout.addWidget(self.resolving_power_button)
-    
-        # Add the content frame to the main layout
-        main_layout.addWidget(content_frame)
-        
-        
-        # Fitting Panel
-        
-        # Title
-        title = QLabel('Spectral Fitting')
-        title.setAlignment(Qt.AlignCenter)
-        # title.setStyleSheet("""
-        #     font-family: "Segoe UI";
-        #     font-size: 16pt;
-        #     border: none;
-        #     padding-right: 10px;
-        #     padding-left: 10px;
-        #     padding-top: 5px;
-        #     padding-bottom: 5px;
-        #     background-color: snow;
-        #     color: black;
-        #     font: bold;
-        #     width: 64px;
-        # """)
-        
-        # Main content area (right side)
-        fit_frame = QFrame()
-        fit_frame.setFrameShape(QFrame.StyledPanel)
-        fit_frame.setFrameShadow(QFrame.Raised)
-        fit_layout = QVBoxLayout(fit_frame)
-    
-        # Add the title to the content frame
-        fit_layout.addWidget(title)
-        
-        
-        # Add other content or widgets to the main content frame here
-        # ...
-        self.fit_spaxel_button = QPushButton('Fit Current Spaxel')  # New button
-        # self.fit_aperture_button = QPushButton('Fit Aperture')  # New button
-        self.fit_cube_button = QPushButton('Fit Cube')  # New button
-        self.fix_fit_button = QPushButton('Rectify Bad Fits')
-        self.save_cube_fit_button = QPushButton('Save Cube Fit')
-        self.save_cube_fit_fitsfile_button = QPushButton('Save Fit to Fits File')
-        self.load_cube_fit_button = QPushButton('Load Cube Fit')
+        self.source_name_button.clicked.connect(
+            partial(self.on_button_click, data_frame=df_obs, frame_id=0, button_name='sourcename'))
+        self.source_redshift_button.clicked.connect(
+            partial(self.on_button_click, data_frame=df_obs, frame_id=0, button_name='redshift'))
+        self.resolving_power_button.clicked.connect(
+            partial(self.on_button_click, data_frame=df_obs, frame_id=0, button_name='resolvingpower'))
 
-        # Add the source information to the content layout
-        self.fit_spaxel_button.setText(f"Fit Current Spaxel")
-        # self.fit_aperture_button.setText(f"Fit Aperture")
-        self.fit_cube_button.setText(f"Fit Cube")
-        self.fix_fit_button.setText(f"Rectify Bad Fits")
-        self.save_cube_fit_button.setText(f"Save Cube Fit")
-        self.save_cube_fit_fitsfile_button.setText(f'Save Fit to Fits File')
-        self.load_cube_fit_button.setText(f"Load Cube Fit")
-        
-        
-        # for button in [self.fit_spaxel_button,self.fit_aperture_button,self.fit_cube_button,
-        #                self.save_cube_fit_button, self.load_cube_fit_button]:
-        #     button.setStyleSheet("""
-        #         font-family: "Segoe UI";
-        #         font-size: 10pt;
-        #         border: 2px solid;
-        #         border-color: steelblue;
-        #         border-radius: 5px;
-        #         padding-right: 10px;
-        #         padding-left: 10px;
-        #         padding-top: 5px;
-        #         padding-bottom: 5px;
-        #         background-color: lightskyblue;
-        #         color: k;
-        #         font: bold;
-        #         width: 12px;
-        #     """)
-        
-        # Button press functions
+        # Separator
+        sep = QFrame(); sep.setFrameShape(QFrame.VLine); sep.setFrameShadow(QFrame.Sunken)
+        row.addWidget(sep)
+
+        # ── Fit action buttons ──────────────────────────────────────────────
+        self.fit_spaxel_button           = QPushButton('Fit Spaxel')
+        self.fit_cube_button             = QPushButton('Fit Cube')
+        self.fix_fit_button              = QPushButton('Rectify Bad Fits')
+        self.save_cube_fit_button        = QPushButton('Save Fit (CSV)')
+        self.save_cube_fit_fitsfile_button = QPushButton('Save Fit (FITS)')
+        self.load_cube_fit_button        = QPushButton('Load Fit')
+
         self.fit_spaxel_button.clicked.connect(partial(self.fit_spaxel))
         self.fit_cube_button.clicked.connect(partial(self.fit_cube))
-        self.save_cube_fit_button.clicked.connect(partial(self.save_cube_fit))
         self.fix_fit_button.clicked.connect(partial(self.fix_fits))
+        self.save_cube_fit_button.clicked.connect(partial(self.save_cube_fit))
         self.save_cube_fit_fitsfile_button.clicked.connect(partial(self.save_fit_result_fitsfile))
         self.load_cube_fit_button.clicked.connect(partial(self.load_cube_fit))
-        
-        
-        # Add the observation buttons to the content layout
-        fit_layout.addWidget(self.fit_spaxel_button)
-        # fit_layout.addWidget(self.fit_aperture_button)
-        fit_layout.addWidget(self.fit_cube_button)
-        fit_layout.addWidget(self.fix_fit_button)
-        fit_layout.addWidget(self.save_cube_fit_button)
-        fit_layout.addWidget(self.save_cube_fit_fitsfile_button)
-        fit_layout.addWidget(self.load_cube_fit_button)
-        
-        # Add the content frame to the main layout
-        main_layout.addWidget(fit_frame)
-        
-        
-        
-        self.scroll_layout.addWidget(frame)
 
+        for btn in [self.fit_spaxel_button, self.fit_cube_button,
+                    self.fix_fit_button, self.save_cube_fit_button,
+                    self.save_cube_fit_fitsfile_button, self.load_cube_fit_button]:
+            btn.setFixedHeight(28)
+            row.addWidget(btn)
 
+        # Separator
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.VLine); sep2.setFrameShadow(QFrame.Sunken)
+        row.addWidget(sep2)
+
+        # ── + Spectral Region ───────────────────────────────────────────────
+        self.add_region_button = QPushButton('+ Region')
+        self.add_region_button.setFixedHeight(28)
+        self.add_region_button.setToolTip(
+            'Add a new blank spectral region.\n'
+            'You can also draw a continuum with the D key.'
+        )
+        self.add_region_button.clicked.connect(self._on_add_region_button_click)
+        row.addWidget(self.add_region_button)
+
+        row.addStretch()
+        self.outer_scroll_layout.insertWidget(0, frame)  # toolbar always at top
+
+    def add_spaxel_info_frame(self, title_text, df_cont, df, df_obs):
+        """Legacy wrapper — calls the new compact toolbar builder."""
+        self._build_obs_and_fit_toolbar(df_obs)
+
+    def _on_add_region_button_click(self):
+        """Manually add a new blank spectral region panel without drawing on the spectrum.
+        
+        Creates a placeholder continuum entry in df_cont with NaN geometry so the
+        spectral region frame appears in the dock immediately.  The user can then
+        populate x1/x2/slope/intercept by clicking the parameter buttons, or draw
+        a real continuum with the 'D' key which will override these values.
+        """
+        global df_cont, df
+        new_id = len(df_cont)  # Next region ID
+        
+        # Add a placeholder continuum row so add_spectral_frame has data to display
+        placeholder_cont = pd.DataFrame({
+            'Continuum Name': ['Continuum'],
+            'x1': [np.nan],
+            'x2': [np.nan],
+            'Slope_0': [0.0],
+            'Intercept_0': [0.0],
+            'Slope_fit': [np.nan],
+            'Intercept_fit': [np.nan],
+            'region_ID': [new_id],
+            'lineactor': [None],
+        })
+        
+        if len(df_cont) == 0:
+            df_cont = placeholder_cont
+        else:
+            df_cont = pd.concat([df_cont, placeholder_cont], ignore_index=True)
+        
+        # Add the spectral region frame (addframe=False because we already updated df_cont above)
+        self.add_spectral_frame(
+            f"Spectral Region {new_id + 1}", df_cont, df, ID=new_id, addframe=False
+        )
 
     def fix_fits(self):
         global df, df_cont, df_fit
@@ -2918,9 +4426,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             df_obs = pd.DataFrame(rows[:split_indices[0]][1:], columns=rows[0])  # Exclude header row from data
             df_obs = df_obs.apply(pd.to_numeric, errors='ignore')  # Convert numeric columns if possible
     
-            self.source_name_button.setText('Source Name: '+str(df_obs['sourcename'].item()))
-            self.source_redshift_button.setText('Source Redshift: '+str(df_obs['redshift'].item()))
-            self.resolving_power_button.setText('Resolving Power: '+str(df_obs['resolvingpower'].item()))
+            self.source_name_button.setText('Source: '+str(df_obs['sourcename'].item()))
+            self.source_redshift_button.setText('z: '+str(df_obs['redshift'].item()))
+            self.resolving_power_button.setText('R: '+str(df_obs['resolvingpower'].item()))
             
             df_scale_header_index = split_indices[0] + 1
             while df_scale_header_index < len(rows) and not any(rows[df_scale_header_index]):
@@ -3063,12 +4571,35 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             
         spectrum = np.nan_to_num(spectrum)
         
+        # ── Flux rescaling ────────────────────────────────────────────────
+        # lmfit's Levenberg-Marquardt uses finite differences ~1e-8 * value
+        # for the Jacobian.  When flux values are ~1e-18, that step underflows
+        # to zero, making the Jacobian singular and all amplitude fits zero.
+        # Rescaling to order-unity before the fit and back afterward avoids this.
+        flux_scale = np.nanpercentile(np.abs(spectrum[spectrum != 0]), 95) if np.any(spectrum != 0) else 1.0
+        if flux_scale == 0 or not np.isfinite(flux_scale):
+            flux_scale = 1.0
+        spectrum_scaled = spectrum / flux_scale
+
+        # Scale amplitude params and their bounds
+        params_scaled = params_to_use.copy()
+        for pname, param in params_scaled.items():
+            if pname.startswith('amp'):
+                param.set(value=param.value / flux_scale)
+                if param.min is not None:
+                    param.min = param.min / flux_scale
+                if param.max is not None:
+                    param.max = param.max / flux_scale
+            elif pname.startswith('intercept'):
+                param.set(value=param.value / flux_scale)
+        # ─────────────────────────────────────────────────────────────────
+
         # Constants for velocity calculation
         c = 299792.458  # km/s
         
         # Perform the fit using lmfit
         try:
-            result = piecewise_model.fit(spectrum, params_to_use, x=wavelengths, max_nfev=max_nfev)
+            result = piecewise_model.fit(spectrum_scaled, params_scaled, x=wavelengths, max_nfev=max_nfev)
             
             # Map parameter prefixes to continuum regions
             cont_map = {
@@ -3090,9 +4621,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     f'cont_region{region_index}_x_start': params_to_use[f'x{region_index}_start'].value,
                     f'cont_region{region_index}_x_end': params_to_use[f'x{region_index}_end'].value,
                     f'cont_region{region_index}_slope_init': params_to_use[f'slope{region_index}'].init_value,
-                    f'cont_region{region_index}_slope_fit': result.params[f'slope{region_index}'].value,
+                    f'cont_region{region_index}_slope_fit': result.params[f'slope{region_index}'].value * flux_scale,
                     f'cont_region{region_index}_intercept_init': params_to_use[f'intercept{region_index}'].init_value,
-                    f'cont_region{region_index}_intercept_fit': result.params[f'intercept{region_index}'].value
+                    f'cont_region{region_index}_intercept_fit': result.params[f'intercept{region_index}'].value * flux_scale
                 }
             
                 # If there is an intermediate region, capture its parameters
@@ -3132,8 +4663,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             
                     # Amplitude information
                     'amp_init': params_to_use[amp_key].init_value,
-                    'amp_fit': result.params[amp_key].value,
-                    'amp_std': result.params[amp_key].stderr,
+                    'amp_fit': result.params[amp_key].value * flux_scale,
+                    'amp_std': (result.params[amp_key].stderr or 0) * flux_scale,
             
                     # Centroid information
                     'cen_init': params_to_use[cen_key].init_value,
@@ -3338,9 +4869,25 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     
             # Add Gaussian parameters for this region
             for j, line in enumerate(df.itertuples(), start=1):
-                params.add(f'amp{j}', value=line.Amp_0, vary=True, min=line.Amp_0_lowlim, max=line.Amp_0_highlim)
-                params.add(f'cen{j}', value=line.Centroid_0, vary=True, min=line.Centroid_0_lowlim, max=line.Centroid_0_highlim)
-                params.add(f'sigma{j}', value=line.Sigma_0, vary=True, min=line.Sigma_0_lowlim, max=line.Sigma_0_highlim)
+                # Cast all parameter values to float64 explicitly.
+                # After pd.concat operations, columns can be object dtype;
+                # lmfit silently misbehaves when given non-float initial values.
+                _amp   = np.float64(line.Amp_0)
+                _cen   = np.float64(line.Centroid_0)
+                _sigma = np.float64(line.Sigma_0)
+                _amp_lo  = np.float64(line.Amp_0_lowlim)   if np.isfinite(np.float64(line.Amp_0_lowlim))  else None
+                _amp_hi  = np.float64(line.Amp_0_highlim)  if np.isfinite(np.float64(line.Amp_0_highlim)) else None
+                _cen_lo  = np.float64(line.Centroid_0_lowlim)  if np.isfinite(np.float64(line.Centroid_0_lowlim))  else None
+                _cen_hi  = np.float64(line.Centroid_0_highlim) if np.isfinite(np.float64(line.Centroid_0_highlim)) else None
+                _sig_lo  = np.float64(line.Sigma_0_lowlim)  if np.isfinite(np.float64(line.Sigma_0_lowlim))  else None
+                _sig_hi  = np.float64(line.Sigma_0_highlim) if np.isfinite(np.float64(line.Sigma_0_highlim)) else None
+                # Guard: if initial value is exactly 0, use a small non-zero starting point
+                # so the optimizer has something to scale against
+                if _amp == 0:
+                    _amp = 1e-30
+                params.add(f'amp{j}',   value=_amp,   vary=True, min=_amp_lo,  max=_amp_hi)
+                params.add(f'cen{j}',   value=_cen,   vary=True, min=_cen_lo,  max=_cen_hi)
+                params.add(f'sigma{j}', value=_sigma, vary=True, min=_sig_lo,  max=_sig_hi)
                 
                 
                 # Add velocity parameter for this line
@@ -3374,6 +4921,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         piecewise_model = Model(model_maker.model_function)
         # piecewise_model = Model(HyperCube_ModelFunctions.model_chooser(Nregions, Nlines))
         
+        # Save the spaxel the user has locked before the loop mutates current_spaxel
+        _locked_spaxel = self.viewer_window.current_spaxel
+
         if len(fit_results) > 0 and not refit:
             fit_results = []
             
@@ -3505,158 +5055,157 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         unique_lines = df_fit['LineID'].unique()
         
         svg_colors = [
-            'deeppink', 'dodgerblue', 'plum', 'orange', 'springgreen',
-            'brown', 'cyan', 'magenta', 'burlywood', 'gold'
+            'dodgerblue', 'mediumseagreen', 'darkorange', 'mediumpurple',
+            'deepskyblue', 'gold', 'steelblue', 'mediumaquamarine',
+            'peru', 'cornflowerblue'
         ]
         
         lineid_to_color = {line: svg_colors[i % len(svg_colors)] for i, line in enumerate(unique_lines)}
         df_fit['color'] = df_fit['LineID'].map(lineid_to_color)
         
         progress_window.close()
-        
-        x=df_fit.iloc[0]['spaxel_x']
-        y=df_fit.iloc[0]['spaxel_y']
-        self.viewer_window.update_buttons(x,y)
-        
-        
+
+        # Refresh the fitted model on the CURRENTLY DISPLAYED spaxel
+        vw = self.viewer_window
+        # Restore the spaxel the user had locked — fit_cube overwrites current_spaxel
+        vw.current_spaxel = _locked_spaxel
+        cx, cy = int(_locked_spaxel[0]), int(_locked_spaxel[1])
+
+        # ── Wipe every curve from the spectrum (both dashed and solid init-guess) ──
+        # Keep only the raw spectrum step-line (_child0 label)
+        for _line in vw.spectrum_ax.lines[:]:
+            if _line.get_label() != '_child0':
+                try: _line.remove()
+                except ValueError: pass
+        vw.gaussian_component_lines.clear()
+        # Also remove the lineactor refs so rebuild_plot plots fresh lines
+        df_cont['lineactor'] = None
+
+        # ── Guard: only rebuild if this spaxel was actually fitted ──────────────
+        fitted_spaxels = set(
+            zip(df_fit['spaxel_x'].astype(int), df_fit['spaxel_y'].astype(int))
+        ) if len(df_fit) > 0 else set()
+
+        if (cx, cy) in fitted_spaxels:
+            for region_ID in np.unique(np.int64(df_cont['region_ID'])):
+                vw.rebuild_plot(region_ID, from_file=True, show_init=False, show_fit=True, x=cx, y=cy)
+        vw.spectrum_canvas.draw_idle()
+        # Remove the blue init-guess spaxel marker now that the fit is done
+        vw._init_guess_spaxel = None
+        if getattr(vw, '_blue_rect', None) is not None:
+            vw._blue_rect.set_visible(False)
+            vw.canvas.draw_idle()
+
         print("Fitting complete for entire cube.")
 
         
 
     def add_spectral_frame(self, title_text, df_cont, df, ID, addframe):
-        
-        
-        """Creates a frame for a spectral region and adds it to the scroll area"""
+        """Creates a spectral region frame and appends it vertically to the scroll area.
 
+        Each frame has:
+          - a compact title bar (region name + delete button)
+          - a QGridLayout with continuum params in a header row, then one row per line
+          - a + Line button at the bottom
+        The frame expands horizontally to fill the dock width (scroll is vertical only).
+        """
+        # df_cont and df arrive as parameters; use local aliases so we can
+        # assign back to the module-level globals when addframe is True.
+        _df_cont = df_cont
+        _df = df
 
-        """ Initialize new region dataframes"""
-        data_cont_initreg = {'Continuum Name': ['Continuum'],
-                      'x1': [5000],
-                      'x2': [5010],
-                      'Slope_0': [0],
-                      'Intercept_0': [0.002],
-                      'Slope_fit': [np.nan],
-                      'Intercept_fit': [np.nan],
-                      'region_ID': [ID],
-                      'lineactor': [self.current_line]}
+        # ── Init placeholder data if addframe requested ─────────────────────
+        data_cont_initreg = {
+            'Continuum Name': ['Continuum'],
+            'x1': [5000], 'x2': [5010],
+            'Slope_0': [0], 'Intercept_0': [0.002],
+            'Slope_fit': [np.nan], 'Intercept_fit': [np.nan],
+            'region_ID': [ID], 'lineactor': [self.current_line]
+        }
+        data_lines_initreg = {
+            'Line_ID': [0, 1], 'Line_Name': ['line 1', 'line 2'],
+            'SNR': [np.nan, np.nan],
+            'Amp_0': [0.2348, 0.343], 'Centroid_0': [5504, 6533], 'Sigma_0': [0.345, 0.45],
+            'Amp_fit': [np.nan, np.nan], 'Centroid_fit': [np.nan, np.nan],
+            'Sigma_fit': [np.nan, np.nan], 'region_ID': [ID, ID]
+        }
+        if addframe:
+            # Write back to module-level globals (can't use 'global' because
+            # df_cont and df are also parameter names in this function).
+            import sys as _sys
+            _g = vars(_sys.modules[__name__])
+            _g['df_cont'] = pd.concat([_df_cont, pd.DataFrame(data_cont_initreg)], ignore_index=True)
+            _g['df']      = pd.concat([_df,      pd.DataFrame(data_lines_initreg)], ignore_index=True)
+            _df_cont = _g['df_cont']
+            _df      = _g['df']
 
-        data_lines_initreg = {'Line_ID': [0, 1],
-                'Line_Name': ['line 1', 'line 2'],
-                'SNR': [np.nan,np.nan],
-                'Amp_0': [0.2348, 0.343],
-                'Centroid_0': [5504, 6533],
-                'Sigma_0': [0.345, 0.45],
-                'Amp_fit': [np.nan,np.nan],
-                'Centroid_fit': [np.nan,np.nan],
-                'Sigma_fit': [np.nan,np.nan],
-                'region_ID': [ID,ID]}
-
-        df_cont_new = pd.DataFrame(data_cont_initreg)
-        df_new = pd.DataFrame(data_lines_initreg)
-        
-        
-        # if ID > 0:
-        if addframe == True:
-            df_cont = pd.concat([df_cont, df_cont_new], ignore_index=True)
-            df = pd.concat([df, df_new], ignore_index=True)
-        
-        # Create frame
+        # ── Outer frame ─────────────────────────────────────────────────────
         frame = QFrame()
         frame.setFrameShape(QFrame.StyledPanel)
         frame.setFrameShadow(QFrame.Raised)
         frame.setObjectName(f"frame_{ID}")
-        
-        # Set max width to prevent exceeding main window width
-        max_frame_width = self.width()  # Allow some padding
-        frame.setMaximumWidth(max_frame_width)
-        frame.setMinimumWidth(1150)  # Adjust based on content needs
-        frame.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
-    
-        # frame.setStyleSheet("""
-        #     border: 2px solid black;
-        #     background-color: snow;
-        #     border-radius: 15px;  /* Adjust roundness */
-        #     padding: 10px;
-        # """)
-    
-        # Frame layout
+        frame.setMinimumWidth(0)
+        frame.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
         frame_layout = QVBoxLayout(frame)
+        frame_layout.setSpacing(4)
+        frame_layout.setContentsMargins(6, 6, 6, 6)
 
+        # ── Title bar ───────────────────────────────────────────────────────
+        title_row = QHBoxLayout()
+        title_lbl = QLabel(title_text)
+        title_lbl.setStyleSheet("font-size: 12pt; font-weight: bold;")
+        title_lbl.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        title_row.addWidget(title_lbl)
+        del_btn = QPushButton("✕")
+        del_btn.setFixedSize(22, 22)
+        del_btn.setToolTip("Delete this spectral region")
+        del_btn.setStyleSheet("background-color: lightcoral; color: black;")
+        del_btn.clicked.connect(partial(self.on_deleteregion_button_click, frame_id=ID))
+        title_row.addWidget(del_btn)
+        frame_layout.addLayout(title_row)
 
-        # Title
-        title = QLabel(title_text)
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("""
-            font-size: 24pt;
-            font: bold;
-            width: 64px;
-        """)
-        # title.setStyleSheet("""
-        #     font-family: "Segoe UI";
-        #     font-size: 24pt;
-        #     border: none;
-        #     padding-right: 10px;
-        #     padding-left: 10px;
-        #     padding-top: 5px;
-        #     padding-bottom: 5px;
-        #     background-color: snow;
-        #     color: black;
-        #     font: bold;
-        #     width: 64px;
-        # """)
-        frame_layout.addWidget(title)
-
-        
-        # Grid Layout
+        # ── Single grid: continuum header + continuum row + line header + line rows
         grid_layout = QGridLayout()
-        grid_layout.setHorizontalSpacing(10)  # Adjust horizontal spacing
-        grid_layout.setVerticalSpacing(5)    # Adjust vertical spacing
-
-        # Ensure grid does not stretch frame
-        grid_layout.setContentsMargins(10, 10, 10, 10)
-    
+        grid_layout.setHorizontalSpacing(6)
+        grid_layout.setVerticalSpacing(3)
+        grid_layout.setContentsMargins(4, 4, 4, 4)
         frame_layout.addLayout(grid_layout)
-        
-        
-        # Add headers and buttons
+
         self.add_continuum_buttons(ID, grid_layout)
         self.add_spectral_lines_button_header(grid_layout)
         self.add_spectral_lines(ID, grid_layout)
-           
-                        
-        # Add emission line row of buttons
-        add_line_button = QPushButton('+')
-        # add_line_button.setStyleSheet("""
-        #     font-family: "Segoe UI";
-        #     font-size: 12pt;
-        #     border: 2px solid;
-        #     border-color: green;
-        #     border-radius: 5px;
-        #     padding-right: 10px;
-        #     padding-left: 10px;
-        #     padding-top: 5px;
-        #     padding-bottom: 5px;
-        #     background-color: limegreen;
-        #     color: k;
-        #     font: bold;
-        #     width: 24px;
-        # """)
 
-        # add_line_button.clicked.connect(partial(self.on_addline_button_click, data_frame=df, frame_id=ID,send_new_df=False))
-        add_line_button.clicked.connect(partial(self.on_addline_widget, data_frame=df, frame_id=ID))
-        grid_layout.addWidget(add_line_button,4+len(df)*2,0)
-        
-        # Append this frame to the scroll layout
-        self.scroll_layout.addWidget(frame)
-        
-        
+        # Equal stretch on every column so content fills the frame width
+        n_cols = 17
+        for col in range(n_cols):
+            grid_layout.setColumnStretch(col, 1)
+            grid_layout.setColumnMinimumWidth(col, 0)
+
+        # ── + Line button ───────────────────────────────────────────────────
+        add_line_btn = QPushButton('+ Line')
+        add_line_btn.setFixedHeight(26)
+        add_line_btn.clicked.connect(partial(self.on_addline_widget, data_frame=df, frame_id=ID))
+        # Row = header(1) + continuum_header(1) + continuum_row(1) + line_header(1) + line_rows
+        n_lines = len(df.loc[df['region_ID'] == ID]) if 'region_ID' in df.columns else 0
+        grid_layout.addWidget(add_line_btn, 3 + n_lines * 2, 0)
+        self.buttons_dict[(ID, '__add_line__')] = add_line_btn
+
+        # ── Append to vertical scroll layout ────────────────────────────────
+        # Insert before the trailing stretch if one exists, otherwise just append
+        count = self.scroll_layout.count()
+        last = self.scroll_layout.itemAt(count - 1) if count > 0 else None
+        if last and last.spacerItem():
+            self.scroll_layout.insertWidget(count - 1, frame)
+        else:
+            self.scroll_layout.addWidget(frame)
 
     def update_button_value(self, frame_id, button_name, new_value):
         """Update the button text based on row and column"""
         if any(x in button_name for x in ['sourcename','redshift','resolvingpower']):
-            self.source_name_button.setText(f"Source Name: {df_obs.loc[0, 'sourcename']}")
-            self.source_redshift_button.setText(f"Source Redshift: {df_obs.loc[0, 'redshift']}")
-            self.resolving_power_button.setText(f"Resolving Power: {df_obs.loc[0, 'resolvingpower']}")
+            self.source_name_button.setText(f"Source: {df_obs.loc[0, 'sourcename']}")
+            self.source_redshift_button.setText(f"z: {df_obs.loc[0, 'redshift']}")
+            self.resolving_power_button.setText(f"R: {df_obs.loc[0, 'resolvingpower']}")
         else:
         
             if (frame_id, button_name) in self.buttons_dict:
@@ -3665,86 +5214,102 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     
     def on_deleteregion_button_click(self, frame_id):
         global df, df_cont
-        """Deletes a spectral line from df, removes the UI frame if empty, and removes the line from the spectrum plot."""
-        print(f"Deleting frame {frame_id}")
-    
-        # Fetch the line object from df_cont
+        """Deletes an entire spectral region: removes all its curves from the plot,
+        drops it from df and df_cont, and regenerates the UI."""
+        print(f"Deleting region {frame_id}")
+
+        vw = self.viewer_window
+        ax = vw.spectrum_ax
+
+        # Remove all dashed component curves belonging to this region
+        for line in ax.lines[:]:
+            if line.get_linestyle() in ('--', 'dashed'):
+                try:
+                    line.remove()
+                except ValueError:
+                    pass
+        vw.gaussian_component_lines.clear()
+
+        # Remove the solid total-model lineactor for this region
         line_actor = df_cont.loc[np.int64(df_cont["region_ID"]) == frame_id, 'lineactor'].item()
-    
-        if line_actor is not None:
-            print(f"Removing line: {line_actor}")
-            line_actor.remove()  # Remove the line from the plot
-            
-            # Redraw the figure via ViewerWindow
-            if hasattr(self, 'viewer_window') and hasattr(self.viewer_window, 'spectrum_canvas'):
-                self.viewer_window.spectrum_canvas.draw_idle()  # Efficient redrawing
-            else:
-                print("Warning: No reference to spectrum_canvas found!")
-        else:
-            print(f"No valid line found for frame_id={frame_id}")
-    
-        # Remove frame from dataframe
-        df = df.reset_index(drop=True)  # Ensure unique indices
+        if line_actor is not None and line_actor in ax.lines:
+            try:
+                line_actor.remove()
+            except ValueError:
+                pass
+
+        # Drop region from dataframes
+        df = df.reset_index(drop=True)
         df = df.drop(df.index[np.int64(df["region_ID"]) == frame_id]).reset_index(drop=True)
         df_cont = df_cont.drop(df_cont.index[np.int64(df_cont["region_ID"]) == frame_id]).reset_index(drop=True)
-    
-        # Iterate over all items in the layout and remove them
+
+        # Rebuild UI frames
         for i in reversed(range(self.scroll_layout.count())):
             widget = self.scroll_layout.itemAt(i).widget()
             if isinstance(widget, QFrame):
                 self.scroll_layout.removeWidget(widget)
                 widget.deleteLater()
-    
-        # Regenerate UI
         self.add_spaxel_info_frame('Observation Data', df_cont, df, df_obs)
         for ID in np.unique(df_cont['region_ID']):
             ID = np.int64(ID)
             self.add_spectral_frame('Spectral Region ' + str(ID + 1), df_cont, df, ID, addframe=False)
 
+        vw.spectrum_canvas.draw_idle()
+        # Remove the blue init-guess marker — region is gone
+        if len(df_cont) == 0:
+            vw._init_guess_spaxel = None
+            if getattr(vw, '_blue_rect', None) is not None:
+                vw._blue_rect.set_visible(False)
+                vw.canvas.draw_idle()
 
     def on_deleteline_button_click(self, frame_id, line_id):
         global df, df_cont
-        """Deletes a spectral line from df and removes the frame if empty"""
+        """Deletes a spectral line from df and redraws surviving components."""
         print(f"Deleting line {line_id} from frame {frame_id}")
-    
-        # Delete all curveactors for the given frame_id
-        for actor in df.loc[df["region_ID"] == frame_id, 'curveactor']:
-            if actor and actor in self.viewer_window.spectrum_ax.lines:
-                actor.remove()
-        # self.viewer_window.spectrum_ax.cla()
-        # xmin,xmax=self.viewer_window.spectrum_ax.get_xlim()
-        # ymin,ymax=self.viewer_window.spectrum_ax.get_ylim()
-        # self.viewer_window.spectrum_ax.step(wavelengths,spectrum,lw=0.5,color='w')
-        # self.viewer_window.spectrum_ax.set_xlim(xmin,xmax)
-        # self.viewer_window.spectrum_ax.set_ylim(ymin,ymax)
-        
-        
-        
-        # Reset DataFrame indices and remove the line from df
-        df = df.reset_index(drop=True)  
-        df = df.drop(df[(df["region_ID"].astype(int) == frame_id) & (df["Line_ID"].astype(int) == line_id)].index)
-        
-        # Clean up the UI frames
-        for i in reversed(range(self.scroll_layout.count())):  
+
+        vw = self.viewer_window
+        ax = vw.spectrum_ax
+
+        # Step 1: wipe every dashed line from the spectrum axes.
+        # curveactor refs fall out of sync after reindexing so we nuke all
+        # dashed lines and let rebuild_plot redraw survivors cleanly.
+        for line in ax.lines[:]:
+            if line.get_linestyle() in ('--', 'dashed'):
+                try:
+                    line.remove()
+                except ValueError:
+                    pass
+        vw.gaussian_component_lines.clear()
+
+        # Step 2: remove the solid total-model lineactor for this region
+        for actor in df_cont.loc[df_cont["region_ID"] == frame_id, 'lineactor']:
+            if actor and actor in ax.lines:
+                try:
+                    actor.remove()
+                except ValueError:
+                    pass
+
+        # Step 3: drop the line from df
+        df = df.reset_index(drop=True)
+        df = df.drop(df[(df["region_ID"].astype(int) == frame_id) &
+                        (df["Line_ID"].astype(int) == line_id)].index)
+        df = df.reset_index(drop=True)
+
+        # Step 4: rebuild UI frames
+        for i in reversed(range(self.scroll_layout.count())):
             widget = self.scroll_layout.itemAt(i).widget()
             if isinstance(widget, QFrame):
                 self.scroll_layout.removeWidget(widget)
                 widget.deleteLater()
-        
-        # Refresh the UI and redraw the plot
         self.add_spaxel_info_frame('Observation Data', df_cont, df, df_obs)
         for ID in np.unique(df_cont['region_ID']):
             ID = np.int64(ID)
             self.add_spectral_frame(f'Spectral Region {ID + 1}', df_cont, df, ID, addframe=False)
-        
-        # Safely remove lineactor objects
-        for actor in df_cont.loc[df_cont["region_ID"] == frame_id, 'lineactor']:
-            if actor and actor in self.viewer_window.spectrum_ax.lines:
-                actor.remove()
-        
-        self.viewer_window.spectrum_canvas.draw_idle()  
-        self.viewer_window.rebuild_plot(region_ID=frame_id, from_file=False, show_init=True, show_fit=False, x=0, y=0)
-            
+
+        # Step 5: redraw survivors
+        vw.spectrum_canvas.draw_idle()
+        vw.rebuild_plot(region_ID=frame_id, from_file=False, show_init=True, show_fit=False, x=0, y=0)
+
     def on_addline_widget(self, data_frame, frame_id):
         global df, df_cont
         # Retrieve the line associated with frame_id
@@ -3844,38 +5409,226 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             return
     
     
-        # Get the grid layout inside the frame
-        grid_layout = frame.layout().itemAt(1).layout()  # Assuming it's the second layout added
-    
-        # Find and remove the existing button
-        add_line_button = None
-        for i in range(grid_layout.count()):
-            item = grid_layout.itemAt(i)
-            if isinstance(item.widget(), QPushButton) and item.widget().text() == '+':
-                add_line_button = item.widget()
-                grid_layout.removeWidget(add_line_button)
-                break
-    
-        # Determine the new row index
-        row = df.shape[0]*2 - 1  # New row index
-        button_name = f'line_{row}'
-    
-        # Add new row of buttons
-        self.add_spectral_lines(frame_id, grid_layout)
-                
-        # Re-add the add_line_button below the last row
+        # Get the grid layout inside the frame (second item in the card VBoxLayout)
+        grid_layout = frame.layout().itemAt(1).layout()
+
+        # Retrieve the stored + Line button and remove it from its current position
+        add_line_button = self.buttons_dict.get((frame_id, '__add_line__'))
         if add_line_button:
-            grid_layout.addWidget(add_line_button, 5 + row, 0)
+            grid_layout.removeWidget(add_line_button)
+
+        # Only add the NEW (last) line row — re-drawing all rows creates duplicates
+        df_region = df.loc[np.int64(df['region_ID']) == np.int64(frame_id)]
+        n_lines = len(df_region)
+        last_row_idx = n_lines - 1  # 0-based index of the new line in df_region
+
+        button_columns = ['Line_Name', 'SNR', 'Rest Wavelength',
+                          'Amp_0', 'Amp_0_lowlim', 'Amp_0_highlim',
+                          'Centroid_0', 'Centroid_0_lowlim', 'Centroid_0_highlim',
+                          'Sigma_0', 'Sigma_0_lowlim', 'Sigma_0_highlim',
+                          'Amp_fit', 'Centroid_fit', 'v_fit', 'Sigma_fit']
+
+        # grid row for the new line:
+        # row 0 = cont header, 1 = cont row, 2 = line header, 3..3+n-1 = line rows
+        grid_row = 3 + last_row_idx * 2
+
+        for col, col_name in enumerate(button_columns):
+            button_name = str(np.int64(df_region.iloc[last_row_idx]['Line_ID'])) + '~' + col_name
+            if col_name in ['Rest Wavelength', 'Amp_0', 'Centroid_0', 'Sigma_0']:
+                button_text = _fmt(df_region.iloc[last_row_idx][col_name])
+            elif 'fit' in col_name.lower() or col_name in ('SNR', 'Rest Wavelength'):
+                button_text = ''
+            else:
+                button_text = str(df_region.iloc[last_row_idx][col_name])
+            btn = FrameButton(button_text, last_row_idx, col, frame_id, button_name)
+            btn.setFixedHeight(24)
+            if 'fit' in col_name:
+                btn.clicked.connect(partial(self.on_fit_button_click, frame_id=frame_id, button_name=button_name))
+            else:
+                btn.clicked.connect(partial(self.on_button_click, data_frame=df, frame_id=frame_id, button_name=button_name))
+            grid_layout.addWidget(btn, grid_row, col)
+            self.buttons_dict[(frame_id, button_name)] = btn
+
+        # Delete button at rightmost position of the new line row
+        new_line_id = np.int64(df_region.iloc[last_row_idx]['Line_ID'])
+        del_btn = FrameButton('x', last_row_idx, len(button_columns), frame_id, f'del_line_{new_line_id}')
+        del_btn.setFixedHeight(24)
+        del_btn.setStyleSheet("background-color: lightcoral; color: black;")
+        del_btn.clicked.connect(partial(self.on_deleteline_button_click, frame_id=frame_id, line_id=new_line_id))
+        grid_layout.addWidget(del_btn, grid_row, len(button_columns))
+        self.buttons_dict[(frame_id, f'del_line_{new_line_id}')] = del_btn
+
+        # Re-place the + Line button immediately below the new last row
+        if add_line_button:
+            grid_layout.addWidget(add_line_button, grid_row + 1, 0)
 
         # """
     
     def clear_snr_visualizer(self, frame_id, button_name):
         global df
-        self.viewer_window.draw_image(FITS_DATA,cmap='Grays',scale='linear',from_fits=True)
+        self.viewer_window.draw_image(FITS_DATA,cmap='gray',scale='linear',from_fits=True)
         self.update_button_value(frame_id, button_name, np.nan)
         df.loc[(np.int64(df['region_ID'])==frame_id) & 
                         (np.float64(df['Line_ID'])==np.float64(button_name.split('~')[0])),'SNR'] = np.nan
 
+
+    def _show_source_dialog(self):
+        """Source name dialog with NED name-resolve and coordinate-resolve options."""
+        global df_obs, FITS_HEADER
+
+        current_name = str(df_obs.loc[0, 'sourcename']) if len(df_obs) > 0 else ''
+        current_z    = str(df_obs.loc[0, 'redshift'])   if len(df_obs) > 0 else ''
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Source Information')
+        dialog.setMinimumWidth(420)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+
+        # ── Name row ─────────────────────────────────────────────────────────
+        layout.addWidget(QLabel('Source name:'))
+        name_edit = QLineEdit(current_name)
+        name_edit.setPlaceholderText('e.g. NGC 1068')
+        layout.addWidget(name_edit)
+
+        # ── Resolve buttons ───────────────────────────────────────────────────
+        resolve_name_btn  = QPushButton('Resolve name  (NED)')
+        resolve_coord_btn = QPushButton('Resolve coordinates  (NED)')
+        layout.addWidget(resolve_name_btn)
+        layout.addWidget(resolve_coord_btn)
+
+        # ── Status label ──────────────────────────────────────────────────────
+        status = QLabel('')
+        status.setWordWrap(True)
+        layout.addWidget(status)
+
+        # ── OK / Cancel ───────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        ok_btn     = QPushButton('OK');     ok_btn.setDefault(True)
+        cancel_btn = QPushButton('Cancel')
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        # ── Helpers ───────────────────────────────────────────────────────────
+        def _apply_result(ned_name, ned_z):
+            """Write NED name and redshift into HyperCube state."""
+            name_edit.setText(ned_name)
+            df_obs.loc[0, 'sourcename'] = ned_name
+            df_obs.loc[0, 'redshift']   = ned_z
+            self.source_name_button.setText(f'Source: {ned_name}')
+            self.source_redshift_button.setText(f'z: {ned_z}')
+
+        def _query_ned_by_name():
+            name = name_edit.text().strip()
+            if not name:
+                status.setText('Please enter a source name first.')
+                return
+            status.setText(f'Querying NED for "{name}"…')
+            dialog.repaint()
+            try:
+                # Prefer astroquery if available (handles NED API correctly)
+                try:
+                    from astroquery.ipac.ned import Ned
+                    result = Ned.query_object(name)
+                    ned_name = str(result['Object Name'][0])
+                    ned_z = float(result['Redshift'][0])
+                except ImportError:
+                    # Fallback: classic NED CGI with VOTable-like text output
+                    import urllib.request, urllib.parse
+                    enc = urllib.parse.quote(name)
+                    url = (f'https://ned.ipac.caltech.edu/cgi-bin/nph-objsearch'
+                           f'?objname={enc}&extend=no&of=ascii_tab&list_limit=1'
+                           f'&img_stamp=false&zv_breaker=30000'
+                           f'&out_csys=Equatorial&out_equinox=J2000.0')
+                    req = urllib.request.Request(url, headers={'User-Agent': 'HyperCube/1.0'})
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        text = r.read().decode('utf-8', errors='replace')
+                    # Parse tab-separated NED output: columns include Object Name, Redshift
+                    lines = [l for l in text.splitlines() if l and not l.startswith('#')]
+                    if not lines:
+                        raise ValueError('No results returned by NED')
+                    header = lines[0].split('\t')
+                    row    = lines[1].split('\t')
+                    d = dict(zip(header, row))
+                    ned_name = d.get('Object Name', name).strip()
+                    z_str    = d.get('Redshift', '').strip()
+                    ned_z    = float(z_str) if z_str else None
+
+                if ned_z is None:
+                    status.setText(f'Found: {ned_name} — no redshift in NED.')
+                    name_edit.setText(ned_name)
+                    df_obs.loc[0, 'sourcename'] = ned_name
+                    self.source_name_button.setText(f'Source: {ned_name}')
+                else:
+                    _apply_result(ned_name, ned_z)
+                    status.setText(f'✓  {ned_name}   z = {ned_z:.6f}')
+            except Exception as e:
+                status.setText(f'NED query failed: {e}')
+
+        def _query_ned_by_coords():
+            try:
+                ra  = float(FITS_HEADER.get('CRVAL1', FITS_HEADER.get('RA', '')))
+                dec = float(FITS_HEADER.get('CRVAL2', FITS_HEADER.get('DEC', '')))
+            except (TypeError, ValueError):
+                status.setText('Could not read RA/Dec from FITS header.')
+                return
+            status.setText(f'Querying NED at RA={ra:.5f}, Dec={dec:.5f}...')
+            dialog.repaint()
+            try:
+                try:
+                    from astroquery.ipac.ned import Ned
+                    import astropy.units as u
+                    from astropy.coordinates import SkyCoord
+                    coord = SkyCoord(ra=ra, dec=dec, unit='deg')
+                    result = Ned.query_region(coord, radius=0.5 * u.arcmin)
+                    if len(result) == 0:
+                        raise ValueError('No objects found')
+                    ned_name = str(result['Object Name'][0])
+                    ned_z    = float(result['Redshift'][0])
+                except ImportError:
+                    import urllib.request
+                    url = (f'https://ned.ipac.caltech.edu/cgi-bin/nph-objsearch'
+                           f'?search_type=Near+Position+Search&ra={ra}&dec={dec}'
+                           f'&radius=0.5&of=ascii_tab&list_limit=1&img_stamp=false'
+                           f'&zv_breaker=30000&out_csys=Equatorial&out_equinox=J2000.0')
+                    req = urllib.request.Request(url, headers={'User-Agent': 'HyperCube/1.0'})
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        text = r.read().decode('utf-8', errors='replace')
+                    lines_t = [l for l in text.splitlines() if l and not l.startswith('#')]
+                    if len(lines_t) < 2:
+                        raise ValueError('No NED object within 0.5 arcmin of coordinates.')
+                    header = lines_t[0].split('\t')
+                    row    = lines_t[1].split('\t')
+                    d = dict(zip(header, row))
+                    ned_name = d.get('Object Name', '').strip()
+                    z_str    = d.get('Redshift', '').strip()
+                    ned_z    = float(z_str) if z_str else None
+
+                if ned_z is None:
+                    status.setText(f'Found: {ned_name} — no redshift in NED.')
+                    name_edit.setText(ned_name)
+                    df_obs.loc[0, 'sourcename'] = ned_name
+                    self.source_name_button.setText(f'Source: {ned_name}')
+                else:
+                    _apply_result(ned_name, ned_z)
+                    status.setText(f'Found: {ned_name}   z = {ned_z:.6f}')
+            except Exception as e:
+                status.setText(f'NED query failed: {e}')
+
+        def _commit():
+            # Save whatever name is in the box (user may have typed without resolving)
+            df_obs.loc[0, 'sourcename'] = name_edit.text().strip()
+            self.source_name_button.setText(f'Source: {name_edit.text().strip()}')
+            dialog.accept()
+
+        resolve_name_btn.clicked.connect(_query_ned_by_name)
+        resolve_coord_btn.clicked.connect(_query_ned_by_coords)
+        ok_btn.clicked.connect(_commit)
+        name_edit.returnPressed.connect(_commit)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        dialog.exec_()
 
     def on_button_click(self, data_frame, frame_id, button_name):
         """Handle button click, show a QLineEdit for editing the value"""
@@ -3947,13 +5700,15 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         else:
         
             if any(x in button_name for x in ['sourcename','redshift','resolvingpower']):
-                string = df_obs[button_name].item()
-                text_box = QLineEdit()
-                text_box.setText(string)  # Set the initial value from the dataframe
-                text_box.setGeometry(200, 200, 100, 30)
-                text_box.show()
-                # # # # Connect the returnPressed signal to handle text submission
-                text_box.returnPressed.connect(lambda: self.on_submit(text_box, data_frame, frame_id, button_name, button_type='obs_button'))
+                if 'sourcename' in button_name:
+                    self._show_source_dialog()
+                else:
+                    string = df_obs[button_name].item()
+                    text_box = QLineEdit()
+                    text_box.setText(string)
+                    text_box.setGeometry(200, 200, 100, 30)
+                    text_box.show()
+                    text_box.returnPressed.connect(lambda: self.on_submit(text_box, data_frame, frame_id, button_name, button_type='obs_button'))
             else:
             
             
@@ -3966,6 +5721,32 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     string = str(data_frame.loc[(data_frame['region_ID'] == np.float64(frame_id)) & (np.float64(data_frame['Line_ID'])==np.float64(button_name.split('~')[0]))][button_name.split('~')[1]].item())
                     button_type = 'line'
                 
+            if any(p in button_name for p in ['Centroid_0', 'Amp_0', 'Sigma_0']):
+                param = button_name.split('~')[1]
+                line_id = np.int64(button_name.split('~')[0])
+                current = df.loc[(np.int64(df['region_ID']) == frame_id) &
+                                 (np.int64(df['Line_ID']) == line_id), param]
+                current_val = _fmt(current.item()) if len(current) else ''
+                dialog = QDialog(self)
+                dialog.setWindowTitle(f'Edit {param}')
+                layout = QVBoxLayout(dialog)
+                layout.addWidget(QLabel(f'{param}  (current: {current_val})'))
+                text_box_p = QLineEdit()
+                text_box_p.setText(current_val)
+                text_box_p.selectAll()
+                layout.addWidget(text_box_p)
+                btn_row = QHBoxLayout()
+                ok_btn = QPushButton('OK')
+                ok_btn.setDefault(True)
+                ok_btn.clicked.connect(lambda: [self.on_submit(text_box_p, data_frame, frame_id, button_name, button_type='line_param'), dialog.accept()])
+                text_box_p.returnPressed.connect(lambda: [self.on_submit(text_box_p, data_frame, frame_id, button_name, button_type='line_param'), dialog.accept()])
+                cancel_btn = QPushButton('Cancel')
+                cancel_btn.clicked.connect(dialog.reject)
+                btn_row.addWidget(ok_btn)
+                btn_row.addWidget(cancel_btn)
+                layout.addLayout(btn_row)
+                dialog.exec_()
+
             if 'Rest Wavelength' in button_name:
                 text_box = QLineEdit()
                 # text_box.setText('')  # Set the initial value from the dataframe
@@ -4141,7 +5922,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             linewl = df.loc[(np.int64(df['region_ID'])==frame_id) & 
                             (np.float64(df['Line_ID'])==np.int64(button_name.split('~')[0]))]['Centroid_0']
             self.viewer_window.ax.cla()
-            self.viewer_window.draw_image(FITS_DATA,cmap='Grays',scale='linear',from_fits=True)
+            self.viewer_window.draw_image(FITS_DATA,cmap='gray',scale='linear',from_fits=True)
             # snrmap = self.calculate_snr_map(linewl, snr_value, search_window_factor=5, continuum_offset_factor=20, continuum_width_factor=30)
             snrmap = self.calculate_snr_map(linewl, snr_value, search_window_width=None, continuum_offset=None, continuum_width=None)
             self.update_button_value(frame_id, button_name, snr_value)
@@ -4161,6 +5942,30 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                             (np.int64(df['Line_ID']==np.int64(button_name.split('~')[0]))),button_name.split('~')[1]] = new_value
             self.update_button_value(frame_id, button_name, new_value)
             
+        elif button_type == 'line_param':
+            try:
+                new_value = np.float64(text_box.text())
+            except ValueError:
+                print(f"Invalid value: {text_box.text()}")
+                return
+            param = button_name.split('~')[1]
+            line_id = np.int64(button_name.split('~')[0])
+            df.loc[(np.int64(df['region_ID']) == frame_id) &
+                   (np.int64(df['Line_ID']) == line_id), param] = new_value
+            self.update_button_value(frame_id, button_name, _fmt(new_value))
+            # Redraw the component curves to reflect the new initial guess
+            vw = self.viewer_window
+            for line in vw.spectrum_ax.lines[:]:
+                if line.get_linestyle() in ('--', 'dashed'):
+                    try: line.remove()
+                    except ValueError: pass
+            vw.gaussian_component_lines.clear()
+            for actor in df_cont.loc[df_cont["region_ID"] == frame_id, 'lineactor']:
+                if actor and actor in vw.spectrum_ax.lines:
+                    try: actor.remove()
+                    except ValueError: pass
+            vw.rebuild_plot(region_ID=frame_id, from_file=False, show_init=True, show_fit=False, x=0, y=0)
+
         elif button_type == 'RestWavelength':
             new_value = ast.literal_eval(text_box.text())
             df.loc[(df['region_ID']==frame_id) & 
