@@ -13,7 +13,7 @@ HyperCube is a python-based spectral fitting tool designed to make integral fiel
 
 ## Table of Contents
 1. [Installation](#installation)
-   - [Python Version](#python-version)
+   - [Source Version](#python-version)
    - [Standalone Version](#standalone-version)
 2. [Quick Start Guide](#quick-start-guide)
 3. [Interactive Usage Mode](#interactive-usage-mode)
@@ -37,7 +37,7 @@ git clone https://github.com/jkader925/HyperCube.git
 ```
 This will create a "HyperCube" directory containing the distribution. Alternatively, download source files as a .zip and unpack to desired location.
 
-### Source Version
+### HyperCube Source Version
 The tool was designed for quick and painless installation using `conda` environment management via the included environment file `hypercube.yml`. In a terminal, from your base conda environment, navigate to the new HyperCube directory and issue the following command:
 
 ```
@@ -75,7 +75,7 @@ python hypercube.py
  
 ---
 
-### Hypercube (Standalone App)
+### Hypercube Standalone Version
 The repository also comes with a `hypercube.spec` file for use with [pyinstaller](https://github.com/pyinstaller/pyinstaller), in order to package a standalone app version of HyperCube. From a Python console (conda or otherwise), install pyinstaller:
 
 ```
@@ -90,7 +90,7 @@ pyinstaller hypercube.spec
 
 This will generate a `dist` folder which contains hypercube.app, which can be double-clicked to open the tool. You can create a shortcut to this application from anywhere on your machine.
 
-#### Updating the App Version
+#### Updating the Standalone Version
  
 The app does not update automatically — each new version requires a fresh build. First get the latest code by downloading the latest zip from the [Releases](https://github.com/jkader925/HyperCube/releases) page and replacing the contents of your HyperCube folder, or if you cloned with git:
  
@@ -103,8 +103,9 @@ Then rebuild from your HyperCube directory:
 ```
 pyinstaller hypercube.spec
 ```
- 
-This regenerates the `dist` folder with an updated `hypercube.app`. Replace your existing app with the new one from `dist/`. If you have a shortcut or dock icon pointing to the old app, update it to point to the newly built version.
+
+This regenerates the `dist` folder with an updated `hypercube.app`. Replace your existing app with the new one from `dist/`. If you have a shortcut or dock icon pointing to the old ap, update it to point to the newly built version.
+
 ---
  
 # Updating
