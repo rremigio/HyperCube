@@ -108,18 +108,6 @@ This regenerates the `dist` folder with an updated `hypercube.app`. Replace your
 
 ---
  
-# Updating
- 
-### Updating — Run from Source
- 
-**1. Pull the latest code**
- 
-If you cloned the repository with git:
-```
-git pull origin main
-```
-If you downloaded a zip, download the latest zip from the [Releases](https://github.com/jkader925/HyperCube/releases) page and replace the contents of your HyperCube folder with the new files.
-
 # Quick Start Guide
 This guide walks you through a basic analysis of a Keck Cosmic Wave Imager (KCWI) data cube observation of the luminous infrared galaxy IRAS F23365+3604. The purpose of this guide is to familiarize you with the basic features and modes available to you when using HyperCube to fit 3D spectral data, it is not intended as a comprehensive introduction to every feature the tool offers.
 
