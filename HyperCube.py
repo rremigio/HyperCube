@@ -4,6 +4,7 @@
 Created on Fri Mar 28 15:01:22 2025
 
 @author: justin
+__version__ = "0.1.0"
 """
 
 import sys
