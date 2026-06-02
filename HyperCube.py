@@ -622,6 +622,11 @@ class ViewerWindow(QMainWindow):
         self._chanmap_start  = None    # wavelength where C was pressed
         self._chanmap_span   = None    # axvspan patch on spectrum_ax
         self._chanmap_locked = False   # True after C released (selection fixed)
+        self._chanmap_handle_left  = None   # ◀ annotation on left  edge of span
+        self._chanmap_handle_right = None   # ▶ annotation on right edge of span
+        self._chanmap_drag_active  = False  # True while user is dragging the span
+        self._chanmap_drag_x_start = None   # xdata at drag-press
+        self._chanmap_drag_wav_start = None # (wav0, wav1) at drag-press
         # Subtraction windows (X and V keys)
         self._submap = {'x': {'active': False, 'start': None, 'span': None, 'locked': False},
                         'v': {'active': False, 'start': None, 'span': None, 'locked': False}}
@@ -1601,7 +1606,8 @@ class ViewerWindow(QMainWindow):
             self._bkg_brightness = bkg_bright_slider.value() / 100.0
             self._bkg_contrast   = bkg_contrast_slider.value() / 100.0
             if getattr(self, '_bkg_data', None) is not None:
-                self._bkg_artist = None
+                # Keep the live _bkg_artist reference so _draw_bkg_overlay can
+                # remove the previous image instead of leaking one per tick.
                 self._draw_bkg_overlay()
 
         bkg_cmap_combo.currentTextChanged.connect(lambda _: _apply_display())
@@ -1651,6 +1657,11 @@ class ViewerWindow(QMainWindow):
                 wcs_h['NAXIS1'] = FITS_DATA.shape[-1]
                 wcs_h['NAXIS2'] = FITS_DATA.shape[-2]
             wcs2d = AstroWCS(wcs_h)
+            # Explicitly set pixel_shape so hips2fits uses the cube's spatial
+            # dimensions rather than falling back to its own default size.
+            _nx = int(wcs_h['NAXIS1']) if 'NAXIS1' in wcs_h else int(FITS_DATA.shape[-1])
+            _ny = int(wcs_h['NAXIS2']) if 'NAXIS2' in wcs_h else int(FITS_DATA.shape[-2])
+            wcs2d.pixel_shape = (_nx, _ny)  # FITS order: (NAXIS1, NAXIS2)
         except Exception as e:
             if status_label: status_label.setText(f'WCS error: {e}')
             return
@@ -1716,6 +1727,17 @@ class ViewerWindow(QMainWindow):
             # ITU-R BT.601 luminosity
             bkg_data = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
 
+        # Resample to cube spatial dimensions if hips2fits returned a different
+        # size (the CDS service ignores NAXIS1/NAXIS2 and uses its own default).
+        cube_ny = int(FITS_DATA.shape[-2])
+        cube_nx = int(FITS_DATA.shape[-1])
+        if bkg_data.shape != (cube_ny, cube_nx):
+            from scipy.ndimage import zoom as _zoom
+            zy = cube_ny / bkg_data.shape[0]
+            zx = cube_nx / bkg_data.shape[1]
+            bkg_data = _zoom(bkg_data.astype(float), (zy, zx), order=1)
+            print(f"Background resampled to cube shape: {bkg_data.shape}")
+
         # Store and display
         self._bkg_data = bkg_data.astype(np.float64)
         self._bkg_label = label
@@ -1735,24 +1757,28 @@ class ViewerWindow(QMainWindow):
         bkg = self._bkg_data.copy()
         bmin, bmax = np.nanpercentile(bkg, [1, 99])
 
-        # Apply scale (transfer function)
+        # Apply scale (transfer function).
+        # Normalise to [0,1] FIRST, then stretch. Applying log/asinh to the raw
+        # data is ~linear when its values sit in a small range (e.g. HiPS
+        # cutouts), which is why "Log" looked identical to "Linear". The
+        # parametrised stretches below (astropy LogStretch a=1000 / AsinhStretch
+        # a=0.1 / SqrtStretch) bend consistently regardless of data magnitude.
         scale = getattr(self, '_bkg_scale', 'Linear')
-        bkg = bkg - bmin  # shift to zero
-        bkg = np.where(bkg > 0, bkg, 0.0)
+        span = bmax - bmin
+        if span > 0:
+            bkg = np.clip((bkg - bmin) / span, 0, 1)
+        else:
+            bkg = np.zeros_like(bkg)
+
         if scale == 'Log':
-            bkg = np.log1p(bkg)
+            a = 1000.0
+            bkg = np.log(a * bkg + 1.0) / np.log(a + 1.0)
         elif scale == 'Square root':
             bkg = np.sqrt(bkg)
         elif scale == 'Asinh':
-            med = np.nanmedian(bkg[bkg > 0]) if np.any(bkg > 0) else 1.0
-            bkg = np.arcsinh(bkg / (med or 1.0))
-
-        # Normalise to [0,1]
-        vmax = np.nanpercentile(bkg, 99)
-        if vmax > 0:
-            bkg = np.clip(bkg / vmax, 0, 1)
-        else:
-            bkg = np.zeros_like(bkg)
+            a = 0.1
+            bkg = np.arcsinh(bkg / a) / np.arcsinh(1.0 / a)
+        # Linear: leave as-is
 
         # Apply brightness and contrast
         brightness = getattr(self, '_bkg_brightness', 0.0)
@@ -1961,6 +1987,17 @@ class ViewerWindow(QMainWindow):
             # Update the cursor position in the spectrum plot
             self.spectrum_cursor_pos = (event.xdata, event.ydata)
 
+            # Show a horizontal-resize cursor when hovering over a locked span
+            if (self._chanmap_locked and self._chanmap_span is not None
+                    and event.xdata is not None and not self._chanmap_active):
+                wav0, wav1 = self._span_x_extent(self._chanmap_span)
+                if wav0 <= event.xdata <= wav1:
+                    self.spectrum_canvas.setCursor(Qt.PointingHandCursor)
+                else:
+                    self.spectrum_canvas.setCursor(Qt.ArrowCursor)
+            elif not self._chanmap_drag_active:
+                self.spectrum_canvas.setCursor(Qt.ArrowCursor)
+
             # Update channel map span while C is held
             if self._chanmap_active and self._chanmap_span is not None and event.xdata is not None:
                 pass  # handled below
@@ -1970,21 +2007,13 @@ class ViewerWindow(QMainWindow):
                     if _sm['active'] and _sm['span'] is not None:
                         _x0 = min(_sm['start'], event.xdata)
                         _x1 = max(_sm['start'], event.xdata)
-                        _xy = _sm['span'].get_xy()
-                        _n = len(_xy)
-                        _xy[:, 0] = [_x0, _x0, _x1, _x1, _x0][:_n]
-                        _sm['span'].set_xy(_xy)
+                        self._span_set_x_extent(_sm['span'], _x0, _x1)
             # Update channel map span while C is held (main)
             if self._chanmap_active and self._chanmap_span is not None and event.xdata is not None:
                 wav = event.xdata
                 x0 = min(self._chanmap_start, wav)
                 x1 = max(self._chanmap_start, wav)
-                xy = self._chanmap_span.get_xy()
-                # axvspan polygon is either 4 or 5 vertices depending on mpl version
-                n = len(xy)
-                xs = [x0, x0, x1, x1, x0][:n]
-                xy[:, 0] = xs
-                self._chanmap_span.set_xy(xy)
+                self._span_set_x_extent(self._chanmap_span, x0, x1)
                 self.spectrum_canvas.draw_idle()
 
             # Update wavelength/flux overlay
@@ -2007,8 +2036,19 @@ class ViewerWindow(QMainWindow):
 
 
     def on_mouse_press(self, event):
-        """Start zoom selection."""
-        if event.button == 1 and event.inaxes == self.spectrum_ax:
+        """Start zoom selection, or begin dragging a locked channel map span."""
+        if event.button == 1 and event.inaxes == self.spectrum_ax and event.xdata is not None:
+            # If click lands inside a locked channel map span, enter drag mode
+            if (self._chanmap_locked and self._chanmap_span is not None
+                    and not self._chanmap_active):
+                wav0, wav1 = self._span_x_extent(self._chanmap_span)
+                if wav0 <= event.xdata <= wav1:
+                    self._chanmap_drag_active      = True
+                    self._chanmap_drag_x_start     = event.xdata
+                    self._chanmap_drag_wav_start   = (wav0, wav1)
+                    self._chanmap_drag_last_centre = (wav0 + wav1) / 2
+                    return  # consume event — don't start zoom
+            # Normal zoom start
             self.zoom_start_x = event.xdata
             if self.zoom_rect:
                 self.zoom_rect.remove()
@@ -2016,42 +2056,71 @@ class ViewerWindow(QMainWindow):
             self.spectrum_canvas.draw_idle()
 
     def on_mouse_drag(self, event):
-        """Update zoom selection rectangle dynamically."""
-        if event.button == 1 and event.inaxes == self.spectrum_ax and self.zoom_start_x is not None:
-            x_end = event.xdata
-            if x_end is not None:
+        """Update zoom selection rectangle, or slide a dragged channel map span."""
+        if event.button == 1 and event.inaxes == self.spectrum_ax and event.xdata is not None:
+            # Channel map span drag
+            if self._chanmap_drag_active and self._chanmap_drag_wav_start is not None:
+                wav0_s, wav1_s = self._chanmap_drag_wav_start
+                delta   = event.xdata - self._chanmap_drag_x_start
+                new_w0  = wav0_s + delta
+                new_w1  = wav1_s + delta
+                self._span_set_x_extent(self._chanmap_span, new_w0, new_w1)
+                self._chanmap_draw_handles()
+                self._chanmap_update_centre_display()
+                self.spectrum_canvas.draw_idle()
+                # Recompute channel map live, throttled to one update per wavelength channel
+                new_centre = (new_w0 + new_w1) / 2
+                last_centre = getattr(self, '_chanmap_drag_last_centre', None)
+                chan_step = abs(wavelengths[1] - wavelengths[0]) if wavelengths is not None and len(wavelengths) > 1 else 0
+                if last_centre is None or abs(new_centre - last_centre) >= chan_step:
+                    self._chanmap_drag_last_centre = new_centre
+                    self._compute_channel_map(new_w0, new_w1)
+                return  # don't update zoom rect
+            # Normal zoom drag
+            if self.zoom_start_x is not None:
+                x_end = event.xdata
                 if self.zoom_rect:
                     self.zoom_rect.remove()
                 self.zoom_rect = self.spectrum_ax.axvspan(self.zoom_start_x, x_end, color='grey', alpha=0.3)
                 self.spectrum_canvas.draw_idle()
 
     def on_mouse_release(self, event):
-        """Apply zoom when mouse is released."""
-        if event.button == 1 and event.inaxes == self.spectrum_ax and self.zoom_start_x is not None:
-            zoom_end_x = event.xdata
-            if zoom_end_x is not None and self.zoom_start_x != zoom_end_x:
-                x_min, x_max = min(self.zoom_start_x, zoom_end_x), max(self.zoom_start_x, zoom_end_x)
-                self.spectrum_ax.set_xlim(x_min, x_max)
-                self._spectrum_update_hbar()
-                self.zoom_limits = (x_min, x_max)  # Store zoom limits globally
-                self.zoom_active = True
-    
-                # Dynamically adjust the y-axis based on the zoomed x-axis range
-                mask = (wavelengths >= x_min) & (wavelengths <= x_max)
-                if np.any(mask):  # Ensure there are valid points in the selected range
-                    y_min, y_max = np.nanmin(self.spectrum_line.get_ydata()[mask]), np.nanmax(self.spectrum_line.get_ydata()[mask])
-                else:  # If no valid points, use full y-range
-                    y_min, y_max = np.nanmin(self.spectrum_line.get_ydata()), np.nanmax(self.spectrum_line.get_ydata())
-    
-                padding = self.zoom_pad * (y_max - y_min)
-                self.spectrum_ax.set_ylim(y_min - padding/2, y_max + padding)
-    
-                self.spectrum_ax.figure.canvas.draw_idle()  # Ensure immediate update
-    
-            if self.zoom_rect:
-                self.zoom_rect.remove()
-                self.zoom_rect = None
-            self.zoom_start_x = None
+        """Apply zoom when mouse is released, or finalise a channel map span drag."""
+        if event.button == 1 and event.inaxes == self.spectrum_ax:
+            # Finalise channel map drag
+            if self._chanmap_drag_active:
+                self._chanmap_drag_active   = False
+                self._chanmap_drag_x_start  = None
+                self._chanmap_drag_wav_start = None
+                if self._chanmap_span is not None:
+                    wav0, wav1 = self._span_x_extent(self._chanmap_span)
+                    self._compute_channel_map(wav0, wav1)
+                return  # don't trigger zoom
+
+            # Normal zoom release
+            if self.zoom_start_x is not None:
+                zoom_end_x = event.xdata
+                if zoom_end_x is not None and self.zoom_start_x != zoom_end_x:
+                    x_min, x_max = min(self.zoom_start_x, zoom_end_x), max(self.zoom_start_x, zoom_end_x)
+                    self.spectrum_ax.set_xlim(x_min, x_max)
+                    self._spectrum_update_hbar()
+                    self.zoom_limits = (x_min, x_max)
+                    self.zoom_active = True
+
+                    mask = (wavelengths >= x_min) & (wavelengths <= x_max)
+                    if np.any(mask):
+                        y_min, y_max = np.nanmin(self.spectrum_line.get_ydata()[mask]), np.nanmax(self.spectrum_line.get_ydata()[mask])
+                    else:
+                        y_min, y_max = np.nanmin(self.spectrum_line.get_ydata()), np.nanmax(self.spectrum_line.get_ydata())
+
+                    padding = self.zoom_pad * (y_max - y_min)
+                    self.spectrum_ax.set_ylim(y_min - padding/2, y_max + padding)
+                    self.spectrum_ax.figure.canvas.draw_idle()
+
+                if self.zoom_rect:
+                    self.zoom_rect.remove()
+                    self.zoom_rect = None
+                self.zoom_start_x = None
 
     def show_context_menu(self, event):
         if event.button == 3:  # Right-click
@@ -2715,15 +2784,64 @@ class ViewerWindow(QMainWindow):
             # Refresh the figure
             self.spectrum_canvas.draw()
 
+    @staticmethod
+    def _span_x_extent(span):
+        """Return (x0, x1) of an axvspan.
+
+        matplotlib >= 3.10 makes ``axvspan`` return a ``Rectangle`` (whose
+        ``get_xy`` is a corner 2-tuple), while older versions returned a
+        ``Polygon`` (whose ``get_xy`` is an Nx2 vertex array). Handle both.
+        """
+        if isinstance(span, patches.Rectangle):
+            x = span.get_x()
+            return x, x + span.get_width()
+        xy = span.get_xy()
+        return xy[:, 0].min(), xy[:, 0].max()
+
+    @staticmethod
+    def _span_set_x_extent(span, x0, x1):
+        """Set the x-extent of an axvspan, for both Rectangle and Polygon."""
+        if isinstance(span, patches.Rectangle):
+            span.set_x(min(x0, x1))
+            span.set_width(abs(x1 - x0))
+            return
+        xy = span.get_xy()
+        n = len(xy)
+        xy[:, 0] = [x0, x0, x1, x1, x0][:n]
+        span.set_xy(xy)
+
+    def _chanmap_draw_handles(self):
+        """Draw (or refresh) ◀ / ▶ drag handles at the top edges of the channel map span."""
+        for attr in ('_chanmap_handle_left', '_chanmap_handle_right'):
+            h = getattr(self, attr, None)
+            if h is not None:
+                try: h.remove()
+                except Exception: pass
+            setattr(self, attr, None)
+
+        if not self._chanmap_locked or self._chanmap_span is None:
+            return
+        if not hasattr(self, 'spectrum_ax') or self.spectrum_ax is None:
+            return
+
+        wav0, wav1 = self._span_x_extent(self._chanmap_span)
+        xform = self.spectrum_ax.get_xaxis_transform()  # x: data coords, y: axes [0,1]
+
+        kw = dict(transform=xform, va='top', fontsize=9,
+                  color='#4fc3f7', fontweight='bold', clip_on=True,
+                  zorder=10)
+        self._chanmap_handle_left  = self.spectrum_ax.text(
+            wav0, 0.97, '◀', ha='right', **kw)
+        self._chanmap_handle_right = self.spectrum_ax.text(
+            wav1, 0.97, '▶', ha='left',  **kw)
+
     def _chanmap_update_centre_display(self):
         """Update the centre-pixel button label from the current span limits."""
         global wavelengths
         if self._chanmap_span is None or wavelengths is None:
             self.chanmap_centre_btn.setText("Pixel: —")
             return
-        xy = self._chanmap_span.get_xy()
-        wav0 = xy[:, 0].min()
-        wav1 = xy[:, 0].max()
+        wav0, wav1 = self._span_x_extent(self._chanmap_span)
         wav_centre = (wav0 + wav1) / 2
         pix = np.argmin(np.abs(wavelengths - wav_centre))
         self.chanmap_centre_btn.setText(f"Pixel: {pix}")
@@ -2733,9 +2851,7 @@ class ViewerWindow(QMainWindow):
         global wavelengths
         if not self._chanmap_locked or self._chanmap_span is None or wavelengths is None:
             return
-        xy = self._chanmap_span.get_xy()
-        wav0 = xy[:, 0].min()
-        wav1 = xy[:, 0].max()
+        wav0, wav1 = self._span_x_extent(self._chanmap_span)
         half_w = (wav1 - wav0) / 2
         wav_centre = (wav0 + wav1) / 2
 
@@ -2745,10 +2861,8 @@ class ViewerWindow(QMainWindow):
 
         new_wav0 = new_centre - half_w
         new_wav1 = new_centre + half_w
-        n = len(xy)
-        xs = [new_wav0, new_wav0, new_wav1, new_wav1, new_wav0][:n]
-        xy[:, 0] = xs
-        self._chanmap_span.set_xy(xy)
+        self._span_set_x_extent(self._chanmap_span, new_wav0, new_wav1)
+        self._chanmap_draw_handles()
         self.spectrum_canvas.draw_idle()
         self._chanmap_update_centre_display()
         self._compute_channel_map(new_wav0, new_wav1)
@@ -2758,9 +2872,7 @@ class ViewerWindow(QMainWindow):
         global wavelengths
         if not self._chanmap_locked or self._chanmap_span is None or wavelengths is None:
             return
-        xy = self._chanmap_span.get_xy()
-        wav0 = xy[:, 0].min()
-        wav1 = xy[:, 0].max()
+        wav0, wav1 = self._span_x_extent(self._chanmap_span)
         current_pix = int(np.argmin(np.abs(wavelengths - (wav0 + wav1) / 2)))
 
         dialog = QDialog(self)
@@ -2787,10 +2899,8 @@ class ViewerWindow(QMainWindow):
             new_centre = wavelengths[pix]
             new_wav0 = new_centre - half_w
             new_wav1 = new_centre + half_w
-            n = len(xy)
-            xs = [new_wav0, new_wav0, new_wav1, new_wav1, new_wav0][:n]
-            xy[:, 0] = xs
-            self._chanmap_span.set_xy(xy)
+            self._span_set_x_extent(self._chanmap_span, new_wav0, new_wav1)
+            self._chanmap_draw_handles()
             self.spectrum_canvas.draw_idle()
             self._chanmap_update_centre_display()
             self._compute_channel_map(new_wav0, new_wav1)
@@ -2838,6 +2948,7 @@ class ViewerWindow(QMainWindow):
                         except ValueError: pass
                         self._chanmap_span = None
                     self._chanmap_locked = False
+                    self._chanmap_draw_handles()  # removes handles
                     # Also clear all subtraction windows
                     for _sm in self._submap.values():
                         if _sm['span'] is not None:
@@ -2851,6 +2962,8 @@ class ViewerWindow(QMainWindow):
                     self._chanmap_locked = True
                     self._compute_channel_map(wav0, wav1)
                     self._chanmap_update_centre_display()
+                    self._chanmap_draw_handles()
+                    self.spectrum_canvas.draw_idle()
 
     def _compute_channel_map(self, wav0, wav1):
         """Store the current line window limits and trigger the full (subtracted) map."""
@@ -2885,8 +2998,7 @@ class ViewerWindow(QMainWindow):
         cont_estimates = []
         for key_char, sm in self._submap.items():
             if sm['locked'] and sm['span'] is not None:
-                xy = sm['span'].get_xy()
-                sw0, sw1 = xy[:, 0].min(), xy[:, 0].max()
+                sw0, sw1 = self._span_x_extent(sm['span'])
                 cont_mask = (wavelengths >= sw0) & (wavelengths <= sw1)
                 n_cont = cont_mask.sum()
                 if n_cont > 0:
@@ -4610,7 +4722,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             for line_idx, line in enumerate(df.itertuples(), start=1):
                 line_id = line.Line_ID
                 line_name = line.Line_Name
-                rest_wavelength = np.float64(df.loc[df['Line_ID']==line_id]['Rest Wavelength'])
+                rest_wavelength = float(df.loc[df['Line_ID']==line_id, 'Rest Wavelength'].iloc[0])
             
                 # Identify corresponding region for this line
                 region_id = line.region_ID
@@ -5468,8 +5580,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         global df
         self.viewer_window.draw_image(FITS_DATA,cmap='gray',scale='linear',from_fits=True)
         self.update_button_value(frame_id, button_name, np.nan)
-        df.loc[(np.int64(df['region_ID'])==frame_id) & 
-                        (np.float64(df['Line_ID'])==np.float64(button_name.split('~')[0])),'SNR'] = np.nan
+        df.loc[(df['region_ID'].astype(int)==frame_id) &
+                        (df['Line_ID'].astype(float)==float(button_name.split('~')[0])),'SNR'] = np.nan
 
 
     def _show_source_dialog(self):
@@ -5527,14 +5639,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             status.setText(f'Querying NED for "{name}"…')
             dialog.repaint()
             try:
-                # Prefer astroquery if available (handles NED API correctly)
                 try:
                     from astroquery.ipac.ned import Ned
                     result = Ned.query_object(name)
                     ned_name = str(result['Object Name'][0])
                     ned_z = float(result['Redshift'][0])
                 except ImportError:
-                    # Fallback: classic NED CGI with VOTable-like text output
                     import urllib.request, urllib.parse
                     enc = urllib.parse.quote(name)
                     url = (f'https://ned.ipac.caltech.edu/cgi-bin/nph-objsearch'
@@ -5544,7 +5654,6 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     req = urllib.request.Request(url, headers={'User-Agent': 'HyperCube/1.0'})
                     with urllib.request.urlopen(req, timeout=10) as r:
                         text = r.read().decode('utf-8', errors='replace')
-                    # Parse tab-separated NED output: columns include Object Name, Redshift
                     lines = [l for l in text.splitlines() if l and not l.startswith('#')]
                     if not lines:
                         raise ValueError('No results returned by NED')
@@ -5688,8 +5797,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             snr_window.show()
             
         if ('_highlim' in button_name) or ('_lowlim' in button_name):
-            string = str(df.loc[(np.int64(df['region_ID'])==frame_id) & 
-                            (np.float64(df['Line_ID'])==np.int64(button_name.split('~')[0]))][button_name.split('~')[1]].item())
+            string = str(df.loc[(df['region_ID'].astype(int)==frame_id) &
+                            (df['Line_ID'].astype(float)==float(button_name.split('~')[0]))][button_name.split('~')[1]].item())
             text_box = QLineEdit()
             text_box.setText(string)  # Set the initial value from the dataframe
             text_box.setGeometry(200, 200, 100, 30)
@@ -5718,7 +5827,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 # elif button_name.split('~')[1] == 'Line_Name':
                 #     string = str(data_frame.loc[(data_frame['region_ID'] == np.float64(frame_id)) & (np.float64(data_frame['Line_ID'])==np.float64(button_name.split(',')[0]))][button_name.split('~')[1]].item())
                 else:
-                    string = str(data_frame.loc[(data_frame['region_ID'] == np.float64(frame_id)) & (np.float64(data_frame['Line_ID'])==np.float64(button_name.split('~')[0]))][button_name.split('~')[1]].item())
+                    string = str(data_frame.loc[(data_frame['region_ID'].astype(float) == float(frame_id)) & (data_frame['Line_ID'].astype(float)==float(button_name.split('~')[0]))][button_name.split('~')[1]].item())
                     button_type = 'line'
                 
             if any(p in button_name for p in ['Centroid_0', 'Amp_0', 'Sigma_0']):
@@ -5919,8 +6028,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         
         if button_type == 'SNR':
             snr_value = np.float64(text_box.text())
-            linewl = df.loc[(np.int64(df['region_ID'])==frame_id) & 
-                            (np.float64(df['Line_ID'])==np.int64(button_name.split('~')[0]))]['Centroid_0']
+            linewl = df.loc[(df['region_ID'].astype(int)==frame_id) &
+                            (df['Line_ID'].astype(float)==float(button_name.split('~')[0]))]['Centroid_0']
             self.viewer_window.ax.cla()
             self.viewer_window.draw_image(FITS_DATA,cmap='gray',scale='linear',from_fits=True)
             # snrmap = self.calculate_snr_map(linewl, snr_value, search_window_factor=5, continuum_offset_factor=20, continuum_width_factor=30)
