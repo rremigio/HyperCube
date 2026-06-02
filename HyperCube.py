@@ -605,6 +605,9 @@ class ViewerWindow(QMainWindow):
         self.fits_data = None
         self.is_1d_spectrum = False
         self.current_spaxel = None  # Stores the currently highlighted spaxel (x, y)
+        # Gaussian component line actors (populated during interactive 'g' draws;
+        # must exist up front so update_buttons can .clear() it after a CSV fit load)
+        self.gaussian_component_lines = []
         self.locked = False  # Initially unlocked
         self._chanmap_active = False   # True while C is held
         # Brightness/contrast drag state
@@ -704,7 +707,7 @@ class ViewerWindow(QMainWindow):
             "    border: 1px solid #555;"
             "}"
         )
-        self.zoom_combo.currentTextChanged.connect(self._cube_zoom_combo_changed)
+        self.zoom_combo.currentTextChanged.connect(lambda t: [self._cube_zoom_combo_changed(t), self.setFocus()])
         zoom_bar.addWidget(self.zoom_combo)
 
         self.zoom_in_btn = QPushButton("+", self)
@@ -734,7 +737,7 @@ class ViewerWindow(QMainWindow):
         self.stretch_combo.setCurrentText("99%")
         self.stretch_combo.setToolTip("Image stretch (clip level)")
         self.stretch_combo.setStyleSheet(_combo_qss)
-        self.stretch_combo.currentTextChanged.connect(self._cube_redraw_with_current_settings)
+        self.stretch_combo.currentTextChanged.connect(lambda _: [self._cube_redraw_with_current_settings(), self.setFocus()])
         zoom_bar.addWidget(self.stretch_combo)
 
         # Scale combo (transfer function)
@@ -746,7 +749,7 @@ class ViewerWindow(QMainWindow):
         self.scale_combo.setCurrentText("Linear")
         self.scale_combo.setToolTip("Image scaling (transfer function)")
         self.scale_combo.setStyleSheet(_combo_qss)
-        self.scale_combo.currentTextChanged.connect(self._cube_redraw_with_current_settings)
+        self.scale_combo.currentTextChanged.connect(lambda _: [self._cube_redraw_with_current_settings(), self.setFocus()])
         zoom_bar.addWidget(self.scale_combo)
 
         zoom_bar.addStretch()
@@ -789,7 +792,7 @@ class ViewerWindow(QMainWindow):
             "  selection-background-color: #d7801a; selection-color: #000; border: 1px solid #555; }"
         )
         self.cube_cmap_combo.currentTextChanged.connect(
-            lambda cmap: [setattr(self, '_last_cmap', cmap), self._cube_redraw_with_current_settings()]
+            lambda cmap: [setattr(self, '_last_cmap', cmap), self._cube_redraw_with_current_settings(), self.setFocus()]
         )
         zoom_bar.addWidget(self.cube_cmap_combo)
 
@@ -1847,12 +1850,11 @@ class ViewerWindow(QMainWindow):
         self.stretch_combo.blockSignals(False)
 
         # Redraw with gray cmap, original data
-        self.draw_image(
-            FITS_DATA if hasattr(self, '_last_from_fits') and self._last_from_fits else self._last_data,
-            cmap='gray',
-            scale='linear',
-            from_fits=True
-        )
+        if FITS_DATA is not None:
+            self.draw_image(FITS_DATA, cmap='gray', scale='linear', from_fits=True)
+        elif self._last_data is not None:
+            self.draw_image(self._last_data, cmap='gray', scale='linear',
+                            from_fits=getattr(self, '_last_from_fits', False))
 
         # Reset zoom to fit window
         self._cube_zoom_apply(mode='fit_window')
@@ -2683,7 +2685,8 @@ class ViewerWindow(QMainWindow):
             self.gaussian_component_lines.clear()
             self.spectrum_canvas.draw()
 
-        for region_ID in np.unique(np.int64(df_cont['region_ID'])):
+        print(f"update_buttons: spaxel ({x},{y}), df_fit rows={len(df_fit)}, on_init={on_init_spaxel}")
+        for region_ID in df_cont['region_ID'].astype(int).unique():
             show_init = on_init_spaxel  # redraw init curves when back on home spaxel
             self.rebuild_plot(region_ID, from_file=False,
                               show_init=show_init, show_fit=(not show_init), x=x, y=y)
@@ -3371,11 +3374,13 @@ class ViewerWindow(QMainWindow):
 
 
         if (show_fit == True) and (len(df_fit) > 0):
-            region = df_fit.loc[(np.int64(df_fit['spaxel_x'])==x) &
-                                 (np.int64(df_fit['spaxel_y'])==y) &
-                                 (np.int64(df_fit['region_ID'])==np.int64(region_ID))]
-            
-            
+            region = df_fit.loc[(df_fit['spaxel_x'].astype(int)==int(x)) &
+                                 (df_fit['spaxel_y'].astype(int)==int(y)) &
+                                 (df_fit['region_ID'].astype(int)==int(region_ID))]
+            if len(region) == 0:
+                return  # no fit data for this spaxel/region (e.g. below SNR cut)
+            print(f"rebuild_plot show_fit: spaxel ({x},{y}) region {region_ID}, {len(region)} row(s)")
+
             self.x1, self.x2 = region.iloc[0]["cont_region"+str(region_ID+1)+"_x_start"].item(), region.iloc[0]["cont_region"+str(region_ID+1)+"_x_end"].item()
             self.m, self.b = region.iloc[0]["cont_region"+str(region_ID+1)+"_slope_fit"].item(), region.iloc[0]["cont_region"+str(region_ID+1)+"_intercept_fit"].item()
             
@@ -3423,12 +3428,10 @@ class ViewerWindow(QMainWindow):
             self.spectrum_ax.legend()
 
             # ── Push fitted values into the parameter buttons ─────────────
-            # df_fit uses 'LineID' and df uses 'Line_ID'; match on both.
             if self.fit_params_window is not None:
                 fp = self.fit_params_window
                 for _, frow in region.iterrows():
                     lid = np.int64(frow['LineID'])
-                    # Button key prefix is the Line_ID from df
                     prefix = str(lid)
                     _map = {
                         f'{prefix}~Amp_fit':      frow.get('amp_fit', np.nan),
@@ -3439,9 +3442,12 @@ class ViewerWindow(QMainWindow):
                     for btn_name, val in _map.items():
                         key = (np.int64(region_ID), btn_name)
                         if key in fp.buttons_dict:
-                            fp.buttons_dict[key].setText(
-                                _fmt(val) if np.isfinite(float(val)) else "—"
-                            )
+                            try:
+                                fval = float(val)
+                                txt = f"{fval:.4g}" if np.isfinite(fval) else "—"
+                            except (TypeError, ValueError):
+                                txt = "—"
+                            fp.buttons_dict[key].setText(txt)
 
         # Redraw dynamically
         self.spectrum_ax.figure.canvas.draw_idle()
@@ -3562,6 +3568,8 @@ class ViewerWindow(QMainWindow):
 
     def get_spectrum_at_spaxel(self, x, y):
         """Fetch the 1D spectrum corresponding to the given spaxel (x, y)."""
+        x = int(np.clip(x, 0, FITS_DATA.shape[2] - 1))
+        y = int(np.clip(y, 0, FITS_DATA.shape[1] - 1))
         spectrum = FITS_DATA[:, y, x]
         return spectrum
 
@@ -4062,12 +4070,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             filtered_df['spaxel_x'] = filtered_df['spaxel_x'].astype(int)
             filtered_df['spaxel_y'] = filtered_df['spaxel_y'].astype(int)
             
-            # Determine image dimensions
-            x_max = filtered_df['spaxel_x'].max() + 1
-            y_max = filtered_df['spaxel_y'].max() + 1
-            
-            # Create an empty image array
-            image_array = np.full((y_max, x_max), np.nan)  # Using NaN for unfilled values
+            # Always use the full cube spatial footprint so the map aligns with
+            # the background image regardless of which spaxels passed the SNR cut.
+            cube_ny = int(FITS_DATA.shape[-2])
+            cube_nx = int(FITS_DATA.shape[-1])
+            image_array = np.full((cube_ny, cube_nx), np.nan)
             
             
             
@@ -4450,7 +4457,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             line_df = df_fit[df_fit['LineName'] == line]
             for param in ["amp_fit", "cen_fit", "vel_fit", "sigma_fit"]:
                 # Create an empty map with NaNs
-                image_map = np.full((max(df_fit["spaxel_y"]) + 1, max(df_fit["spaxel_x"]) + 1), np.nan)
+                image_map = np.full((int(FITS_DATA.shape[-2]), int(FITS_DATA.shape[-1])), np.nan)
     
                 # Populate map using RA/Dec indices
                 for (_, row), ra, dec in zip(line_df.iterrows(), ra_vals, dec_vals):
@@ -4605,8 +4612,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             # Replace "nan" and "NaN" strings with actual NaNs
             df_fit.replace(["nan", "NaN"], np.nan, inplace=True)
             
-            # Convert columns to float
-            df_fit[float_columns] = df_fit[float_columns].astype(float)
+            # Convert columns to float; strip numpy-array brackets (e.g. '[1.23]')
+            # that can appear when a column was saved with array-valued cells.
+            def _to_float(s):
+                return pd.to_numeric(
+                    s.astype(str).str.strip().str.strip('[]'), errors='coerce'
+                )
+            df_fit[float_columns] = df_fit[float_columns].apply(_to_float)
             
             # Convert integer columns (use Int64 dtype to allow NaNs)
             df_fit[int_columns] = df_fit[int_columns].astype("Int64")
@@ -4764,11 +4776,15 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 else:
                     vel_init = vel_fit = vel_param = vel_std = np.nan
             
+                _ra, _dec = self.viewer_window.pixel_to_ra_dec(
+                    self.viewer_window.current_spaxel[0],
+                    self.viewer_window.current_spaxel[1]
+                )
                 fit_entry = {
                     'spaxel_x': self.viewer_window.current_spaxel[0],
                     'spaxel_y': self.viewer_window.current_spaxel[1],
-                    'RA': self.viewer_window.pixel_to_ra_dec(self.viewer_window.current_spaxel[0],self.viewer_window.current_spaxel[1])[0],
-                    'Dec': self.viewer_window.pixel_to_ra_dec(self.viewer_window.current_spaxel[0],self.viewer_window.current_spaxel[1])[1],
+                    'RA': float(_ra),
+                    'Dec': float(_dec),
                     'region_ID': region_id,
                     'LineName': line_name,
                     'LineID': line_id,
@@ -5777,14 +5793,18 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             # Button layout (side-by-side buttons)
             button_layout = QHBoxLayout()
             
-            # "Visualize" button
-            visualize_button = QPushButton("Visualize")
+            # "Calculate" button — compute and display the SNR map
+            visualize_button = QPushButton("Calculate")
             visualize_button.clicked.connect(lambda: self.on_submit(text_box, data_frame, frame_id, button_name, button_type='SNR'))
             button_layout.addWidget(visualize_button)
-            
-            # "Clear" button to close the window
-            clear_button = QPushButton("Clear")
-            # Reset to the white light image
+
+            # "Accept" button — keep the current SNR threshold and close
+            accept_button = QPushButton("Accept")
+            accept_button.clicked.connect(snr_window.close)
+            button_layout.addWidget(accept_button)
+
+            # "Cancel" button — reset to white-light image and close
+            clear_button = QPushButton("Cancel")
             clear_button.clicked.connect(lambda: self.clear_snr_visualizer(frame_id, button_name))
             clear_button.clicked.connect(snr_window.close)
             button_layout.addWidget(clear_button)
