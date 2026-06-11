@@ -4,7 +4,7 @@ QToolTip
      background-color: #ffa02f;
      padding: 1px;
      border-radius: 3px;
-     opacity: 100;
+     opacity: 229;
 }
 
 QWidget
@@ -339,9 +339,20 @@ QMainWindow::separator:hover
 QSplitter::handle
 {
     background-color: #3a3a3a;
-    width: 5px;
-    height: 5px;
     border: none;
+}
+
+/* Orientation-specific sizing: a horizontal splitter has a vertical,
+   full-height handle whose *width* is the grab thickness (and vice versa).
+   Setting both width and height collapses the grab region to a tiny square. */
+QSplitter::handle:horizontal
+{
+    width: 6px;
+}
+
+QSplitter::handle:vertical
+{
+    height: 6px;
 }
 
 QSplitter::handle:hover
@@ -473,7 +484,8 @@ QRadioButton::indicator:hover, QCheckBox::indicator:hover
 
 QCheckBox::indicator:checked
 {
-    image:url(:/dark_orange/img/checkbox.png);
+    background-color: #ffaa00;
+    border: 1px solid #ffaa00;
 }
 
 QCheckBox::indicator:disabled, QRadioButton::indicator:disabled

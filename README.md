@@ -11,6 +11,16 @@ HyperCube is a python-based spectral fitting tool designed to make integral fiel
 
 ---
 
+## What's New in v0.3.0
+
+- **Kinematic groups (K1–K5).** Tie the velocity *and* velocity dispersion of multiple emission lines into a single kinematic solution with one click, directly from the Line Name window. Members share the same velocity and the same km/s dispersion (widths and centroids scaled by each line's rest wavelength); the group's reference line — the one carrying the free kinematics — is surfaced in the UI.
+- **Velocity dispersion in km/s.** σ is now displayed and edited in km/s throughout the GUI (parameter buttons, column headers, σ maps) and exported alongside the wavelength-space values in the CSV and FITS outputs.
+- **Constraint workflow upgrades.** A syntax **?** help button and an **Auto-suggest constraints** button in the Line Name window, plus clearer "constraints saved" feedback.
+- **Constraint correctness fixes (important).** Relational constraints referencing bracketed forbidden-line names (`[S II]`, `[N II]`, `[O III]`, …) were being silently dropped — now fixed. A separate bug that let amplitude constraints be lost during per-spaxel flux rescaling is also fixed, so constraints are now reliably respected in every spaxel.
+- **UI fix.** Checkbox check-marks now render correctly in the dark theme.
+
+---
+
 ## Table of Contents
 1. [Installation](#installation)
    - [Source Version](#hypercube-source-version)
@@ -19,12 +29,15 @@ HyperCube is a python-based spectral fitting tool designed to make integral fiel
 3. [Interactive Usage Mode](#interactive-usage-mode)
    - [Initiating Models Interactively](#initiating-models-interactively)
    - [Adjusting Model Parameters Interactively](#adjusting-model-parameters-interactively)
+   - [Per-Spaxel Fit Correction](#per-spaxel-fit-correction)
+   - [Saving and Restoring Sessions](#saving-and-restoring-sessions)
    - [Relational Constraints](#relational-constraints)
-4. [Pipeline Usage Mode](#pipeline-usage-mode)
+4. [Stellar Kinematics with pPXF](#stellar-kinematics-with-ppxf)
+5. [Pipeline Usage Mode](#pipeline-usage-mode)
    - [Initiating Models with Configuration Files](#initiating-models-with-configuration-files)
    - [Batch Processing](#batch-processing)
-4. [Troubleshooting](#troubleshooting)
-5. [Acknowledging HyperCube](#acknowledging-hypercube)
+6. [Troubleshooting](#troubleshooting)
+7. [Acknowledging HyperCube](#acknowledging-hypercube)
 
 ---
 
@@ -45,6 +58,8 @@ conda env create -f hypercube.yml
 ```
 
 Conda will install all of the required packages automatically. If not using conda, you can manually install the required packages (listed in hypercube.yml) via `pip`.
+
+> **Stellar kinematics fitting** (the [Stellar Kinematics with pPXF](#stellar-kinematics-with-ppxf) section) additionally requires the [`ppxf`](https://pypi.org/project/ppxf/) package. If it is not already in your environment, install it with `pip install ppxf`. The bundled stellar template libraries live in the `indo_us_library/` and `eMILES/` folders and ship with the distribution.
 
 #### Updating the Source Version
  
@@ -182,9 +197,77 @@ One of the two main use cases for HyperCube is intuitive/dynamic spectral fittin
 
 ### Initiating Models Interactively
 
+Each spectral region is built from a **continuum** plus any number of **Gaussian** emission lines drawn on top of it. Three continuum types can be drawn interactively over the spectrum:
+
+- **Linear** (`d`) — press `d` at one end of the continuum and again at the other to set a straight line.
+- **Spline** (`s`) — press `s` to drop interpolation knots (connect-the-dots); press `Enter` to finalize, `Backspace` to undo the last knot, `Esc` to cancel.
+- **Polynomial** (`p`) — press `p` at the start and end of a wavelength range to fit a Chebyshev polynomial to the data in that range.
+
+Once a continuum is placed, press `g` over a line peak to begin a Gaussian (horizontal motion sets the width, vertical motion the amplitude) and `g` again to lock it. Each continuum + line set becomes a "Spectral Region" panel in the Fit Parameters window.
+
 ### Adjusting Model Parameters Interactively
 
+Every value in a Spectral Region panel is an editable button. Click a continuum cell (slope, intercept, knots, polynomial degree) or a line cell (amplitude *f*<sub>λ,0</sub>, observed wavelength λ<sub>obs,0</sub>, width σ<sub>0</sub>, and their min/max limits) to type a new value; the model overlay updates immediately. Line widths (σ) are shown and entered in **km/s** (velocity dispersion). Click `Line Name` to name a line, assign it to a [kinematic group](#relational-constraints), and set relational constraints, and `λ_rest` to set its rest wavelength.
+
+### Per-Spaxel Fit Correction
+
+After fitting the whole cube, individual spaxels can be corrected without re-fitting everything. Lock onto a spaxel (`L`) and use the per-spaxel controls in the **This Spaxel** group at the top of the Fit Parameters window:
+
+- **Fit This Spaxel** — (re)fit the model to just the locked spaxel.
+- **Clear Spaxel Fit** — remove this spaxel's fit and enter *edit mode*. The old (poor) model is greyed for reference, and a dialog lets you seed the edit from the spaxel's existing fit or from the base template. You can then re-specify the continuum type and emission-line initial guesses for **this spaxel only** — graphically (`d`/`s`/`p` *replace* the region's continuum in place; `g` snaps to the nearest existing line and updates its guess) or by editing the panel cells. While editing, the model **schema is locked** (the same number of regions/lines and the same line names as every other spaxel) so spatially-resolved line maps never develop NaN holes.
+- **Cancel Edit** — discard an in-progress per-spaxel edit and restore the original fit.
+- **Toggle Edited** — overlay translucent blue boxes on the image marking every spaxel that has a per-spaxel edit.
+
+Per-spaxel edits are remembered and reloaded whenever you lock back onto that spaxel. To wipe every fit for the whole cube while keeping the model definition (so you can re-fit), use **Clear All Fits** in the cube-level controls.
+
+### Saving and Restoring Sessions
+
+The entire tool state — cube, model, fits, per-spaxel edits, stellar results, and display/background settings — can be saved to a `.hcsession` file with **Save Session** and restored later with **Load Session**, so you can close HyperCube and resume exactly where you left off.
+
 ### Relational Constraints
+
+Open the **Line Name and Parameter Constraints** window (click any `Line Name` button) to tie a line's parameters to other lines in the model. Up to five constraints per line can be entered, using the syntax:
+
+```
+param  op  param_[line name]
+param  op  factor * param_[line name]
+```
+
+where `param` is one of `amp`, `sigma`, `cen` (centroid), or `vel` (velocity), and `op` is one of `<=`, `<`, `>=`, `>`, `==`. For example:
+
+- `amp <= amp_[Halpha]` — keep a component fainter than another line
+- `sigma >= sigma_[Halpha]` — keep a component broader than another
+- `amp <= 0.33 * amp_[Halpha]` — fixed flux-ratio bound
+- `vel == vel_[nii_1]` — tie velocities (shared kinematics)
+
+A **?** help button lists the available parameters, operators, and the lines currently in the model. The **Auto-suggest constraints** button proposes sensible constraints based on the components' initial guesses, which you can review before applying. Constraints reference lines by **name**, so forbidden-line names containing brackets (e.g. `[S II]_6716`) are fully supported.
+
+#### Kinematic Groups (K-groups)
+
+For multi-component fits it is often desirable for several lines to share one kinematic solution. Assign lines to the same **K-group** (K1–K5, via the checkboxes in the Line Name window) to tie their **velocity and velocity dispersion** together during fitting — every member shares the same velocity and the same km/s dispersion, with widths and centroids scaled by each line's rest wavelength. The first line of a group (in model order) is the **reference** that carries the group's free kinematics, and the window indicates which line that is. K-groups are a shortcut that writes the equivalent relational constraints for you, and they coexist non-destructively with any manual sigma constraints — a manual constraint is held inactive while the line is grouped and re-activates if you remove it from the group.
+
+> **Note:** velocity dispersion (σ) is displayed and entered in **km/s** throughout the GUI and is included (alongside the wavelength-space values) in the CSV and FITS output.
+
+
+# Stellar Kinematics with pPXF
+
+HyperCube can model the **stellar continuum** and recover the stellar line-of-sight velocity (V) and velocity dispersion (σ) using the Penalized Pixel-Fitting method ([pPXF](https://pypi.org/project/ppxf/); Cappellari 2017). The stellar fit is integrated as a new **continuum type**: pPXF fits a combination of stellar templates convolved with the line-of-sight velocity distribution (LOSVD), and emission-line Gaussians are added on top exactly as for the linear/spline/polynomial continua.
+
+Two template libraries ship with HyperCube (in the `indo_us_library/` and `eMILES/` folders):
+- **Indo-US** — empirical stellar spectra (Valdes et al. 2004); ideal for pure kinematics.
+- **eMILES** — single stellar population models with wide wavelength coverage.
+
+### Fitting a stellar continuum to a spaxel
+1. Set the **Source Redshift** and **Resolving Power** in the Observation Data panel — pPXF needs both. HyperCube auto-fills them from the FITS header when the relevant keywords are present.
+2. Lock onto a spaxel (`L`) and click **Stellar Template…** in the *This Spaxel* group. The Stellar Templates window lets you choose a library (showing its wavelength coverage and resolution against your data's observed and rest-frame ranges), the fit range, the number of LOSVD moments (V, σ or V, σ, h3, h4), additive/multiplicative polynomial degrees, an initial σ guess, and whether to mask emission lines.
+3. Click **Fit**. pPXF fits the spaxel, a **Stellar** spectral-region panel appears spanning the fit range with editable **V**, **σ**, and **scale** cells, and the best-fit stellar model is overplotted on the spectrum.
+
+Editing the V, σ, or scale cells re-renders the model instantly (no re-fit); **Refit Stellar** re-runs pPXF for the current spaxel. Add emission lines with `g` on top of the stellar continuum — when you fit, the stellar baseline is held fixed and the lines are fit to the stellar-subtracted residual.
+
+### Stellar maps across the cube
+Press **Fit Cube** to fit the stellar continuum *and* the emission lines across every spaxel in one pass (or **Fit Stellar (Cube)** for kinematics only). The **V map** and **σ map** buttons in the Stellar panel then display the spatially-resolved stellar velocity and dispersion maps; the buttons themselves show the current spaxel's best-fit V and σ as you move the cursor. A **Cancel** button in the progress bar stops a long fit, keeping the spaxels already fit.
+
+Stellar results are included when you **Save Fit** (CSV) and **Save Fit to FITS File** (as `stellar_vel`, `stellar_sigma`, … image extensions), and are fully preserved in saved sessions.
 
 
 # Pipeline Usage Mode
