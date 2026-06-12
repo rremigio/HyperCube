@@ -32,12 +32,17 @@ HyperCube is a python-based spectral fitting tool designed to make integral fiel
    - [Per-Spaxel Fit Correction](#per-spaxel-fit-correction)
    - [Saving and Restoring Sessions](#saving-and-restoring-sessions)
    - [Relational Constraints](#relational-constraints)
-4. [Stellar Kinematics with pPXF](#stellar-kinematics-with-ppxf)
-5. [Pipeline Usage Mode](#pipeline-usage-mode)
+4. [Fitting Techniques](#fitting-techniques)
+   - [Relational constraints & kinematic groups](#relational-constraints--kinematic-groups)
+   - [Sequential core→outflow fitting](#sequential-coreoutflow-fitting)
+   - [Calibrated fit-quality metrics & the Quality Map](#calibrated-fit-quality-metrics--the-quality-map)
+   - [Rectify Bad Fits](#rectify-bad-fits)
+5. [Stellar Kinematics with pPXF](#stellar-kinematics-with-ppxf)
+6. [Pipeline Usage Mode](#pipeline-usage-mode)
    - [Initiating Models with Configuration Files](#initiating-models-with-configuration-files)
    - [Batch Processing](#batch-processing)
-6. [Troubleshooting](#troubleshooting)
-7. [Acknowledging HyperCube](#acknowledging-hypercube)
+7. [Troubleshooting](#troubleshooting)
+8. [Acknowledging HyperCube](#acknowledging-hypercube)
 
 ---
 
@@ -247,6 +252,49 @@ A **?** help button lists the available parameters, operators, and the lines cur
 For multi-component fits it is often desirable for several lines to share one kinematic solution. Assign lines to the same **K-group** (K1–K5, via the checkboxes in the Line Name window) to tie their **velocity and velocity dispersion** together during fitting — every member shares the same velocity and the same km/s dispersion, with widths and centroids scaled by each line's rest wavelength. The first line of a group (in model order) is the **reference** that carries the group's free kinematics, and the window indicates which line that is. K-groups are a shortcut that writes the equivalent relational constraints for you, and they coexist non-destructively with any manual sigma constraints — a manual constraint is held inactive while the line is grouped and re-activates if you remove it from the group.
 
 > **Note:** velocity dispersion (σ) is displayed and entered in **km/s** throughout the GUI and is included (alongside the wavelength-space values) in the CSV and FITS output.
+
+
+# Fitting Techniques
+
+HyperCube's per-spaxel fitting is powered by [`lmfit`](https://github.com/lmfit/lmfit-py): named parameters with bounds, algebraic constraints between parameters (`.expr`), per-parameter uncertainties from the covariance matrix, and χ²/BIC statistics. On top of that core, HyperCube layers several techniques aimed at getting **accurate, consistent fits across a whole cube** without hand-tuning every spaxel. This section summarizes them; the constraint syntax itself is covered under [Relational Constraints](#relational-constraints).
+
+### Relational constraints & kinematic groups
+
+Tie parameters across lines to encode physics and reduce free parameters:
+
+- **Amplitude / width / centroid relations** — e.g. `amp <= amp_[Halpha]`, `sigma >= sigma_[Halpha_b]`, fixed flux-ratio bounds `amp <= 0.33 * amp_[Halpha]`.
+- **Velocity ties, windows, and one-sided bounds** — `vel == vel_[B]` (exact tie), `vel == vel_[B] +- 300` (within ±300 km/s), `vel <= vel_[B] + 300` / `vel >= vel_[B] - 300` (one-sided). These are realized internally as a bounded additive centroid offset (`cen_A = (restA/restB)·cen_B + offset`), so they are physically correct for lines at different rest wavelengths.
+- **Kinematic groups (K1–K5)** — a one-click shortcut that ties a set of lines to share one velocity *and* one km/s velocity dispersion (see [Kinematic Groups](#kinematic-groups-k-groups)).
+
+### Sequential core→outflow fitting
+
+Lines with a narrow core **and** a broad/outflow component (an AGN/starburst outflow, a second velocity system) are degenerate for a single joint fit: from one static initial guess the broad component often collapses to its σ-minimum on top of the core and the offset outflow flux is left unmodeled — and because the outflow can sweep from one side of the core to the other across the field (and from sub-dominant to dominant), no single initial guess works everywhere.
+
+The **Sequential** toggle (in the Spectral Fitting toolbar) breaks this degeneracy structurally. For every line that has a broad (`_b`) partner it fits in stages: **(1)** fit the narrow core(s) with the broad amplitudes suppressed; **(2)** freeze the core and continuum and fit each broad component to the *residual*, where it is the only feature and cannot collapse onto the core; **(3)** a joint polish from that solution. It needs no per-galaxy tuning and leans on the (typically tight) bounds you already set on the narrow component. It has no effect on lines without a broad partner, and toggling it off reproduces the standard joint fit exactly. Rectify's refits inherit the staged fit automatically.
+
+### Calibrated fit-quality metrics & the Quality Map
+
+The native reduced χ² lmfit reports is **unweighted and flux-rescaled** (no per-spaxel noise model), so it is not comparable between bright and faint spaxels and can rank a badly-fit bright spaxel *better* than a well-fit faint one. HyperCube therefore computes, per spaxel, a set of calibrated, scale-free quality statistics over the line cores vs. the off-line continuum:
+
+- **Core/continuum ratio** — mean(residual²) in the line cores ÷ in the continuum; ≈1 = good, ≫1 = poorly-fit profile. Noise-independent and the headline metric.
+- **Signed-residual z** — direction and significance of leftover flux: large positive = missed flux (an unmodeled component), negative = over-subtracted.
+- **Runs z** — a runs test on the residual signs flags systematic *shape* errors even when amplitudes look right.
+- **Calibrated continuum χ²** — reduced χ² over off-line pixels (≈1 for a good fit); the calibration anchor.
+
+The **Quality Map ▾** button renders any of these (plus the native rChi²) as a cube map, so you can *see* which spaxels actually failed. These columns are written to the CSV/FITS output.
+
+### Rectify Bad Fits
+
+**Rectify Bad Fits** *repairs* the spaxels a cube fit got wrong, rather than re-fitting the whole cube from scratch. It operates only on spaxels that already have a fit, leaves the good ones untouched, and replaces only the bad ones in place. Press it after a `Fit Cube` to clean up the failures the [Quality Map](#calibrated-fit-quality-metrics--the-quality-map) reveals.
+
+It works in four steps:
+
+1. **Flag the bad spaxels.** Each fitted spaxel is scored by its *calibrated* core/continuum residual ratio (the headline quality metric — noise-independent and comparable across the cube), **not** the misleading raw χ². A spaxel is "bad" if that ratio exceeds the rectify threshold (**2.0**) or is undefined (a failed/degenerate fit). Because the core mask spans each line's full *allowed* centroid window, a fit that misses the real peak entirely is correctly flagged rather than scoring as good.
+2. **Seed from the best good neighbor.** Each bad spaxel is re-fit using initial guesses (amplitude, centroid, width, and the region-1 continuum) copied from the *best-scoring* good spaxel among its 8 immediate neighbors, clamped to each parameter's bounds. This is a spatial-smoothness prior: it exploits the spatial coherence of real kinematic fields, so a degenerate spaxel inherits a working solution from right next door. If no neighbor is good, it falls back to the base template's initial guesses. Spaxels below the SNR threshold are skipped entirely.
+3. **Targeted multi-start fallback.** If the neighbor-seeded fit is *still* bad, Rectify tries a small set of physically-motivated restarts for the known two-component (core + broad) failure modes — **narrow-only**, **broad-only**, **swapped**, and **equal-split** — and keeps whichever gives the lowest core/continuum ratio.
+4. **Keep only the winner.** Every candidate fit for a spaxel is evaluated without committing; only the lowest-ratio result is written back into the cube fit, so a rectify pass can never make a spaxel worse.
+
+Constraints, kinematic groups, and (if enabled) [sequential core→outflow staging](#sequential-coreoutflow-fitting) all carry through to the rectify refits automatically. The combination of a calibrated metric, a spatial prior, and targeted restarts resolves most degenerate/initialization failures without manual intervention; the handful that survive can be cleaned up with [per-spaxel correction](#per-spaxel-fit-correction).
 
 
 # Stellar Kinematics with pPXF
