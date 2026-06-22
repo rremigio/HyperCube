@@ -226,11 +226,13 @@ def convert_velocity_to_centroid(velocity_constraint, line_name, df, galaxy_reds
     Returns:
     - str: A new centroid-based constraint.
     """
-    # Extract the reference line from the constraint (e.g., "sii_1" from "vel == vel_[sii_1]").
-    # Greedy match to the final ']' so bracketed names like [S II]_6716 parse.
-    match = re.search(r"vel\s*==\s*vel_\[(.*)\]", velocity_constraint)
+    # Extract the reference line from an EXACT velocity tie ("vel == vel_[B]").
+    # Anchored at the end so windowed/one-sided forms ("vel == vel_[B] +- 300",
+    # "vel <= vel_[B] + 300") are left untouched here and handled later as a
+    # bounded centroid offset in add_dataframe_constraints_to_params.
+    match = re.match(r"\s*vel\s*==\s*vel_\[(.*)\]\s*$", velocity_constraint)
     if not match:
-        return velocity_constraint  # Return unchanged if no match
+        return velocity_constraint  # Return unchanged if not an exact tie
 
     ref_line_name = match.group(1).strip()
 
@@ -304,6 +306,108 @@ def update_constraints_with_velocity(df, galaxy_redshift):
     return df
 
 
+def _apply_velocity_constraint(found_op, right_side, line_id, df, params):
+    """Translate a velocity tie/window/one-sided constraint into a bounded
+    additive centroid offset.
+
+    The fit has no `vel` parameter, so a constraint on the velocity *difference*
+    between this line (A) and a reference (B) is realised on the centroid as
+
+        cen_A = (restA / restB) * cen_B + offset
+
+    where the helper parameter `offset` carries a [min, max] box bound that
+    encodes the allowed Δv interval (Δv = vel_A − vel_B, km/s). Δλ = λ_A · Δv/c.
+
+    Recognised right-hand sides:
+        vel_[B]          → exact tie (Δv = 0)
+        vel_[B] +- D     → symmetric window |Δv| ≤ D            (use with ==)
+        vel_[B] + D      → one-sided threshold +D               (use with <=/>=)
+        vel_[B] - D      → one-sided threshold −D               (use with <=/>=)
+
+    A two-sided *minimum* separation (|Δv| ≥ D) is intentionally NOT supported:
+    it is a disconnected feasible region (a forbidden band around 0) that
+    box-bounded least-squares cannot represent in a single fit. Use a one-sided
+    form (pick the sign) instead. Returns True if applied.
+    """
+    C_KMS = 299792.458
+    if '_[' not in right_side or ']' not in right_side:
+        return False
+    ref_name = _ref_line_name(right_side)
+    cen_self = f'cen{line_id + 1}'
+    if cen_self not in params:
+        return False
+    try:
+        other = df[df['Line_Name'] == ref_name].iloc[0]
+        cen_ref = f"cen{int(other['Line_ID']) + 1}"
+    except (IndexError, KeyError, ValueError):
+        return False
+    if cen_ref not in params:
+        return False
+
+    # Rest-wavelength ratio → the "same velocity" centroid mapping.
+    try:
+        restA = float(df.loc[df['Line_ID'] == line_id, 'Rest Wavelength'].iloc[0])
+        restB = float(other['Rest Wavelength'])
+        ratio = (restA / restB) if (np.isfinite(restA) and np.isfinite(restB)
+                                    and restA > 0 and restB > 0) else 1.0
+    except Exception:
+        ratio = 1.0
+
+    # Wavelength scale (Å per km/s) at line A's observed position.
+    lam = float(params[cen_self].value)
+    if not (np.isfinite(lam) and lam > 0):
+        lam = float(params[cen_ref].value) * ratio
+    if not (np.isfinite(lam) and lam > 0):
+        return False
+
+    def dlam(dv):
+        return lam * dv / C_KMS
+
+    # Generous wavelength span for the "open" side of a one-sided bound.
+    spans, r = [], 1
+    while f'x{r}_start' in params and f'x{r}_end' in params:
+        spans += [float(params[f'x{r}_start'].value), float(params[f'x{r}_end'].value)]
+        r += 1
+    edge = (max(spans) - min(spans)) if spans else 1000.0
+    if not (np.isfinite(edge) and edge > 0):
+        edge = 1000.0
+
+    tail = right_side.split(']', 1)[1].strip()
+    try:
+        if tail.startswith('+-') or tail.startswith('±'):
+            numstr = tail[2:] if tail.startswith('+-') else tail[1:]
+            amp = abs(dlam(abs(float(numstr.replace(' ', '')))))
+            lo, hi = -amp, amp
+        elif tail == '':
+            lo = hi = 0.0
+        else:
+            thr = dlam(float(tail.replace(' ', '')))   # signed km/s
+            if found_op in ('<=', '<'):
+                lo, hi = -edge, thr
+            elif found_op in ('>=', '>'):
+                lo, hi = thr, edge
+            else:                                       # '==' with a fixed offset
+                lo = hi = thr
+    except (ValueError, IndexError):
+        return False
+    if lo > hi:
+        lo, hi = hi, lo
+
+    offset_name = f'offset_vel_{cen_self}_{cen_ref}'
+    init = min(max(0.0, lo), hi)
+    if offset_name not in params:
+        params.add(offset_name, value=init, min=lo, max=hi, vary=(lo != hi))
+    else:
+        params[offset_name].min = lo
+        params[offset_name].max = hi
+        params[offset_name].value = init
+        params[offset_name].vary = (lo != hi)
+    params[cen_self].expr = f'{ratio:.8f} * {cen_ref} + {offset_name}'
+    print(f"Velocity constraint: {cen_self} = {ratio:.4f}*{cen_ref} + offset "
+          f"∈ [{lo:.4f}, {hi:.4f}] Å")
+    return True
+
+
 def add_dataframe_constraints_to_params(df, params):
     """
     Adds constraints to lmfit Parameters object, using:
@@ -358,6 +462,14 @@ def add_dataframe_constraints_to_params(df, params):
                 param1_base = ''.join(filter(str.isalpha, left_side)).lower()
                 param1_num = line_id + 1
                 param1_name = f"{param1_base}{param1_num}"
+
+                # VELOCITY constraints (tie / symmetric window / one-sided bound).
+                # There is no `vel` parameter — these are realised as a bounded
+                # additive offset on the centroid. Handle before the param check.
+                if param1_base == 'vel':
+                    if not _apply_velocity_constraint(found_op, right_side, line_id, df, params):
+                        print(f"Warning: could not parse velocity constraint: {constraint}")
+                    continue
 
                 if param1_name not in params:
                     print(f"Warning: Parameter not found in params: {param1_name}")
@@ -434,6 +546,62 @@ def add_dataframe_constraints_to_params(df, params):
                             print(f"Warning: Could not find line '{other_line_name}' for constraint: {constraint} - {e}")
                     else:
                         print(f"Warning: Centroid constraint must reference another line: {constraint}")
+                    continue
+
+                # SPECIAL CASE: Sigma inequalities use additive offsets.
+                # The ratio method (default) always initialises at ratio=0.9,
+                # making σ_b ≈ σ_core and collapsing the two components.
+                # Additive reparameterisation (σ_b = σ_core + δ, δ≥0) seeds
+                # δ from the user's initial-guess difference, so the broad
+                # component starts at its intended width.
+                if param1_base == 'sigma' and found_op in ['>=', '>', '<=', '<']:
+                    if '_[' in right_side and ']' in right_side and '*' not in right_side:
+                        other_line_name = _ref_line_name(right_side)
+                        try:
+                            other_row = df[df['Line_Name'] == other_line_name].iloc[0]
+                            other_line_id = int(other_row['Line_ID'])
+                            param2_name = f"sigma{other_line_id + 1}"
+
+                            if param2_name not in params:
+                                print(f"Warning: Parameter not found in params: {param2_name}")
+                            else:
+                                sig1_init = params[param1_name].value
+                                sig2_init = params[param2_name].value
+
+                                if found_op in ['>=', '>']:
+                                    # σ1 >= σ2  →  σ1 = σ2 + δ,  δ ≥ 0
+                                    delta_init = max(0.0, sig1_init - sig2_init)
+                                    sig1_max = params[param1_name].max
+                                    delta_max = (float(sig1_max)
+                                                 if sig1_max is not None and np.isfinite(float(sig1_max))
+                                                 else max(delta_init * 10, sig2_init * 5, 1.0))
+                                    offset_name = f"offset_{param2_name}_{param1_name}"
+                                    if offset_name not in params:
+                                        params.add(offset_name, value=delta_init,
+                                                    min=0.0, max=delta_max, vary=True)
+                                    params[param1_name].expr = f"{param2_name} + {offset_name}"
+                                    print(f"Sigma constraint: {param1_name} >= {param2_name} "
+                                          f"(delta_init={delta_init:.4f}, max={delta_max:.4f})")
+                                elif found_op in ['<=', '<']:
+                                    # σ1 <= σ2  →  σ1 = σ2 - δ,  δ ≥ 0
+                                    delta_init = max(0.0, sig2_init - sig1_init)
+                                    sig2_max = params[param2_name].max
+                                    delta_max = (float(sig2_max)
+                                                 if sig2_max is not None and np.isfinite(float(sig2_max))
+                                                 else max(delta_init * 10, sig1_init * 5, 1.0))
+                                    offset_name = f"offset_{param1_name}_{param2_name}"
+                                    if offset_name not in params:
+                                        params.add(offset_name, value=delta_init,
+                                                    min=0.0, max=delta_max, vary=True)
+                                    params[param1_name].expr = f"{param2_name} - {offset_name}"
+                                    print(f"Sigma constraint: {param1_name} <= {param2_name} "
+                                          f"(delta_init={delta_init:.4f}, max={delta_max:.4f})")
+                        except (IndexError, KeyError) as e:
+                            print(f"Warning: Could not find line '{other_line_name}' "
+                                  f"for sigma constraint: {constraint} - {e}")
+                    else:
+                        print(f"Warning: Sigma inequality must reference another line "
+                              f"without a multiplicative factor: {constraint}")
                     continue
 
                 # DEFAULT CASE: Non-centroid parameters use ratio method
@@ -3237,7 +3405,8 @@ class ViewerWindow(QMainWindow):
     def process_3d_cube(self):
         """Processing for 3D cubes"""
         global wavelengths, snr_map
-        
+
+        self._spaxel_mask = None  # drop any mask from a previously-loaded cube
         self.draw_image(FITS_DATA, cmap='gray', scale='linear', from_fits=True)
         self.wcs = WCS(self.fits_header)
         
@@ -3436,10 +3605,23 @@ class ViewerWindow(QMainWindow):
         dec_sexagesimal = self.decimal_to_sexagesimal(dec[0], is_ra=False)
         n = self.get_spaxel_number(x, y)
         if hasattr(self, 'spaxel_info_text'):
+            qual_label = getattr(self, '_quality_map_label', None)
+            if qual_label is not None:
+                try:
+                    img = self._last_data
+                    val = float(img[y, x]) if (img is not None and
+                          hasattr(img, 'ndim') and img.ndim == 2 and
+                          0 <= y < img.shape[0] and 0 <= x < img.shape[1]) else None
+                    val_str = f"\n{qual_label}: {val:.3g}" if (val is not None and np.isfinite(val)) else ""
+                except Exception:
+                    val_str = ""
+            else:
+                val_str = ""
             self.spaxel_info_text.set_text(
                 f"RA  {ra_sexagesimal}\n"
                 f"Dec {dec_sexagesimal}\n"
                 f"X {x}   Y {y}   N {n}"
+                f"{val_str}"
             )
             self.canvas.draw_idle()
         # Status bar
@@ -4975,15 +5157,8 @@ class ViewerWindow(QMainWindow):
                     line_obj.set_data(x_vals, y_new)
 
 
-            _rchi = region.iloc[0]['rchisq'] if len(region) else np.nan
-            if self.is_1d_spectrum == False and np.isfinite(_safe_float(_rchi)):
-                new_line, = self.spectrum_ax.plot(x_vals, y_new, color='red', lw=0.5, label=f'rChi2 = {_rchi}')
-            else:
-                new_line, = self.spectrum_ax.plot(x_vals, y_new, color='red', lw=0.5)
+            new_line, = self.spectrum_ax.plot(x_vals, y_new, color='red', lw=0.5)
             df_cont.loc[np.int64(df_cont["region_ID"]) == region_ID, 'lineactor'] = new_line  # Update reference
-
-            if self.spectrum_ax.get_legend_handles_labels()[1]:
-                self.spectrum_ax.legend()
 
             # ── Push fitted values into the parameter buttons ─────────────
             if self.fit_params_window is not None:
@@ -5059,6 +5234,8 @@ class ViewerWindow(QMainWindow):
         self._last_cmap  = cmap
         self._last_scale = scale
         self._last_from_fits = from_fits
+        if from_fits:
+            self._quality_map_label = None
         # Only update _last_data when called from a real data load (not from
         # _cube_redraw_transformed, which passes already-transformed 2D data).
         # _cube_redraw_transformed sets _applying_transform=True before calling.
@@ -5076,6 +5253,15 @@ class ViewerWindow(QMainWindow):
             npix_y = np.shape(image)[1]
         else:
             image = np.array(data, dtype=np.float64)
+
+        # ── Apply spatial mask, if one is active ──────────────────────
+        # _spaxel_mask is a boolean (ny, nx) array: True = hidden. It is
+        # applied to every displayed field (white-light or any parameter /
+        # quality map) so masked spaxels read as NaN (transparent).
+        _smask = getattr(self, '_spaxel_mask', None)
+        if _smask is not None and hasattr(image, 'shape') \
+                and image.ndim == 2 and _smask.shape == image.shape:
+            image = np.where(_smask, np.nan, image)
 
         # ── Apply transfer function (scale) ───────────────────────────
         # Prefer toolbar setting; fall back to passed-in scale arg
@@ -5163,6 +5349,47 @@ class ViewerWindow(QMainWindow):
 
 
 
+
+    def redraw_current_image(self):
+        """Re-render the currently-displayed field (white-light or a map) using
+        the last draw_image arguments. Used after the spatial mask changes."""
+        if getattr(self, '_last_data', None) is None:
+            return
+        self.draw_image(self._last_data,
+                        cmap=getattr(self, '_last_cmap', 'gray'),
+                        scale=getattr(self, '_last_scale', 'linear'),
+                        from_fits=getattr(self, '_last_from_fits', False))
+
+    def show_mask_preview(self, keep_field):
+        """Outline the kept region as a contour on the cube image (mirrors the
+        SNR-mask contour). keep_field is a 2D array, 1 where kept, 0 elsewhere."""
+        self.clear_mask_preview()
+        if keep_field is None or getattr(self, 'ax', None) is None:
+            return
+        try:
+            self._mask_preview_cs = self.ax.contour(
+                keep_field, levels=[0.5], colors='#4fc3f7', linewidths=1.5)
+            self.canvas.draw_idle()
+        except Exception as e:
+            print(f"Mask preview contour failed: {type(e).__name__}: {e}")
+
+    def clear_mask_preview(self):
+        """Remove any mask-preview contour drawn by show_mask_preview."""
+        cs = getattr(self, '_mask_preview_cs', None)
+        if cs is not None:
+            try:
+                cs.remove()  # matplotlib ≥3.8: ContourSet is itself an Artist
+            except Exception:
+                try:
+                    for coll in cs.collections:  # older matplotlib
+                        coll.remove()
+                except Exception:
+                    pass
+            self._mask_preview_cs = None
+            try:
+                self.canvas.draw_idle()
+            except Exception:
+                pass
 
     def get_spectrum_at_spaxel(self, x, y):
         """Fetch the 1D spectrum corresponding to the given spaxel (x, y)."""
@@ -5372,6 +5599,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         df_cont = df_cont
         df = df
         self.fitloaded = False
+        self._sequential_fit = False   # sequential core→outflow fit mode (off by default)
         self.current_line = current_line
         self.setWindowTitle("Fit Parameters")
         
@@ -6082,6 +6310,68 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             # ax.imshow(image_array,origin='lower',aspect='auto',cmap=cmap)
             self.viewer_window.draw_image(image_array, cmap=cmap, scale=scale,from_fits=False)
 
+    # Quality-map menu: (label, df_fit column, colormap, center-on-zero?)
+    QUALITY_MAPS = [
+        ('Core / continuum ratio', 'qa_core_cont_ratio', 'plasma', False),
+        ('Signed residual (z)',    'qa_signed_resid_z',  'bwr',    True),
+        ('Runs test (z)',          'qa_runs_z',          'bwr',    True),
+        ('Reduced χ² (continuum)', 'qa_chisq_cont',      'plasma', False),
+        ('Reduced χ² (native)',    'rchisq',             'plasma', False),
+    ]
+
+    def show_quality_menu(self):
+        """Pop a menu of fit-quality maps next to the Quality Map button."""
+        menu = QMenu(self)
+        for label, col, cmap, center in self.QUALITY_MAPS:
+            act = menu.addAction(label)
+            act.triggered.connect(
+                lambda _checked=False, c=col, m=cmap, z=center, lb=label:
+                self.show_quality_map(c, cmap=m, center_zero=z, label=lb))
+        btn = getattr(self, 'rchisq_map_button', None)
+        if btn is not None:
+            menu.exec_(btn.mapToGlobal(btn.rect().bottomLeft()))
+        else:
+            menu.exec_()
+
+    def show_quality_map(self, column, cmap='plasma', center_zero=False, label=''):
+        """Render a per-spaxel goodness-of-fit map from a df_fit column."""
+        from PyQt5.QtWidgets import QMessageBox
+        if len(df_fit) == 0 or column not in df_fit.columns:
+            QMessageBox.information(
+                self, 'Fit Quality Map',
+                f'No "{label or column}" values available.\n'
+                'Fit the cube (or load a fit produced by this version) first.')
+            return
+
+        cube_ny = int(FITS_DATA.shape[-2])
+        cube_nx = int(FITS_DATA.shape[-1])
+        image_array = np.full((cube_ny, cube_nx), np.nan)
+
+        # One value per spaxel (repeated across that spaxel's line rows).
+        per_spaxel = df_fit.drop_duplicates(subset=['spaxel_x', 'spaxel_y'])
+        for _, row in per_spaxel.iterrows():
+            try:
+                x, y = int(row['spaxel_x']), int(row['spaxel_y'])
+            except (TypeError, ValueError):
+                continue
+            if 0 <= y < cube_ny and 0 <= x < cube_nx:
+                image_array[y, x] = _safe_float(row.get(column))
+
+        finite = image_array[np.isfinite(image_array)]
+        if finite.size:
+            if center_zero:
+                # Symmetric scale around 0 for signed/z maps (clip at 98th pct |·|).
+                vmax = np.nanpercentile(np.abs(finite), 98)
+                if np.isfinite(vmax) and vmax > 0:
+                    image_array = np.clip(image_array, -vmax, vmax)
+            else:
+                vmax = np.nanpercentile(finite, 98)
+                if np.isfinite(vmax) and vmax > 0:
+                    image_array = np.clip(image_array, None, vmax)
+
+        self.viewer_window.draw_image(image_array, cmap=cmap, scale='linear',
+                                      from_fits=False)
+        self.viewer_window._quality_map_label = label or column
 
     def save_file(self):
         options = QFileDialog.Options()
@@ -6262,11 +6552,30 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         frame.setObjectName('obs_toolbar_frame')
         frame.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
-        row = QHBoxLayout(frame)
-        row.setContentsMargins(8, 4, 8, 4)
-        row.setSpacing(6)
+        # Stack category rows vertically so buttons keep their natural width and
+        # legible text instead of being squeezed into a single horizontal row.
+        vbox = QVBoxLayout(frame)
+        vbox.setContentsMargins(8, 4, 8, 4)
+        vbox.setSpacing(4)
 
-        # ── Observation fields ──────────────────────────────────────────────
+        def _new_row():
+            r = QHBoxLayout()
+            r.setContentsMargins(0, 0, 0, 0)
+            r.setSpacing(6)
+            return r
+
+        def _cat_label(text):
+            lab = QLabel(text)
+            lab.setStyleSheet('color: gray; font-size: 11px;')
+            return lab
+
+        def _vsep():
+            s = QFrame(); s.setFrameShape(QFrame.VLine); s.setFrameShadow(QFrame.Sunken)
+            return s
+
+        # ── Row 1: Observation fields + per-spaxel actions ──────────────────
+        row1 = _new_row()
+
         _name = df_obs.loc[0, 'sourcename']    if len(df_obs) > 0 else ''
         _z    = df_obs.loc[0, 'redshift']      if len(df_obs) > 0 else ''
         _rp   = df_obs.loc[0, 'resolvingpower'] if len(df_obs) > 0 else ''
@@ -6275,11 +6584,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.source_redshift_button= SpaxelButton(f'z: {_z}',          'Source Redshift')
         self.resolving_power_button= SpaxelButton(f'R: {_rp}',         'Resolving Power')
 
+        row1.addWidget(_cat_label('Observation:'))
         for btn in [self.source_name_button,
                     self.source_redshift_button,
                     self.resolving_power_button]:
             btn.setFixedHeight(28)
-            row.addWidget(btn)
+            row1.addWidget(btn)
 
         self.source_name_button.clicked.connect(
             partial(self.on_button_click, data_frame=df_obs, frame_id=0, button_name='sourcename'))
@@ -6288,14 +6598,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.resolving_power_button.clicked.connect(
             partial(self.on_button_click, data_frame=df_obs, frame_id=0, button_name='resolvingpower'))
 
-        # Separator
-        sep = QFrame(); sep.setFrameShape(QFrame.VLine); sep.setFrameShadow(QFrame.Sunken)
-        row.addWidget(sep)
+        row1.addWidget(_vsep())
 
         # ── Per-spaxel fit buttons ──────────────────────────────────────────
-        spaxel_label = QLabel('This Spaxel:')
-        spaxel_label.setStyleSheet('color: gray; font-size: 11px;')
-        row.addWidget(spaxel_label)
+        row1.addWidget(_cat_label('This Spaxel:'))
 
         self.fit_spaxel_button        = QPushButton('Fit This Spaxel')
         self.clear_spaxel_fit_button  = QPushButton('Clear Spaxel Fit')
@@ -6328,46 +6634,55 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     self.cancel_edit_button, self.toggle_edited_button,
                     self.stellar_template_button]:
             btn.setFixedHeight(28)
-            row.addWidget(btn)
+            row1.addWidget(btn)
+        row1.addStretch()
+        vbox.addLayout(row1)
 
-        # Separator between per-spaxel and cube-level actions
-        sep_spaxel = QFrame(); sep_spaxel.setFrameShape(QFrame.VLine); sep_spaxel.setFrameShadow(QFrame.Sunken)
-        row.addWidget(sep_spaxel)
+        # ── Row 2: Cube-level fit / map / mask actions ──────────────────────
+        row2 = _new_row()
+        row2.addWidget(_cat_label('Cube:'))
 
-        # ── Cube-level fit buttons ──────────────────────────────────────────
         self.fit_cube_button             = QPushButton('Fit Cube')
         self.fix_fit_button              = QPushButton('Rectify Bad Fits')
+        self.rchisq_map_button           = QPushButton('Quality Map ▾')
+        self.mask_button                 = QPushButton('Mask…')
         self.clear_all_fits_button       = QPushButton('Clear All Fits')
-        self.save_cube_fit_button        = QPushButton('Save Fit (CSV)')
-        self.save_cube_fit_fitsfile_button = QPushButton('Save Fit (FITS)')
-        self.load_cube_fit_button        = QPushButton('Load Fit')
-
-        self.save_session_button         = QPushButton('Save Session')
-        self.load_session_button         = QPushButton('Load Session')
 
         self.fit_cube_button.clicked.connect(partial(self.fit_cube))
         self.fix_fit_button.clicked.connect(partial(self.fix_fits))
+        self.rchisq_map_button.clicked.connect(self.show_quality_menu)
+        self.rchisq_map_button.setToolTip(
+            'Show a goodness-of-fit map: core/continuum ratio (≈1 good, ≫1 bad),\n'
+            'signed-residual z (missed/over-subtracted flux), runs z (shape errors),\n'
+            'calibrated continuum χ², or the native reduced χ²')
+        self.mask_button.clicked.connect(partial(self.mask_spaxels))
+        self.mask_button.setToolTip(
+            'Mask the displayed maps by any quality / line / stellar map criterion\n'
+            '(keep spaxels that satisfy it, hide the rest). Preview as a contour,\n'
+            'then accept; Unmask clears it.')
         self.clear_all_fits_button.clicked.connect(self.clear_all_fits)
         self.clear_all_fits_button.setToolTip(
             'Remove ALL fit results for the whole cube (and per-spaxel edits).\n'
             'The model definition is kept so you can re-fit.')
-        self.save_cube_fit_button.clicked.connect(partial(self.save_cube_fit))
-        self.save_cube_fit_fitsfile_button.clicked.connect(partial(self.save_fit_result_fitsfile))
-        self.load_cube_fit_button.clicked.connect(partial(self.load_cube_fit))
-        self.save_session_button.clicked.connect(lambda: self.viewer_window.save_session())
-        self.load_session_button.clicked.connect(lambda: self.viewer_window.load_session())
-        self.save_session_button.setToolTip('Save the entire tool state (cube, fits, display, background) to a .hcsession file')
-        self.load_session_button.setToolTip('Restore a previously saved .hcsession and resume where you left off')
 
-        for btn in [self.fit_cube_button, self.fix_fit_button, self.clear_all_fits_button,
-                    self.save_cube_fit_button, self.save_cube_fit_fitsfile_button,
-                    self.load_cube_fit_button, self.save_session_button, self.load_session_button]:
+        for btn in [self.fit_cube_button, self.fix_fit_button, self.rchisq_map_button,
+                    self.mask_button, self.clear_all_fits_button]:
             btn.setFixedHeight(28)
-            row.addWidget(btn)
+            row2.addWidget(btn)
 
-        # Separator
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.VLine); sep2.setFrameShadow(QFrame.Sunken)
-        row.addWidget(sep2)
+        # Sequential core→outflow fit toggle (no effect unless narrow/broad pairs exist)
+        self.sequential_fit_checkbox = QCheckBox('Sequential')
+        self.sequential_fit_checkbox.setChecked(getattr(self, '_sequential_fit', False))
+        self.sequential_fit_checkbox.setToolTip(
+            'Sequential core→outflow fitting: fit the narrow core first, then fit\n'
+            'the broad component to the residual, then a joint polish. Breaks the\n'
+            'narrow/broad degeneracy — recommended for outflow / multi-component\n'
+            'lines. Only affects lines that have a broad (_b) partner.')
+        self.sequential_fit_checkbox.toggled.connect(
+            lambda checked: setattr(self, '_sequential_fit', bool(checked)))
+        row2.addWidget(self.sequential_fit_checkbox)
+
+        row2.addWidget(_vsep())
 
         # ── + Spectral Region ───────────────────────────────────────────────
         self.add_region_button = QPushButton('+ Region')
@@ -6381,9 +6696,36 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 'You can also draw a continuum with the D key.'
             )
             self.add_region_button.clicked.connect(self._on_add_region_button_click)
-        row.addWidget(self.add_region_button)
+        row2.addWidget(self.add_region_button)
+        row2.addStretch()
+        vbox.addLayout(row2)
 
-        row.addStretch()
+        # ── Row 3: Save / load (fits & sessions) ────────────────────────────
+        row3 = _new_row()
+        row3.addWidget(_cat_label('Output:'))
+
+        self.save_cube_fit_button        = QPushButton('Save Fit (CSV)')
+        self.save_cube_fit_fitsfile_button = QPushButton('Save Fit (FITS)')
+        self.load_cube_fit_button        = QPushButton('Load Fit')
+        self.save_session_button         = QPushButton('Save Session')
+        self.load_session_button         = QPushButton('Load Session')
+
+        self.save_cube_fit_button.clicked.connect(partial(self.save_cube_fit))
+        self.save_cube_fit_fitsfile_button.clicked.connect(partial(self.save_fit_result_fitsfile))
+        self.load_cube_fit_button.clicked.connect(partial(self.load_cube_fit))
+        self.save_session_button.clicked.connect(lambda: self.viewer_window.save_session())
+        self.load_session_button.clicked.connect(lambda: self.viewer_window.load_session())
+        self.save_session_button.setToolTip('Save the entire tool state (cube, fits, display, background) to a .hcsession file')
+        self.load_session_button.setToolTip('Restore a previously saved .hcsession and resume where you left off')
+
+        for btn in [self.save_cube_fit_button, self.save_cube_fit_fitsfile_button,
+                    self.load_cube_fit_button, self.save_session_button,
+                    self.load_session_button]:
+            btn.setFixedHeight(28)
+            row3.addWidget(btn)
+        row3.addStretch()
+        vbox.addLayout(row3)
+
         self.outer_scroll_layout.insertWidget(0, frame)  # toolbar always at top
 
     def add_spaxel_info_frame(self, title_text, df_cont, df, df_obs):
@@ -6431,15 +6773,729 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             f"Spectral Region {new_id + 1}", df_cont, df, ID=new_id, addframe=False
         )
 
+    # Default bad-fit threshold on the scale-free core/continuum residual ratio
+    # Default thresholds suggested in the Rectify dialog per quality metric.
+    _RECTIFY_DEFAULTS = {
+        'qa_core_cont_ratio': 2.0,
+        'qa_signed_resid_z':  3.0,
+        'qa_runs_z':          3.0,
+        'qa_chisq_cont':      5.0,
+        'rchisq':             5.0,
+    }
+
+    def _rectify_available_maps(self):
+        """Enumerate every per-spaxel map the user can currently flag spaxels on.
+
+        Returns a list of descriptors, each a dict:
+            label        : human-readable name shown in the combo
+            values       : {(x, y): float}  per-spaxel values
+            signed       : bool — value can be ±  (→ default to a |·| operator)
+            default_op   : suggested operator token ('>','<','abs>','abs<')
+            default_thr  : suggested (positive) threshold magnitude
+
+        Sources: the calibrated quality metrics, every fitted emission-line
+        parameter (amplitude, centroid, velocity, σ in km/s), and — if a
+        stellar cube fit exists — the stellar kinematics (V, σ).
+        """
+        maps = []
+
+        def _per_spaxel_col(frame, col, conv=None):
+            out = {}
+            for _, rr in frame.iterrows():
+                try:
+                    x, y = int(rr['spaxel_x']), int(rr['spaxel_y'])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                v = _safe_float(rr.get(col))
+                if conv is not None and np.isfinite(v):
+                    v = conv(rr, v)
+                out[(x, y)] = v
+            return out
+
+        # ── Quality metrics (per-spaxel; one value repeated across line rows) ──
+        if isinstance(df_fit, pd.DataFrame) and len(df_fit) > 0:
+            per = df_fit.drop_duplicates(subset=['spaxel_x', 'spaxel_y'])
+            for lbl, col, _cmap, signed in self.QUALITY_MAPS:
+                if col in df_fit.columns:
+                    maps.append({
+                        'label': f'Quality: {lbl}',
+                        'values': _per_spaxel_col(per, col),
+                        'signed': signed,
+                        'default_op': 'abs>' if signed else '>',
+                        'default_thr': self._RECTIFY_DEFAULTS.get(col, 2.0),
+                    })
+
+            # ── Emission-line fitted-parameter maps (one per line) ──
+            # (column, suffix label, signed, default op, default thr, km/s conv)
+            line_specs = [
+                ('amp_fit',   'amplitude',      False, '<',    None),
+                ('cen_fit',   'centroid (Å)',   False, '>',    None),
+                ('vel_fit',   'velocity (km/s)', True, 'abs>', 500.0),
+                ('sigma_fit', 'σ (km/s)',       False, '>',    300.0),
+            ]
+            if 'LineID' in df_fit.columns:
+                seen = []
+                for _, lr in df_fit.drop_duplicates(subset=['LineID', 'region_ID']).iterrows():
+                    lid = lr.get('LineID')
+                    rid = lr.get('region_ID')
+                    name = str(lr.get('LineName', f'Line {lid}'))
+                    sub = df_fit[(df_fit['LineID'] == lid) &
+                                 (df_fit['region_ID'] == rid)]
+                    for col, suffix, signed, dop, dthr in line_specs:
+                        if col not in df_fit.columns:
+                            continue
+                        if col == 'sigma_fit':
+                            conv = lambda rr, v: sigma_wl_to_kms(
+                                _safe_float(rr.get('sigma_fit')),
+                                _safe_float(rr.get('cen_fit')))
+                        else:
+                            conv = None
+                        vals = _per_spaxel_col(sub, col, conv=conv)
+                        finite = [v for v in vals.values() if np.isfinite(v)]
+                        if dthr is not None:
+                            thr = dthr
+                        elif finite:
+                            thr = float(np.round(np.nanmedian(np.abs(finite)), 4))
+                        else:
+                            thr = 0.0
+                        maps.append({
+                            'label': f'{name} — {suffix}',
+                            'values': vals,
+                            'signed': signed,
+                            'default_op': dop,
+                            'default_thr': thr,
+                        })
+
+        # ── Stellar kinematics maps (per-spaxel, from df_stellar) ──
+        if isinstance(df_stellar, pd.DataFrame) and len(df_stellar) > 0 \
+                and 'spaxel_x' in df_stellar.columns:
+            stellar_specs = [
+                ('stellar_V',     'Stellar — V (km/s)',  True,  'abs>', 500.0),
+                ('stellar_sigma', 'Stellar — σ (km/s)',  False, '>',    300.0),
+            ]
+            for col, lbl, signed, dop, dthr in stellar_specs:
+                if col in df_stellar.columns:
+                    maps.append({
+                        'label': lbl,
+                        'values': _per_spaxel_col(df_stellar, col),
+                        'signed': signed,
+                        'default_op': dop,
+                        'default_thr': dthr,
+                    })
+
+        return maps
+
+    @staticmethod
+    def _rectify_flagged(values, op, thresh):
+        """Return the set of (x, y) keys in `values` selected by op/thresh.
+
+        Non-finite values are never selected here (the dialog offers a separate
+        opt-in for failed fits). Operators:
+            '>'    value >  thresh
+            '<'    value <  thresh
+            'abs>' |value| >  thresh
+            'abs<' |value| <  thresh
+        """
+        out = set()
+        for xy, v in values.items():
+            fv = _safe_float(v)
+            if not np.isfinite(fv):
+                continue
+            if op == '>':
+                hit = fv > thresh
+            elif op == '<':
+                hit = fv < thresh
+            elif op == 'abs>':
+                hit = abs(fv) > thresh
+            elif op == 'abs<':
+                hit = abs(fv) < thresh
+            else:
+                hit = False
+            if hit:
+                out.add(xy)
+        return out
+
     def fix_fits(self):
-        global df, df_cont, df_fit
-        
-        # identify spaxels with bad fit
-        if len(df_fit) > 0:
-            rchisq_max = 0.01
-            self.fit_cube(refit=True, rchisq_thresh=rchisq_max)
-        
-                
+        global df_fit
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                                     QComboBox, QDoubleSpinBox, QPushButton,
+                                     QDialogButtonBox, QFrame, QMessageBox)
+
+        if len(df_fit) == 0:
+            QMessageBox.information(self, 'Rectify Bad Fits',
+                                    'No fitted spaxels found. Run Fit Cube first.')
+            return
+
+        from PyQt5.QtWidgets import QCheckBox
+
+        # Every per-spaxel map the user can flag on (quality, line params, stellar).
+        maps = self._rectify_available_maps()
+        if not maps:
+            QMessageBox.information(self, 'Rectify Bad Fits',
+                                    'No maps found in the current fit.\n'
+                                    'Re-run Fit Cube to generate them.')
+            return
+
+        # Operator options offered for every map. Tokens are consumed by
+        # _rectify_flagged. The threshold itself is a signed number, so single-
+        # sided '<'/'>' can target negative values directly (e.g. vel < −200).
+        OPS = [('>',     '>'),
+               ('<',     '<'),
+               ('|·| >', 'abs>'),
+               ('|·| <', 'abs<')]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Rectify Bad Fits')
+        dlg.setMinimumWidth(470)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(10)
+        layout.setContentsMargins(14, 14, 14, 14)
+
+        # ── Row: "Flag spaxels where: [map combo]" ────────────────────────
+        map_row = QHBoxLayout()
+        map_row.addWidget(QLabel('Flag spaxels where:'))
+        map_combo = QComboBox()
+        for m in maps:
+            map_combo.addItem(m['label'])
+        map_row.addWidget(map_combo, 1)
+        layout.addLayout(map_row)
+
+        # ── Row: "[op combo]  [threshold spin]" ───────────────────────────
+        thresh_row = QHBoxLayout()
+        op_combo = QComboBox()
+        op_combo.setFixedWidth(80)
+        for disp, _tok in OPS:
+            op_combo.addItem(disp)
+        thresh_row.addWidget(op_combo)
+        spin = QDoubleSpinBox()
+        spin.setRange(-1e6, 1e6)
+        spin.setDecimals(3)
+        spin.setSingleStep(0.5)
+        thresh_row.addWidget(spin)
+        thresh_row.addStretch()
+        layout.addLayout(thresh_row)
+
+        # ── Opt-in: also re-fit failed (non-finite) spaxels ───────────────
+        nonfinite_chk = QCheckBox('Also re-fit failed (non-finite) spaxels')
+        nonfinite_chk.setChecked(True)
+        layout.addWidget(nonfinite_chk)
+
+        # ── Live count preview ────────────────────────────────────────────
+        preview = QLabel()
+        preview.setWordWrap(True)
+        layout.addWidget(preview)
+
+        def _current():
+            midx = map_combo.currentIndex()
+            oidx = op_combo.currentIndex()
+            if not (0 <= midx < len(maps)) or not (0 <= oidx < len(OPS)):
+                return None
+            return maps[midx], OPS[oidx][1]
+
+        def _refresh(*_):
+            cur = _current()
+            if cur is None:
+                return
+            m, op = cur
+            vals = m['values']
+            thresh = spin.value()
+            flagged = self._rectify_flagged(vals, op, thresh)
+            n_nonfinite = sum(1 for v in vals.values() if not np.isfinite(_safe_float(v)))
+            extra = n_nonfinite if nonfinite_chk.isChecked() else 0
+            disp = {'>': f'> {thresh:g}', '<': f'< {thresh:g}',
+                    'abs>': f'|·| > {thresh:g}', 'abs<': f'|·| < {thresh:g}'}[op]
+            tail = (f" + {extra} failed" if extra else "")
+            preview.setText(
+                f"<b>{len(flagged) + extra}</b> of <b>{len(vals)}</b> spaxels "
+                f"(value {disp}{tail}) will be re-fit."
+            )
+
+        def _on_map_changed(midx):
+            if 0 <= midx < len(maps):
+                m = maps[midx]
+                # Set the suggested operator and threshold for this map.
+                tok_to_idx = {tok: i for i, (_d, tok) in enumerate(OPS)}
+                op_combo.blockSignals(True)
+                op_combo.setCurrentIndex(tok_to_idx.get(m['default_op'], 0))
+                op_combo.blockSignals(False)
+                spin.blockSignals(True)
+                spin.setValue(float(m['default_thr']))
+                spin.blockSignals(False)
+            _refresh()
+
+        map_combo.currentIndexChanged.connect(_on_map_changed)
+        op_combo.currentIndexChanged.connect(_refresh)
+        spin.valueChanged.connect(_refresh)
+        nonfinite_chk.toggled.connect(_refresh)
+        _on_map_changed(0)
+
+        # ── Separator ─────────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        layout.addWidget(sep)
+
+        # ── Help text ─────────────────────────────────────────────────────
+        HELP = (
+            "<b>Rectify Bad Fits</b> re-fits the spaxels you flag here, seeding "
+            "each from its best-fitting 8-neighbour (and falling back to a small "
+            "set of targeted restarts). Only the flagged spaxels change.<br><br>"
+            "<b>Which map?</b> Flag spaxels on any map currently derivable from "
+            "the fit:<br>"
+            "• <b>Quality metrics</b> — measure goodness-of-fit. "
+            "<i>Core / continuum ratio</i> (≈1 good, ≫1 = missed line profile; "
+            "try &gt; 2) is the recommended default; <i>signed residual (z)</i> "
+            "and <i>runs (z)</i> are signed; <i>reduced χ²</i> (continuum / "
+            "native) catch gross failures (try &gt; 5).<br>"
+            "• <b>Emission-line parameters</b> — each line's fitted amplitude, "
+            "centroid, velocity (km/s), and σ (km/s). Useful to catch "
+            "non-physical outliers, e.g. a velocity map with runaway spaxels.<br>"
+            "• <b>Stellar kinematics</b> — V and σ (km/s), if a stellar cube fit "
+            "exists.<br><br>"
+            "<b>Operator &amp; threshold.</b> The threshold is a signed number; "
+            "the operator sets the direction:<br>"
+            "&nbsp;&nbsp;<b>&gt; T</b> — value above T<br>"
+            "&nbsp;&nbsp;<b>&lt; T</b> — value below T (T may be negative, "
+            "e.g. <i>vel &lt; −300</i>)<br>"
+            "&nbsp;&nbsp;<b>|·| &gt; T</b> — magnitude above T "
+            "(both wings, e.g. <i>|vel| &gt; 500</i>)<br>"
+            "&nbsp;&nbsp;<b>|·| &lt; T</b> — magnitude below T (near zero)<br><br>"
+            "For a velocity map you can therefore flag one wing (&gt; / &lt;) or "
+            "both (|·| &gt;). The live count updates as you adjust.<br><br>"
+            "<b>Failed fits.</b> Spaxels whose value is non-finite (NaN / ±Inf) "
+            "are not selected by the numeric test; tick the checkbox to re-fit "
+            "those too (recommended when flagging on a quality metric)."
+        )
+
+        # ── Button row ────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        help_btn = QPushButton('?')
+        help_btn.setFixedWidth(28)
+        help_btn.setToolTip('Explain the maps, operators and thresholds')
+        help_btn.clicked.connect(
+            lambda: QMessageBox.information(dlg, 'Rectify — Help', HELP))
+        btn_row.addWidget(help_btn)
+        btn_row.addStretch()
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText('Rectify')
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        btn_row.addWidget(buttons)
+        layout.addLayout(btn_row)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        cur = _current()
+        if cur is None:
+            return
+        m, op = cur
+        thresh = spin.value()
+        flagged = self._rectify_flagged(m['values'], op, thresh)
+        if nonfinite_chk.isChecked():
+            flagged |= {xy for xy, v in m['values'].items()
+                        if not np.isfinite(_safe_float(v))}
+        if not flagged:
+            QMessageBox.information(self, 'Rectify Bad Fits',
+                                    'No spaxels matched the criterion.')
+            return
+        self.fit_cube(refit=True, bad_spaxels_override=flagged)
+
+    def _mask_keep_field(self, m, op, thresh):
+        """Build (keep_field, mask_array) for the current map criterion.
+
+        keep_field : float (ny, nx) — 1.0 where the spaxel SATISFIES the
+                     criterion (kept), 0.0 in the criterion's domain otherwise,
+                     NaN outside the domain. Used for the preview contour.
+        mask_array : bool  (ny, nx) — True where the spaxel is masked OUT
+                     (in the domain but does NOT satisfy the criterion).
+        """
+        ny, nx = int(FITS_DATA.shape[-2]), int(FITS_DATA.shape[-1])
+        keep_field = np.full((ny, nx), np.nan)
+        mask_array = np.zeros((ny, nx), dtype=bool)
+        vals = m['values']
+        keep = self._rectify_flagged(vals, op, thresh)  # spaxels satisfying
+        for (x, y), v in vals.items():
+            if not (0 <= y < ny and 0 <= x < nx):
+                continue
+            if (x, y) in keep:
+                keep_field[y, x] = 1.0
+            else:
+                keep_field[y, x] = 0.0
+                mask_array[y, x] = True  # in domain but fails → mask out
+        return keep_field, mask_array
+
+    def mask_spaxels(self):
+        """Mask the displayed maps by an arbitrary map criterion: keep spaxels
+        that satisfy it, hide the rest. Preview as a contour (like the SNR mask),
+        then Accept; Unmask clears any active mask."""
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                                     QComboBox, QDoubleSpinBox, QPushButton,
+                                     QFrame, QMessageBox)
+
+        vw = self.viewer_window
+
+        maps = self._rectify_available_maps()
+        if not maps:
+            QMessageBox.information(self, 'Mask Spaxels',
+                                    'No maps found. Fit the cube first so there '
+                                    'are quality / line / stellar maps to mask on.')
+            return
+
+        OPS = [('>',     '>'),
+               ('<',     '<'),
+               ('|·| >', 'abs>'),
+               ('|·| <', 'abs<')]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Mask Spaxels')
+        dlg.setMinimumWidth(470)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(10)
+        layout.setContentsMargins(14, 14, 14, 14)
+
+        # ── Row: "Keep spaxels where: [map combo]" ────────────────────────
+        map_row = QHBoxLayout()
+        map_row.addWidget(QLabel('Keep spaxels where:'))
+        map_combo = QComboBox()
+        for m in maps:
+            map_combo.addItem(m['label'])
+        map_row.addWidget(map_combo, 1)
+        layout.addLayout(map_row)
+
+        # ── Row: "[op combo]  [threshold spin]" ───────────────────────────
+        thresh_row = QHBoxLayout()
+        op_combo = QComboBox()
+        op_combo.setFixedWidth(80)
+        for disp, _tok in OPS:
+            op_combo.addItem(disp)
+        thresh_row.addWidget(op_combo)
+        spin = QDoubleSpinBox()
+        spin.setRange(-1e6, 1e6)
+        spin.setDecimals(3)
+        spin.setSingleStep(0.5)
+        thresh_row.addWidget(spin)
+        thresh_row.addStretch()
+        layout.addLayout(thresh_row)
+
+        # ── Live count preview ────────────────────────────────────────────
+        preview = QLabel()
+        preview.setWordWrap(True)
+        layout.addWidget(preview)
+
+        def _current():
+            midx = map_combo.currentIndex()
+            oidx = op_combo.currentIndex()
+            if not (0 <= midx < len(maps)) or not (0 <= oidx < len(OPS)):
+                return None
+            return maps[midx], OPS[oidx][1]
+
+        def _refresh(*_):
+            cur = _current()
+            if cur is None:
+                return
+            m, op = cur
+            vals = m['values']
+            thresh = spin.value()
+            keep = self._rectify_flagged(vals, op, thresh)
+            n_keep = len(keep)
+            n_mask = len(vals) - n_keep
+            disp = {'>': f'> {thresh:g}', '<': f'< {thresh:g}',
+                    'abs>': f'|·| > {thresh:g}', 'abs<': f'|·| < {thresh:g}'}[op]
+            preview.setText(
+                f"Keep <b>{n_keep}</b> (value {disp}); mask out <b>{n_mask}</b> "
+                f"of <b>{len(vals)}</b> spaxels in this map."
+            )
+
+        def _on_map_changed(midx):
+            if 0 <= midx < len(maps):
+                m = maps[midx]
+                tok_to_idx = {tok: i for i, (_d, tok) in enumerate(OPS)}
+                op_combo.blockSignals(True)
+                op_combo.setCurrentIndex(tok_to_idx.get(m['default_op'], 0))
+                op_combo.blockSignals(False)
+                spin.blockSignals(True)
+                spin.setValue(float(m['default_thr']))
+                spin.blockSignals(False)
+            _refresh()
+
+        map_combo.currentIndexChanged.connect(_on_map_changed)
+        op_combo.currentIndexChanged.connect(_refresh)
+        spin.valueChanged.connect(_refresh)
+        _on_map_changed(0)
+
+        # ── Separator ─────────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        layout.addWidget(sep)
+
+        HELP = (
+            "<b>Mask Spaxels</b> hides spaxels on every displayed map so you can "
+            "focus on the region you care about (e.g. only well-fit spaxels, or "
+            "only a velocity range). It is a display mask — it does not change "
+            "the fit.<br><br>"
+            "<b>Keep spaxels where …</b> defines the criterion the kept spaxels "
+            "<i>satisfy</i>; every other spaxel in that map is masked out. Pick "
+            "any quality metric, emission-line parameter (amplitude, centroid, "
+            "velocity, σ), or stellar map, then an operator and threshold — "
+            "exactly as in Rectify.<br><br>"
+            "<b>Operators.</b> The threshold is signed:<br>"
+            "&nbsp;&nbsp;<b>&gt; T</b> / <b>&lt; T</b> — keep values above / below T "
+            "(T may be negative, e.g. keep <i>vel &gt; −300</i>)<br>"
+            "&nbsp;&nbsp;<b>|·| &gt; T</b> / <b>|·| &lt; T</b> — keep by magnitude "
+            "(e.g. keep <i>|vel| &lt; 300</i> to mask high-velocity outliers)<br><br>"
+            "<b>Buttons.</b> <i>Visualize</i> outlines the kept region as a cyan "
+            "contour (like the SNR mask) without applying it. <i>Accept mask</i> "
+            "applies it to the display. <i>Unmask</i> clears any active mask. "
+            "<i>Cancel</i> closes and removes the preview, leaving any existing "
+            "mask untouched.<br><br>"
+            "Spaxels with no value in the chosen map (e.g. unfit) keep their "
+            "current visibility."
+        )
+
+        # ── Button row: ? | Visualize | Accept | Unmask | Cancel ──────────
+        btn_row = QHBoxLayout()
+        help_btn = QPushButton('?')
+        help_btn.setFixedWidth(28)
+        help_btn.setToolTip('Explain masking, maps and operators')
+        help_btn.clicked.connect(
+            lambda: QMessageBox.information(dlg, 'Mask — Help', HELP))
+        btn_row.addWidget(help_btn)
+        btn_row.addStretch()
+
+        visualize_btn = QPushButton('Visualize')
+        accept_btn    = QPushButton('Accept mask')
+        unmask_btn    = QPushButton('Unmask')
+        cancel_btn    = QPushButton('Cancel')
+        visualize_btn.setToolTip('Preview the kept region as a contour (does not apply)')
+        accept_btn.setToolTip('Apply the mask to the displayed maps')
+        unmask_btn.setToolTip('Remove any active mask')
+        for b in (visualize_btn, accept_btn, unmask_btn, cancel_btn):
+            btn_row.addWidget(b)
+        layout.addLayout(btn_row)
+
+        def _on_visualize():
+            cur = _current()
+            if cur is None:
+                return
+            m, op = cur
+            keep_field, _mask = self._mask_keep_field(m, op, spin.value())
+            vw.show_mask_preview(keep_field)
+
+        def _on_accept():
+            cur = _current()
+            if cur is None:
+                return
+            m, op = cur
+            _keep_field, mask_array = self._mask_keep_field(m, op, spin.value())
+            vw.clear_mask_preview()
+            vw._spaxel_mask = mask_array
+            vw.redraw_current_image()
+            dlg.accept()
+
+        def _on_unmask():
+            vw.clear_mask_preview()
+            vw._spaxel_mask = None
+            vw.redraw_current_image()
+            dlg.accept()
+
+        def _on_cancel():
+            # Leave any already-applied mask intact; just drop the preview.
+            vw.clear_mask_preview()
+            dlg.reject()
+
+        visualize_btn.clicked.connect(_on_visualize)
+        accept_btn.clicked.connect(_on_accept)
+        unmask_btn.clicked.connect(_on_unmask)
+        cancel_btn.clicked.connect(_on_cancel)
+        dlg.rejected.connect(vw.clear_mask_preview)  # safety: X / Esc
+
+        dlg.exec_()
+
+    def _params_from_fit_row(self, base_params, rows):
+        """Seed a copy of base_params from a neighbour spaxel's fitted values.
+
+        rows: the df_fit rows for one spaxel (one per line). Sets each line's
+        amp/cen/sigma initial guess (and region-1 continuum) to the neighbour's
+        best-fit values, clamped to bounds. Derived (expr-constrained) params
+        are skipped — they are non-varying and recomputed from their reference.
+        """
+        p = base_params.copy()
+        try:
+            rows = rows.sort_values('LineID')
+        except Exception:
+            pass
+        for idx, (_, r) in enumerate(rows.iterrows(), start=1):
+            for key, col in ((f'amp{idx}', 'amp_fit'),
+                             (f'cen{idx}', 'cen_fit'),
+                             (f'sigma{idx}', 'sigma_fit')):
+                if key in p and p[key].vary:
+                    v = _safe_float(r.get(col))
+                    if np.isfinite(v):
+                        lo, hi = p[key].min, p[key].max
+                        if lo is not None and np.isfinite(lo):
+                            v = max(v, lo)
+                        if hi is not None and np.isfinite(hi):
+                            v = min(v, hi)
+                        p[key].value = v
+        # Region-1 linear continuum, if the neighbour recorded it and it varies.
+        first = rows.iloc[0] if len(rows) else None
+        if first is not None:
+            for key, col in (('slope1', 'cont_region1_slope_fit'),
+                             ('intercept1', 'cont_region1_intercept_fit')):
+                if key in p and p[key].vary:
+                    v = _safe_float(first.get(col))
+                    if np.isfinite(v):
+                        p[key].value = v
+        return p
+
+    # ── Targeted multi-start (Phase C: fallback for Rectify survivors) ───────
+    def _component_pairs(self):
+        """Model-order (1-based) index pairs of two-component lines that share a
+        rest wavelength, e.g. (narrow, broad). Ordered narrow-first by σ guess.
+        """
+        if 'Rest Wavelength' not in df.columns:
+            return []
+        groups = {}
+        for idx, (_, r) in enumerate(df.iterrows(), start=1):
+            rw = _safe_float(r.get('Rest Wavelength'))
+            sig = _safe_float(r.get('Sigma_0'))
+            if np.isfinite(rw):
+                groups.setdefault(round(rw, 4), []).append((idx, sig))
+        pairs = []
+        for members in groups.values():
+            if len(members) == 2:
+                members.sort(key=lambda t: (t[1] if np.isfinite(t[1]) else np.inf))
+                pairs.append((members[0][0], members[1][0]))  # (narrow, broad)
+        return pairs
+
+    @staticmethod
+    def _seed_param(p, key, value):
+        """Set a free param's value, clamped to its bounds. Skips derived
+        (expr-constrained / non-varying) params so constraints stay intact."""
+        if key not in p or not p[key].vary or value is None or not np.isfinite(value):
+            return
+        lo, hi = p[key].min, p[key].max
+        if lo is not None and np.isfinite(lo):
+            value = max(value, lo)
+        if hi is not None and np.isfinite(hi):
+            value = min(value, hi)
+        p[key].value = value
+
+    def _targeted_restarts(self, base_params):
+        """Physically-motivated restart parameter sets for the known 2-component
+        failure modes (narrow-only, broad-only, swapped, equal-split). Best-effort:
+        only free params are edited; returns [(label, Parameters), ...]."""
+        pairs = self._component_pairs()
+        if not pairs:
+            return []
+
+        def _amp_floor(p, key):
+            lo = p[key].min if key in p else None
+            return lo if (lo is not None and np.isfinite(lo)) else 0.0
+
+        variants = []
+        # narrow-only / broad-only: drive the other component's amplitude to ~0.
+        for label, kill_broad in (('narrow-only', True), ('broad-only', False)):
+            p = base_params.copy()
+            for (i_n, i_b) in pairs:
+                tgt = f'amp{i_b}' if kill_broad else f'amp{i_n}'
+                self._seed_param(p, tgt, _amp_floor(p, tgt))
+            variants.append((label, p))
+        # swapped: exchange amp & σ between the two components.
+        p = base_params.copy()
+        for (i_n, i_b) in pairs:
+            for stem in ('amp', 'sigma'):
+                a, b = f'{stem}{i_n}', f'{stem}{i_b}'
+                if a in p and b in p:
+                    va, vb = p[a].value, p[b].value
+                    self._seed_param(p, a, vb)
+                    self._seed_param(p, b, va)
+        variants.append(('swapped', p))
+        # equal-split: average amp & σ across the pair.
+        p = base_params.copy()
+        for (i_n, i_b) in pairs:
+            for stem in ('amp', 'sigma'):
+                a, b = f'{stem}{i_n}', f'{stem}{i_b}'
+                if a in p and b in p:
+                    avg = 0.5 * (p[a].value + p[b].value)
+                    self._seed_param(p, a, avg)
+                    self._seed_param(p, b, avg)
+        variants.append(('equal-split', p))
+        return variants
+
+    def _fit_candidate(self, z, candidate_params):
+        """Fit the current spaxel with candidate_params and return
+        (qa_core_cont_ratio, rows) WITHOUT committing: the rows fit_spaxel
+        appended are popped back off fit_results so the caller can keep only
+        the best candidate. A failed/degenerate candidate returns +inf."""
+        global fit_results
+        snap = len(fit_results)
+        self.fit_spaxel(z, max_nfev=512, params_to_use=candidate_params)
+        rows = fit_results[snap:]
+        del fit_results[snap:]
+        ratio = np.inf
+        if rows:
+            r = _safe_float(rows[0].get('qa_core_cont_ratio'))
+            ratio = r if np.isfinite(r) else np.inf
+        return ratio, rows
+
+    def _staged_fit(self, model, y, params, wavelengths, max_nfev):
+        """Sequential core→outflow fit (breaks the narrow/broad degeneracy).
+
+        Stage 1 fits the narrow core(s) with the broad amplitudes suppressed;
+        Stage 2 freezes the core + continuum and fits each broad component to
+        the residual (where it is the only feature and cannot collapse onto the
+        core); Stage 3 is a joint polish from that solution. Falls back to a
+        single joint fit if there are no narrow/broad pairs or on any error.
+        Operates in the already-flux-rescaled parameter space.
+        """
+        try:
+            pairs = self._component_pairs()
+        except Exception:
+            pairs = []
+        if not pairs:
+            return model.fit(y, params, x=wavelengths, max_nfev=max_nfev)
+
+        try:
+            broad_amps = {f'amp{i_b}' for (_i_n, i_b) in pairs}
+            cont_prefixes = ('slope', 'intercept', 'polyc', 'knoty')  # slope→slope_int too
+            orig_vary = {name: p.vary for name, p in params.items()}
+
+            # Stage 1 — core only: suppress free broad amplitudes.
+            p1 = params.copy()
+            for k in broad_amps:
+                if k in p1 and not p1[k].expr:
+                    p1[k].set(value=0.0, vary=False)
+            r1 = model.fit(y, p1, x=wavelengths, max_nfev=max_nfev)
+
+            # Stage 2 — broad on the residual: freeze core + continuum, free broad.
+            p2 = r1.params.copy()
+            for name, p in p2.items():
+                if name in broad_amps:
+                    if not p.expr:
+                        p.set(value=params[name].value, vary=True)  # reset to broad init
+                        if params[name].min is not None:
+                            p.min = params[name].min
+                        if params[name].max is not None:
+                            p.max = params[name].max
+                elif name.startswith('offset_vel') or name.startswith('ratio'):
+                    continue  # broad's constraint helpers stay free
+                elif (name.startswith(('amp', 'cen', 'sigma')) or
+                      name.startswith(cont_prefixes)):
+                    if p.expr is None:
+                        p.vary = False  # freeze narrow core + continuum
+            r2 = model.fit(y, p2, x=wavelengths, max_nfev=max_nfev)
+
+            # Stage 3 — joint polish from the staged solution.
+            p3 = r2.params.copy()
+            for name, p in p3.items():
+                if p.expr is None and name in orig_vary:
+                    p.vary = orig_vary[name]
+            return model.fit(y, p3, x=wavelengths, max_nfev=max(64, max_nfev // 2))
+        except Exception as e:
+            print(f"Staged fit fell back to joint fit: {type(e).__name__}: {e}")
+            return model.fit(y, params, x=wavelengths, max_nfev=max_nfev)
+
 
 
     def save_fit_result_fitsfile(self):
@@ -6855,6 +7911,112 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             total[mask] += y[mask]
         return total
 
+    def _fit_quality_metrics(self, spectrum, wavelengths, result, flux_scale):
+        """Calibrated, scale-free goodness-of-fit statistics for one spaxel.
+
+        The native rchisq is an unweighted, flux-rescaled sum-of-squares with no
+        noise model, so it is ~constant offset from a true reduced chi-square and
+        not comparable across spaxels of different brightness. These metrics fix
+        that without touching the fit:
+
+        - qa_chisq_cont : reduced chi-square over off-line (continuum) pixels,
+          normalised by a robust per-spaxel noise estimate. ~1 for a good fit.
+        - qa_core_cont_ratio : mean(resid^2) in the line cores / mean(resid^2)
+          in the continuum. Noise-independent (scale-free); ~1 good, >>1 = the
+          line profile is poorly fit (e.g. a missed peak).
+        - qa_signed_resid_z : signed summed residual in the cores / (noise*sqrt N);
+          large positive = model under-predicts (missed flux), negative = over.
+        - qa_runs_z : standardised Wald-Wolfowitz runs statistic on the sign of
+          the core residuals; large |z| = systematic shape error.
+        """
+        nan = float('nan')
+        out = {'qa_noise': nan, 'qa_chisq_cont': nan, 'qa_chisq_core': nan,
+               'qa_core_cont_ratio': nan, 'qa_signed_resid_z': nan, 'qa_runs_z': nan}
+        try:
+            model = np.asarray(result.best_fit, dtype=float) * flux_scale
+            lam = np.asarray(wavelengths, dtype=float)
+            data = np.asarray(spectrum, dtype=float)
+            if model.shape != data.shape or model.shape != lam.shape:
+                return out
+            resid = data - model
+            finite = np.isfinite(resid) & np.isfinite(lam)
+
+            # In-fit mask = union of the continuum regions' wavelength spans.
+            in_fit = np.zeros_like(lam, dtype=bool)
+            nreg = len(df_cont)
+            for r in range(1, nreg + 1):
+                ks, ke = f'x{r}_start', f'x{r}_end'
+                if ks in result.params and ke in result.params:
+                    x0 = float(result.params[ks].value)
+                    x1 = float(result.params[ke].value)
+                    in_fit |= (lam >= min(x0, x1)) & (lam <= max(x0, x1))
+            if not in_fit.any():
+                in_fit = finite.copy()
+            in_fit &= finite
+
+            # Core mask = (a) ±2.5σ around the fitted centroid UNION
+            # (b) the full allowed centroid range ±2.5·σ_pad.
+            # Including (b) catches missed peaks that sit inside the
+            # parameter bounds but outside the fitted window — without
+            # it a fit that completely misses the line scores as "good".
+            core = np.zeros_like(lam, dtype=bool)
+            nlines = len(np.unique(df['Line_ID'])) if 'Line_ID' in df.columns else 0
+            for i in range(1, nlines + 1):
+                ck, sk = f'cen{i}', f'sigma{i}'
+                if ck in result.params and sk in result.params:
+                    cen = float(result.params[ck].value)
+                    sig = abs(float(result.params[sk].value))
+                    if np.isfinite(cen) and np.isfinite(sig) and sig > 0:
+                        core |= np.abs(lam - cen) <= 2.5 * sig
+                        # Expand to allowed centroid window (part b).
+                        p_cen = result.params[ck]
+                        cen_lo = (float(p_cen.min)
+                                  if p_cen.min is not None and np.isfinite(float(p_cen.min))
+                                  else cen)
+                        cen_hi = (float(p_cen.max)
+                                  if p_cen.max is not None and np.isfinite(float(p_cen.max))
+                                  else cen)
+                        p_sig = result.params[sk]
+                        sig_lo = (float(p_sig.min)
+                                  if p_sig.min is not None and np.isfinite(float(p_sig.min))
+                                  else sig)
+                        sig_pad = max(sig, sig_lo) * 2.5
+                        core |= (lam >= cen_lo - sig_pad) & (lam <= cen_hi + sig_pad)
+            core &= in_fit
+            cont = in_fit & ~core
+
+            r_core, r_cont = resid[core], resid[cont]
+            n_core, n_cont = r_core.size, r_cont.size
+            if n_cont >= 5:
+                noise = 1.4826 * np.median(np.abs(r_cont - np.median(r_cont)))
+                out['qa_noise'] = float(noise)
+                if noise > 0:
+                    out['qa_chisq_cont'] = float(np.mean(r_cont**2) / noise**2)
+                    if n_core >= 1:
+                        out['qa_chisq_core'] = float(np.mean(r_core**2) / noise**2)
+                        out['qa_signed_resid_z'] = float(
+                            np.sum(r_core) / (noise * np.sqrt(n_core)))
+                mc = np.mean(r_cont**2)
+                if n_core >= 1 and mc > 0:
+                    out['qa_core_cont_ratio'] = float(np.mean(r_core**2) / mc)
+
+            # Wald-Wolfowitz runs test on the sign of the core residuals.
+            if n_core >= 10:
+                signs = np.sign(r_core)
+                signs = signs[signs != 0]
+                npos = int((signs > 0).sum()); nneg = int((signs < 0).sum())
+                ntot = npos + nneg
+                if npos > 0 and nneg > 0 and ntot > 1:
+                    runs = 1 + int(np.sum(signs[1:] != signs[:-1]))
+                    mu = 2.0 * npos * nneg / ntot + 1.0
+                    var = (2.0 * npos * nneg * (2.0 * npos * nneg - ntot)
+                           / (ntot**2 * (ntot - 1)))
+                    if var > 0:
+                        out['qa_runs_z'] = float((runs - mu) / np.sqrt(var))
+        except Exception as e:
+            print(f"QA-metrics warning: {type(e).__name__}: {e}")
+        return out
+
     def fit_spaxel(self,z,max_nfev=256,params_to_use=None):
         global df_fit, df, df_cont
         
@@ -6921,10 +8083,18 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         # Constants for velocity calculation
         c = 299792.458  # km/s
         
-        # Perform the fit using lmfit
+        # Perform the fit using lmfit (optionally sequential core→outflow).
         try:
-            result = piecewise_model.fit(spectrum_scaled, params_scaled, x=wavelengths, max_nfev=max_nfev)
-            
+            if getattr(self, '_sequential_fit', False):
+                result = self._staged_fit(piecewise_model, spectrum_scaled,
+                                          params_scaled, wavelengths, max_nfev)
+            else:
+                result = piecewise_model.fit(spectrum_scaled, params_scaled, x=wavelengths, max_nfev=max_nfev)
+
+            # Per-spaxel calibrated goodness-of-fit metrics (computed once,
+            # merged into every line row below like the native rchisq).
+            qa = self._fit_quality_metrics(spectrum, wavelengths, result, flux_scale)
+
             # Map parameter prefixes to continuum regions
             cont_map = {
                 f"x{i + 1}_start": i + 1 for i in range(len(df_cont))
@@ -7055,7 +8225,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             
                 # Add continuum parameters
                 fit_entry.update(cont_params)
-            
+                # Add per-spaxel goodness-of-fit metrics
+                fit_entry.update(qa)
+
                 fit_results.append(fit_entry)
     
         except Exception as e:
@@ -7999,7 +9171,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         print(f"Fit complete for spaxel ({cx}, {cy}).")
 
 
-    def fit_cube(self, refit=False, rchisq_thresh=None):
+    def fit_cube(self, refit=False, rchisq_thresh=None, qual_col=None, qual_op='>',
+                 bad_spaxels_override=None):
         global df, df_fit, fit_results, snr_mask, piecewise_model, line, new_results#,params
         global base_df_cont, base_df, spaxel_overrides, df_stellar
 
@@ -8174,77 +9347,126 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         if len(fit_results) > 0 and not refit:
             fit_results = []
             
-        # Handle refit case with rchisq threshold
-        if refit and rchisq_thresh is not None and 'df_fit' in globals() and 'rchisq' in df_fit.columns:
+        # Handle refit case: either an explicit set of flagged spaxels
+        # (bad_spaxels_override, from the Rectify dialog's arbitrary-map
+        # selection) or the legacy single-column threshold.
+        _have_quality = ('qa_core_cont_ratio' in df_fit.columns
+                         or 'rchisq' in df_fit.columns) if (
+                            'df_fit' in globals() and len(df_fit) > 0) else False
+        if refit and _have_quality and (bad_spaxels_override is not None
+                                        or rchisq_thresh is not None):
             fit_results = []
-            
-            # Get indices of spaxels that need refitting
-            bad_fits = df_fit[df_fit['rchisq'] > rchisq_thresh]
-            bad_spaxels = bad_fits[['spaxel_x', 'spaxel_y']].drop_duplicates()
-            
-            # Create a copy of original parameters to perturb
-            refit_params = params.copy()
-            
-            substrings = ['amp', 'cen', 'sigma']
-            
-            # Perturb all varying parameters by ±10%
-            for name, param in refit_params.items():
-                if param.vary:
-                    if any(sub in name for sub in substrings):
-                        current_val = param.value
-                        perturbation = np.random.uniform(0.9, 1.1)  # 10% random variation
-                        refit_params[name].value = current_val * perturbation
-                        
-                    # print('original parameters:')
-                    # params.pretty_print()
-                    # print('refit parameters:')
-                    # refit_params.pretty_print()
-                        
-            # Refit only the bad spaxels with perturbed parameters
+
+            # Goodness-of-fit column used for (a) ranking neighbours when
+            # seeding and (b) deciding whether a re-fit candidate is acceptable.
+            # Always a genuine quality metric, independent of how spaxels were
+            # flagged for re-fitting.
+            _accept_col = ('qa_core_cont_ratio' if 'qa_core_cont_ratio' in df_fit.columns
+                           else 'rchisq')
+            _accept_thr = self._RECTIFY_DEFAULTS.get(_accept_col, 2.0)
+            _per = df_fit.drop_duplicates(subset=['spaxel_x', 'spaxel_y'])
+            qual = {}
+            for _, rr in _per.iterrows():
+                try:
+                    sx, sy = int(rr['spaxel_x']), int(rr['spaxel_y'])
+                except (TypeError, ValueError):
+                    continue
+                qual[(sx, sy)] = _safe_float(rr.get(_accept_col))
+
+            def _is_bad(v):
+                # Candidate-acceptance quality check (higher = worse).
+                return (not np.isfinite(v)) or (v > _accept_thr)
+
+            if bad_spaxels_override is not None:
+                # Explicit flagged set from the dialog. Good = fitted & not flagged.
+                bad_set = {(int(x), int(y)) for (x, y) in bad_spaxels_override}
+                good_set = {xy for xy in qual if xy not in bad_set}
+                bad_spaxels = pd.DataFrame(sorted(bad_set),
+                                           columns=['spaxel_x', 'spaxel_y'])
+                print(f"Rectify: {len(bad_spaxels)} flagged / {len(qual)} fitted "
+                      f"spaxels (custom selection)")
+            else:
+                # Legacy: flag on a single column / operator / threshold.
+                _flag_col = (qual_col if (qual_col is not None and qual_col in df_fit.columns)
+                             else _accept_col)
+                flag = {}
+                for _, rr in _per.iterrows():
+                    try:
+                        sx, sy = int(rr['spaxel_x']), int(rr['spaxel_y'])
+                    except (TypeError, ValueError):
+                        continue
+                    flag[(sx, sy)] = _safe_float(rr.get(_flag_col))
+
+                def _flag_bad(v):
+                    if not np.isfinite(v):
+                        return True
+                    if qual_op == '<-':
+                        return v < -rchisq_thresh
+                    if qual_op == 'abs>':
+                        return abs(v) > rchisq_thresh
+                    return v > rchisq_thresh  # default: '>'
+
+                good_set = {xy for xy, v in flag.items() if not _flag_bad(v)}
+                bad_spaxels = pd.DataFrame(
+                    sorted(xy for xy, v in flag.items() if _flag_bad(v)),
+                    columns=['spaxel_x', 'spaxel_y'])
+                _op_str = {'<-': f'< -{rchisq_thresh}',
+                           'abs>': f'|·|> {rchisq_thresh}'}.get(
+                    qual_op, f'> {rchisq_thresh}')
+                print(f"Rectify: {len(bad_spaxels)} bad / {len(flag)} fitted spaxels "
+                      f"({_flag_col} {_op_str})")
+
+            def _best_neighbour(i, j):
+                """Best (lowest-quality-value) good spaxel among the 8 neighbours."""
+                best, best_q = None, np.inf
+                for di in (-1, 0, 1):
+                    for dj in (-1, 0, 1):
+                        if di == 0 and dj == 0:
+                            continue
+                        nb = (i + di, j + dj)
+                        if nb in good_set and qual[nb] < best_q:
+                            best, best_q = nb, qual[nb]
+                return best
+
+            # Refit each bad spaxel: seed from its best good neighbour (spatial
+            # smoothness prior); if that still fails, fall back to targeted
+            # multi-start (Phase C). Only the best-scoring candidate is kept.
+            n_rescued = 0
             for i, j in bad_spaxels.itertuples(index=False):
                 if snr_map[j, i] >= snr_value:
-                    # Get original amplitudes for this spaxel - properly extract as dict
-                    original_data = df_fit[
-                        (df_fit['spaxel_x'] == i) & 
-                        (df_fit['spaxel_y'] == j)
-                    ]
-                    original_amplitudes = dict(zip(original_data['LineID'], original_data['amp_fit']))
-                    
-                    # Perform the fit
                     self.viewer_window.current_spaxel = (i, j)
-                    self.fit_spaxel(z, max_nfev=512, params_to_use=refit_params)
-                    
-                    # Get new results (last n entries where n=number of lines in spaxel)
-                    new_results = [r for r in fit_results[-len(original_amplitudes):] 
-                                  if r['spaxel_x'] == i and r['spaxel_y'] == j]
-                    
-                    # Print comparison
-                    print(f"\nSpaxel ({i}, {j}) - Amplitude Comparison:")
-                    print(f"{'LineID':<10} | {'Old Amp':<10} | {'New Amp':<10} | {'Change (%)':<10}")
-                    print("-" * 45)
-                    
-                    for new_r in new_results:
-                        line_id = new_r['LineID']
-                        try:
-                            old_amp = original_amplitudes[line_id]
-                            new_amp = new_r['amp_fit']
-                            change_pct = (new_amp - old_amp)/old_amp * 100
-                            print(
-                                f"{line_id:<10} | {old_amp:<10.3f} | {new_amp:<10.3f} | "
-                                f"{change_pct:>+10.1f}%"
-                            )
-                        except KeyError:
-                            print(f"{line_id:<10} | {'N/A':<10} | {new_amp:<10.3f} | {'New':>10}")
+                    nb = _best_neighbour(i, j)
+                    if nb is not None:
+                        nb_rows = df_fit[(df_fit['spaxel_x'] == nb[0]) &
+                                         (df_fit['spaxel_y'] == nb[1])]
+                        seed = self._params_from_fit_row(params, nb_rows)
+                    else:
+                        seed = params.copy()  # no good neighbour → base init
 
-        
+                    # Incumbent: neighbour-seeded (or base) fit.
+                    best_ratio, best_rows = self._fit_candidate(z, seed)
+
+                    # Targeted multi-start only if the incumbent is still bad.
+                    if _is_bad(best_ratio):
+                        for _label, cand in self._targeted_restarts(seed):
+                            c_ratio, c_rows = self._fit_candidate(z, cand)
+                            if c_ratio < best_ratio:
+                                best_ratio, best_rows = c_ratio, c_rows
+
+                    fit_results.extend(best_rows)
+                    if not _is_bad(best_ratio):
+                        n_rescued += 1
+
                     current_spaxel = i * ny + j + 1
                     progress_bar.setValue(current_spaxel)
-                    status_label.setText(f"Refitting spaxel {current_spaxel} / {total_spaxels}")
+                    status_label.setText(f"Rectifying spaxel ({i}, {j})")
                     QApplication.processEvents()
-        
+
                     if current_spaxel % 500 == 0 and psutil.virtual_memory().percent > 80:
                         gc.collect()
-            
+
+            print(f"Rectify: {n_rescued}/{len(bad_spaxels)} spaxels now below threshold")
+
             # Merge results (keeping LineID matching)
             new_results = pd.DataFrame(fit_results)
             
@@ -9416,9 +10638,15 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             "&nbsp;&nbsp;<tt>sigma &gt;= sigma_[Halpha_b]</tt><br>"
             "&nbsp;&nbsp;<tt>vel == vel_[nii_1]</tt><br>"
             "&nbsp;&nbsp;<tt>amp &lt;= 0.33 * amp_[Halpha]</tt><br><br>"
-            "<b>Tip:</b> to tie velocities across several lines, use the "
-            "<b>Kinematic group</b> (K1–K5) checkboxes below instead of typing "
-            "<tt>vel ==</tt> constraints by hand.<br><br>"
+            "<b>Velocity ties & windows</b> (Δv in km/s, relative to the "
+            "reference line):<br>"
+            "&nbsp;&nbsp;<tt>vel == vel_[nii_1]</tt> — same velocity (Δv = 0)<br>"
+            "&nbsp;&nbsp;<tt>vel == vel_[nii_1] +- 300</tt> — within ±300 km/s<br>"
+            "&nbsp;&nbsp;<tt>vel &lt;= vel_[nii_1] + 300</tt> — at most 300 km/s redward<br>"
+            "&nbsp;&nbsp;<tt>vel &gt;= vel_[nii_1] - 300</tt> — at least 300 km/s blueward<br>"
+            "<i>(a two-sided minimum |Δv| ≥ X is not supported — pick a side.)</i><br><br>"
+            "<b>Tip:</b> to tie velocities across several lines at once, use the "
+            "<b>Kinematic group</b> (K1–K5) checkboxes below.<br><br>"
             f"<b>Lines in this region:</b><br>&nbsp;&nbsp;<tt>{lines_str}</tt>"
         )
         dlg = QDialog(parent)
@@ -9559,6 +10787,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     # numeric factor (e.g. 'sigma == 1.002255 * sigma_[ref]'). This lets us
     # strip K-group ties without touching a user's 'sigma <=/>= sigma_[X]'.
     _KG_SIGMA_RE = re.compile(r'sigma\s*==\s*[\d.]+\s*\*\s*sigma_\[')
+    # K-group-managed velocity tie is the *exact* form 'vel == vel_[ref]'
+    # (anchored, no trailing window). This must NOT match a user's manual
+    # velocity window/one-sided form ('vel == vel_[B] +- 300', 'vel <= ...').
+    _KG_VEL_RE = re.compile(r'^\s*vel\s*==\s*vel_\[.*\]\s*$')
 
     def _rest_wl(self, line_name):
         """Rest wavelength (Å) for a line, or None if missing/invalid."""
@@ -9583,7 +10815,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         for idx in df.index[df['Line_Name'] == line_name]:
             clist = self._normalize_constraint_list(df.at[idx, 'constraints'])
             kept = [c for c in clist if c.strip()
-                    and not re.search(r'\bvel\b', c)
+                    and not self._KG_VEL_RE.match(c)
                     and not self._KG_SIGMA_RE.search(c)]
             if add:
                 kept = kept + list(add)      # ties last → override manual sigma
