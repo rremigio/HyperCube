@@ -20,6 +20,7 @@ import gc
 import pickle
 import psutil
 import os
+from multiprocessing import shared_memory
 from pathlib import Path
 import warnings
 
@@ -44,6 +45,7 @@ from PyQt5.QtGui import QKeySequence
 from lmfit import Model, Parameters
 
 import HyperCube_ModelFunctions
+import HyperCube_fit  # Qt-free per-spaxel fit kernel (shared by serial + parallel)
 try:
     import HyperCube_pPXF as hcppxf
 except Exception as _e:
@@ -3105,6 +3107,18 @@ class ViewerWindow(QMainWindow):
         if df_stellar is None:
             df_stellar = pd.DataFrame({})
         STELLAR_CACHE = session.get('stellar_cache', {}) or {}
+        # Back-compat: older sessions keyed the stellar cache by (x, y). The cache
+        # is now keyed by (x, y, region_ID). If exactly one stellar region exists,
+        # migrate the 2-tuple keys onto it; otherwise drop the ambiguous entries.
+        if any(isinstance(k, tuple) and len(k) == 2 for k in STELLAR_CACHE):
+            _srids = ([] if not (isinstance(df_cont, pd.DataFrame) and 'cont_type' in df_cont.columns)
+                      else [int(np.int64(r)) for r in df_cont.loc[df_cont['cont_type'] == 'stellar', 'region_ID']])
+            _lone = _srids[0] if len(_srids) == 1 else None
+            STELLAR_CACHE = {
+                ((k[0], k[1], _lone) if (isinstance(k, tuple) and len(k) == 2) else k): v
+                for k, v in STELLAR_CACHE.items()
+                if not (isinstance(k, tuple) and len(k) == 2 and _lone is None)
+            }
         self._edit_spaxel = None  # never resume mid-edit
 
         # 3) Ensure the Fit Parameters dock exists and is visible.
@@ -4785,8 +4799,9 @@ class ViewerWindow(QMainWindow):
     
         if not isinstance(line_obj, plt.Line2D):
             print(f"Error: No valid line object found.")
+            self.gaussian_active = False  # don't leave a half-started state for the next 'G'
             return
-    
+
         # Store the line and initialize Gaussian parameters
         self.active_line = line_obj
         region = df_cont.loc[df_cont["region_ID"] == region_ID]
@@ -4998,18 +5013,67 @@ class ViewerWindow(QMainWindow):
             m = np.float64(region['Slope_0'].item()); b = np.float64(region['Intercept_0'].item())
         return m * x_vals + b
 
+    def _ensure_stellar_cache(self, x, y, rid):
+        """Lazily compute & cache the pPXF optimal template for spaxel (x,y),
+        region `rid`, if it is absent. The parallel cube fit stores kinematics
+        only (df_stellar drives the maps), so a spaxel's optimal template is
+        recomputed on demand here the first time its stellar baseline is drawn.
+        No-op if already cached or pPXF/data unavailable."""
+        key = (int(x), int(y), int(rid))
+        if (STELLAR_CACHE.get(key) is not None or hcppxf is None
+                or FITS_DATA is None or 'cont_type' not in df_cont.columns):
+            return
+        reg = df_cont[(np.int64(df_cont['region_ID']) == np.int64(rid)) &
+                      (df_cont['cont_type'] == 'stellar')]
+        if len(reg) == 0:
+            return
+        r = reg.iloc[0]
+        try:
+            library = str(r['stellar_library'])
+            fit_range = (float(r['x1']), float(r['x2']))
+            moments = int(r['stellar_moments']) if pd.notna(r.get('stellar_moments')) else 2
+            z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
+            z = 0.0 if not np.isfinite(z) else z
+            R = _safe_float(df_obs.loc[0, 'resolvingpower']) if len(df_obs) else np.nan
+            R = 3000.0 if not np.isfinite(R) or R <= 0 else R
+            spectrum = np.nan_to_num(self.get_spectrum_at_spaxel(int(x), int(y)))
+            velscale, lam_rest = hcppxf.galaxy_velscale(wavelengths, z, fit_range)
+            lib = _STELLAR_LIBS.get(library) or hcppxf.TemplateLibrary(library).load()
+            _STELLAR_LIBS[library] = lib
+            lib.prepare(velscale, R, lam_rest)
+            mask = (df['Centroid_0'].astype(float).to_numpy()
+                    if len(df) > 0 and 'Centroid_0' in df.columns else ())
+            res = hcppxf.fit_stellar(spectrum, wavelengths, z, R, lib,
+                                     fit_range=fit_range, mask_centroids=mask,
+                                     moments=moments, degree=-1, mdegree=10,
+                                     sigma_guess=150.0, velscale=velscale)
+            STELLAR_CACHE[key] = res['cache']
+        except Exception as e:
+            print(f"lazy stellar cache failed for ({x},{y},{rid}): {e}")
+
     def _stellar_baseline(self, region, x_vals, use_fit=False, xy=None):
         """Stellar continuum baseline for a 'stellar' region: the cached pPXF
         optimal template broadened by the region's LOSVD (V, σ, h3, h4) and scaled.
         Falls back to zeros if the optimal-template cache for this spaxel is absent."""
         if hcppxf is None:
             return np.zeros_like(x_vals)
-        key = None
+        # Cache is keyed per (spaxel, region) so several stellar regions in the
+        # same spaxel each keep their own optimal template.
+        try:
+            rid = int(np.int64(region['region_ID'].iloc[0]))
+        except Exception:
+            rid = None
+        xy_key = None
         if xy is not None:
-            key = (int(xy[0]), int(xy[1]))
+            xy_key = (int(xy[0]), int(xy[1]))
         elif self.current_spaxel is not None:
-            key = (int(self.current_spaxel[0]), int(self.current_spaxel[1]))
-        cache = STELLAR_CACHE.get(key)
+            xy_key = (int(self.current_spaxel[0]), int(self.current_spaxel[1]))
+        cache = None
+        if xy_key is not None and rid is not None:
+            # Lazily (re)compute this spaxel/region's optimal template if a
+            # parallel fit stored kinematics only.
+            self._ensure_stellar_cache(xy_key[0], xy_key[1], rid)
+            cache = STELLAR_CACHE.get((xy_key[0], xy_key[1], rid))
         if cache is None:
             return np.zeros_like(x_vals)
         # Each spaxel's cache carries its OWN kinematics (set by pPXF, updated on
@@ -5098,7 +5162,7 @@ class ViewerWindow(QMainWindow):
             if _is_stellar:
                 # Stellar baseline from the cached optimal template; draw it even
                 # if no emission lines were fit for this spaxel.
-                has_cache = STELLAR_CACHE.get((int(x), int(y))) is not None
+                has_cache = STELLAR_CACHE.get((int(x), int(y), int(region_ID))) is not None
                 if not has_cache and len(region) == 0:
                     return
                 self.x1 = float(_model_reg.iloc[0]['x1'])
@@ -5835,17 +5899,17 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         # V/σ map buttons: header label above, current-spaxel best-fit value on
         # the button face; clicking displays the corresponding cube map.
-        cur_V, cur_sig = self._current_stellar_kin()
+        cur_V, cur_sig = self._current_stellar_kin(regionID)
         grid_layout.addWidget(QLabel('V map'), 0, ncol + 2)
         vmap = QPushButton(_fmt(cur_V))
-        vmap.setToolTip('Show the stellar velocity map (current spaxel value shown)')
-        vmap.clicked.connect(partial(self._stellar_map, 'stellar_V'))
+        vmap.setToolTip('Show this region\'s stellar velocity map (current spaxel value shown)')
+        vmap.clicked.connect(partial(self._stellar_map, 'stellar_V', regionID))
         grid_layout.addWidget(vmap, 1, ncol + 2)
         self.buttons_dict[(regionID, 'stellar~vmap')] = vmap
         grid_layout.addWidget(QLabel('σ map'), 0, ncol + 3)
         smap = QPushButton(_fmt(cur_sig))
-        smap.setToolTip('Show the stellar dispersion map (current spaxel value shown)')
-        smap.clicked.connect(partial(self._stellar_map, 'stellar_sigma'))
+        smap.setToolTip('Show this region\'s stellar dispersion map (current spaxel value shown)')
+        smap.clicked.connect(partial(self._stellar_map, 'stellar_sigma', regionID))
         grid_layout.addWidget(smap, 1, ncol + 3)
         self.buttons_dict[(regionID, 'stellar~smap')] = smap
 
@@ -6029,10 +6093,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 grid_layout.addWidget(label, 0, col)
             
         # Add Data (continuum buttons)
+        _rid_col = df_cont.columns.get_loc('region_ID')  # look up by name, not a fixed index
         for row in range(df_cont.shape[0]):
            for col, col_name in enumerate(df_cont.columns):
                if col_name not in _hidden_cont_cols:
-                   if np.int64(df_cont.iloc[row,7]) == np.int64(regionID):
+                   if np.int64(df_cont.iloc[row, _rid_col]) == np.int64(regionID):
                        button_name = 'continuum~'+col_name
                        # button_text = str(df_cont.iloc[row, col]) if 'fit' not in col_name.lower() else ''
                        if (col_name == 'Continuum Name') or (type(df_cont.iloc[row, col]) == str):
@@ -6680,7 +6745,26 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             'lines. Only affects lines that have a broad (_b) partner.')
         self.sequential_fit_checkbox.toggled.connect(
             lambda checked: setattr(self, '_sequential_fit', bool(checked)))
+        # Reserve room for the full label so it isn't clipped to "Sequentia".
+        _seq_w = self.sequential_fit_checkbox.sizeHint().width()
+        self.sequential_fit_checkbox.setMinimumWidth(_seq_w + 24)
         row2.addWidget(self.sequential_fit_checkbox)
+
+        row2.addSpacing(12)
+        row2.addWidget(_vsep())
+
+        # Parallel cube-fit worker count (1 = serial). Default CPU-1.
+        row2.addWidget(QLabel('Cores:'))
+        self._cores_spin = QtWidgets.QSpinBox()
+        _ncpu = os.cpu_count() or 2
+        self._cores_spin.setRange(1, max(1, _ncpu))
+        self._cores_spin.setValue(max(1, _ncpu - 1))
+        self._cores_spin.setFixedHeight(28)
+        self._cores_spin.setToolTip(
+            'Worker processes for "Fit Cube" (1 = serial). Each spaxel\'s full\n'
+            'model fit (continuum + lines across all regions) runs on its own\n'
+            f'core. This machine reports {_ncpu} cores.')
+        row2.addWidget(self._cores_spin)
 
         row2.addWidget(_vsep())
 
@@ -7565,22 +7649,33 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         if isinstance(df_stellar, pd.DataFrame) and len(df_stellar) > 0 \
                 and 'spaxel_x' in df_stellar.columns:
             ny, nx = int(FITS_DATA.shape[-2]), int(FITS_DATA.shape[-1])
-            for scol, sname in [('stellar_V', 'stellar_vel'),
-                                ('stellar_sigma', 'stellar_sigma'),
-                                ('stellar_h3', 'stellar_h3'),
-                                ('stellar_h4', 'stellar_h4'),
-                                ('stellar_chi2', 'stellar_chi2')]:
-                if scol not in df_stellar.columns:
-                    continue
-                smap = np.full((ny, nx), np.nan)
-                for _, row in df_stellar.iterrows():
-                    smap[int(row['spaxel_y']), int(row['spaxel_x'])] = _safe_float(row.get(scol))
-                shdu = fits.ImageHDU(data=smap, name=sname)
-                try:
-                    shdu.header.update(wcs.to_header())
-                except Exception:
-                    pass
-                extensions.append(shdu)
+            # One map per (quantity, stellar region). With >1 region the HDU name
+            # is suffixed with the region id; a single region keeps the bare names.
+            if 'region_ID' in df_stellar.columns:
+                _srids = sorted(int(r) for r in df_stellar['region_ID'].dropna().unique())
+            else:
+                _srids = [None]
+            _multi = len(_srids) > 1
+            for srid in _srids:
+                _rows = (df_stellar if srid is None
+                         else df_stellar[df_stellar['region_ID'] == srid])
+                for scol, sname in [('stellar_V', 'stellar_vel'),
+                                    ('stellar_sigma', 'stellar_sigma'),
+                                    ('stellar_h3', 'stellar_h3'),
+                                    ('stellar_h4', 'stellar_h4'),
+                                    ('stellar_chi2', 'stellar_chi2')]:
+                    if scol not in df_stellar.columns:
+                        continue
+                    smap = np.full((ny, nx), np.nan)
+                    for _, row in _rows.iterrows():
+                        smap[int(row['spaxel_y']), int(row['spaxel_x'])] = _safe_float(row.get(scol))
+                    hduname = f'{sname}_r{srid}' if (_multi and srid is not None) else sname
+                    shdu = fits.ImageHDU(data=smap, name=hduname)
+                    try:
+                        shdu.header.update(wcs.to_header())
+                    except Exception:
+                        pass
+                    extensions.append(shdu)
 
         # Write all extensions to FITS file
         hdulist = fits.HDUList(extensions)
@@ -8017,229 +8112,45 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             print(f"QA-metrics warning: {type(e).__name__}: {e}")
         return out
 
-    def fit_spaxel(self,z,max_nfev=256,params_to_use=None):
-        global df_fit, df, df_cont
-        
-        if self.viewer_window.is_1d_spectrum == False:
-            spectrum = self.viewer_window.get_spectrum_at_spaxel(
-                self.viewer_window.current_spaxel[0], self.viewer_window.current_spaxel[1]
-            )
+    def fit_spaxel(self, z, max_nfev=256, params_to_use=None):
+        """Serial single-spaxel fit. Thin wrapper around the shared, Qt-free
+        kernel HyperCube_fit.fit_one_spaxel so the serial and parallel ("Fit
+        Cube") paths produce identical results. Appends result rows to the
+        global fit_results (used by single-spaxel fits and Rectify)."""
+        global fit_results
+        vw = self.viewer_window
+        cx, cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
+        if vw.is_1d_spectrum is False:
+            spectrum = vw.get_spectrum_at_spaxel(cx, cy)
         else:
             spectrum = FITS_DATA
-            
-        spectrum = np.nan_to_num(spectrum)
 
-        # ── Stellar baseline subtraction ───────────────────────────────────
-        # For any stellar (pPXF) region, subtract its fixed baseline so the
-        # emission-line Gaussians are fit to the residual (stellar held fixed).
-        # The baseline is zero outside each stellar region's wavelength range.
-        spectrum = spectrum - self._stellar_baseline_total(
-            self.viewer_window.current_spaxel)
-
-        # ── Flux rescaling ────────────────────────────────────────────────
-        # lmfit's Levenberg-Marquardt uses finite differences ~1e-8 * value
-        # for the Jacobian.  When flux values are ~1e-18, that step underflows
-        # to zero, making the Jacobian singular and all amplitude fits zero.
-        # Rescaling to order-unity before the fit and back afterward avoids this.
-        flux_scale = np.nanpercentile(np.abs(spectrum[spectrum != 0]), 95) if np.any(spectrum != 0) else 1.0
-        if flux_scale == 0 or not np.isfinite(flux_scale):
-            flux_scale = 1.0
-        spectrum_scaled = spectrum / flux_scale
-
-        # Scale amplitude params and their bounds
-        params_scaled = params_to_use.copy()
-        for pname, param in params_scaled.items():
-            # Skip derived (constrained) parameters: their value comes from an
-            # expression (e.g. amp2 = ratio * amp1) and scales with its
-            # reference automatically. Calling .set(value=...) on them would
-            # silently clear the expression and destroy the constraint.
-            if param.expr:
-                continue
-            if pname.startswith('amp'):
-                param.set(value=param.value / flux_scale)
-                if param.min is not None:
-                    param.min = param.min / flux_scale
-                if param.max is not None:
-                    param.max = param.max / flux_scale
-            elif pname.startswith('intercept'):
-                param.set(value=param.value / flux_scale)
-            elif pname.startswith('knoty'):
-                # Spline knot-Y are flux-level (like intercept): scale value and
-                # bounds into the rescaled-flux space for the fit.
-                param.set(value=param.value / flux_scale)
-                if param.min is not None and np.isfinite(param.min):
-                    param.min = param.min / flux_scale
-                if param.max is not None and np.isfinite(param.max):
-                    param.max = param.max / flux_scale
-            elif pname.startswith('polyc'):
-                # Chebyshev coefficients are linear in flux: scale all of them.
-                param.set(value=param.value / flux_scale)
-                if param.min is not None and np.isfinite(param.min):
-                    param.min = param.min / flux_scale
-                if param.max is not None and np.isfinite(param.max):
-                    param.max = param.max / flux_scale
-        # ─────────────────────────────────────────────────────────────────
-
-        # Constants for velocity calculation
-        c = 299792.458  # km/s
-        
-        # Perform the fit using lmfit (optionally sequential core→outflow).
+        # Stellar baseline for this spaxel (zeros if no stellar region). This
+        # also lazily recomputes/repopulates STELLAR_CACHE for the spaxel.
+        stellar_baseline = self._stellar_baseline_total((cx, cy))
         try:
-            if getattr(self, '_sequential_fit', False):
-                result = self._staged_fit(piecewise_model, spectrum_scaled,
-                                          params_scaled, wavelengths, max_nfev)
-            else:
-                result = piecewise_model.fit(spectrum_scaled, params_scaled, x=wavelengths, max_nfev=max_nfev)
+            _ra, _dec = vw.pixel_to_ra_dec(cx, cy)
+        except Exception:
+            _ra, _dec = np.nan, np.nan
 
-            # Per-spaxel calibrated goodness-of-fit metrics (computed once,
-            # merged into every line row below like the native rchisq).
-            qa = self._fit_quality_metrics(spectrum, wavelengths, result, flux_scale)
+        # Per-region stellar kinematics for the result rows (from the cache the
+        # baseline step just ensured).
+        stellar_kin = {}
+        if isinstance(df_cont, pd.DataFrame) and 'cont_type' in df_cont.columns:
+            for rid in df_cont.loc[df_cont['cont_type'] == 'stellar', 'region_ID']:
+                rid = int(np.int64(rid))
+                sc = STELLAR_CACHE.get((cx, cy, rid))
+                if sc is not None:
+                    stellar_kin[rid] = sc
 
-            # Map parameter prefixes to continuum regions
-            cont_map = {
-                f"x{i + 1}_start": i + 1 for i in range(len(df_cont))
-            }
-            
-            # Loop through each emission line in df
-            for line_idx, line in enumerate(df.itertuples(), start=1):
-                line_id = line.Line_ID
-                line_name = line.Line_Name
-                rest_wavelength = float(df.loc[df['Line_ID']==line_id, 'Rest Wavelength'].iloc[0])
-            
-                # Identify corresponding region for this line
-                region_id = line.region_ID
-                region_index = df_cont[df_cont['region_ID'] == region_id].index[0] + 1
-            
-                # Collect continuum model parameters
-                cont_params = {
-                    f'cont_region{region_index}_x_start': params_to_use[f'x{region_index}_start'].value,
-                    f'cont_region{region_index}_x_end': params_to_use[f'x{region_index}_end'].value,
-                    f'cont_region{region_index}_slope_init': params_to_use[f'slope{region_index}'].init_value,
-                    f'cont_region{region_index}_slope_fit': result.params[f'slope{region_index}'].value * flux_scale,
-                    f'cont_region{region_index}_intercept_init': params_to_use[f'intercept{region_index}'].init_value,
-                    f'cont_region{region_index}_intercept_fit': result.params[f'intercept{region_index}'].value * flux_scale
-                }
+        rows = HyperCube_fit.fit_one_spaxel(
+            spectrum, stellar_baseline, wavelengths, params_to_use,
+            piecewise_model, df, df_cont, z, max_nfev,
+            getattr(self, '_sequential_fit', False), (cx, cy), _ra, _dec,
+            stellar_kin)
+        fit_results.extend(rows)
 
-                # Record the continuum type and, for spline/poly regions, the
-                # fitted parameters (scaled back to physical flux units).
-                _nk = int(params_to_use[f'NK{region_index}'].value) if f'NK{region_index}' in params_to_use else 0
-                _np_ = int(params_to_use[f'NP{region_index}'].value) if f'NP{region_index}' in params_to_use else 0
-                # A stellar region (per the model df_cont) records as 'stellar'
-                # with its per-spaxel kinematics, not the placeholder linear params.
-                _mrow = df_cont[df_cont['region_ID'] == region_id]
-                _model_ctype = (str(_mrow.iloc[0]['cont_type'])
-                                if len(_mrow) and 'cont_type' in df_cont.columns else 'linear')
-                if _model_ctype == 'stellar':
-                    _ctype_out = 'stellar'
-                    _scache = STELLAR_CACHE.get(
-                        (int(self.viewer_window.current_spaxel[0]),
-                         int(self.viewer_window.current_spaxel[1]))) or {}
-                    cont_params[f'cont_region{region_index}_stellar_V'] = _safe_float(_scache.get('V'))
-                    cont_params[f'cont_region{region_index}_stellar_sigma'] = _safe_float(_scache.get('sigma'))
-                    cont_params[f'cont_region{region_index}_stellar_h3'] = _safe_float(_scache.get('h3'))
-                    cont_params[f'cont_region{region_index}_stellar_h4'] = _safe_float(_scache.get('h4'))
-                    cont_params[f'cont_region{region_index}_stellar_scale'] = _safe_float(_scache.get('scale'))
-                else:
-                    _ctype_out = 'poly' if _np_ >= 1 else ('spline' if _nk >= 2 else 'linear')
-                cont_params[f'cont_region{region_index}_cont_type'] = _ctype_out
-                if _np_ >= 1:
-                    cont_params[f'cont_region{region_index}_poly_degree'] = _np_ - 1
-                    cont_params[f'cont_region{region_index}_poly_coef_init'] = [
-                        params_to_use[f'polyc{region_index}_{j}'].init_value for j in range(_np_)]
-                    cont_params[f'cont_region{region_index}_poly_coef_fit'] = [
-                        result.params[f'polyc{region_index}_{j}'].value * flux_scale for j in range(_np_)]
-                if _nk >= 2:
-                    cont_params[f'cont_region{region_index}_knots_x'] = [
-                        params_to_use[f'knotx{region_index}_{k}'].value for k in range(_nk)]
-                    cont_params[f'cont_region{region_index}_knots_y_init'] = [
-                        params_to_use[f'knoty{region_index}_{k}'].init_value for k in range(_nk)]
-                    cont_params[f'cont_region{region_index}_knots_y_fit'] = [
-                        result.params[f'knoty{region_index}_{k}'].value * flux_scale for k in range(_nk)]
-            
-                # If there is an intermediate region, capture its parameters
-                if region_index < len(df_cont):
-                    cont_params.update({
-                        f'cont_region{region_index}_x_int_start': params_to_use[f'x_int_{region_index}_start'].value,
-                        f'cont_region{region_index}_x_int_end': params_to_use[f'x_int_{region_index}_end'].value,
-                        f'cont_region{region_index}_slope_int_init': params_to_use[f'slope_int_{region_index}'].init_value,
-                        f'cont_region{region_index}_slope_int_fit': result.params[f'slope_int_{region_index}'].value,
-                    })
-            
-                # Get parameter keys for this line
-                amp_key = f'amp{line_idx}'
-                cen_key = f'cen{line_idx}'
-                sigma_key = f'sigma{line_idx}'
-                
-                # Calculate velocities
-                if np.isfinite(rest_wavelength):
-                    # Initial velocity from initial parameters
-                    vel_init = c * ((params_to_use[cen_key].init_value / (rest_wavelength*(z+1))) - 1)
-                    # Fitted velocity from fitted parameters
-                    vel_fit = c * ((result.params[cen_key].value / (rest_wavelength*(z+1))) - 1)
-                    # Velocity from parameter if it exists
-                    # vel_param = result.params[vel_key].value if vel_key in result.params else vel_fit
-                    # vel_std = result.params[vel_key].stderr if vel_key in result.params else np.nan
-                else:
-                    vel_init = vel_fit = vel_param = vel_std = np.nan
-            
-                _ra, _dec = self.viewer_window.pixel_to_ra_dec(
-                    self.viewer_window.current_spaxel[0],
-                    self.viewer_window.current_spaxel[1]
-                )
-                fit_entry = {
-                    'spaxel_x': self.viewer_window.current_spaxel[0],
-                    'spaxel_y': self.viewer_window.current_spaxel[1],
-                    'RA': float(_ra),
-                    'Dec': float(_dec),
-                    'region_ID': region_id,
-                    'LineName': line_name,
-                    'LineID': line_id,
-            
-                    # Amplitude information
-                    'amp_init': params_to_use[amp_key].init_value,
-                    'amp_fit': result.params[amp_key].value * flux_scale,
-                    'amp_std': (result.params[amp_key].stderr or 0) * flux_scale,
-            
-                    # Centroid information
-                    'cen_init': params_to_use[cen_key].init_value,
-                    'cen_fit': result.params[cen_key].value,
-                    'cen_std': result.params[cen_key].stderr,
-                    
-                    # Velocity information
-                    'vel_init': vel_init,
-                    'vel_fit': vel_fit,
-                    # 'vel_param': vel_param,
-                    # 'vel_std': vel_std,
-                    'rest_wavelength': rest_wavelength,
-                    
-                    # Sigma (width) information
-                    'sigma_init': params_to_use[sigma_key].init_value,
-                    'sigma_fit': result.params[sigma_key].value,
-                    'sigma_std': result.params[sigma_key].stderr,
-            
-                    # Fit statistics
-                    'BIC': result.bic,
-                    'rchisq': result.redchi,
-                    'success': result.success
-                }
-            
-                # Add continuum parameters
-                fit_entry.update(cont_params)
-                # Add per-spaxel goodness-of-fit metrics
-                fit_entry.update(qa)
 
-                fit_results.append(fit_entry)
-    
-        except Exception as e:
-            fit_results.append({
-                'spaxel_x': self.viewer_window.current_spaxel[0],
-                'spaxel_y': self.viewer_window.current_spaxel[1],
-                'fit_success': False,
-                'error': str(e)
-            })
-            print(f"Fit error for spaxel {self.viewer_window.current_spaxel}: {type(e).__name__}: {e}")
-                
-            
 
     def calculate_snr_map(self, linewl, Nsigma, search_window_width=None, continuum_offset=None, continuum_width=None):
         """
@@ -8720,8 +8631,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             return
         self._fit_stellar_for_spaxel(dlg._settings)
 
-    def _fit_stellar_for_spaxel(self, settings):
-        """Run pPXF on the current spaxel and write a stellar continuum region."""
+    def _fit_stellar_for_spaxel(self, settings, target_rid=None):
+        """Run pPXF on the current spaxel and write a stellar continuum region.
+        target_rid=None appends a new region; otherwise the given region is refit."""
         global df_cont, STELLAR_CACHE, _STELLAR_LIBS
         from PyQt5.QtWidgets import QMessageBox, QApplication
         vw = self.viewer_window
@@ -8752,8 +8664,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-        STELLAR_CACHE[(cx, cy)] = res['cache']
-        rid = self._write_stellar_region(settings, res, fit_range)
+        rid = self._write_stellar_region(settings, res, fit_range, target_rid=target_rid)
+        STELLAR_CACHE[(cx, cy, int(rid))] = res['cache']
         # Clear any previous model curves so a re-fit doesn't leave stale ones.
         for ln in vw.spectrum_ax.lines[:]:
             if ln.get_label() != '_child0':
@@ -8763,17 +8675,25 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         if 'lineactor' in df_cont.columns:
             df_cont['lineactor'] = None
         self.rebuild_fit_panel(show_fit=False, x=cx, y=cy)
-        # Overplot the stellar baseline for this spaxel
-        if rid is not None:
-            vw.rebuild_plot(rid, from_file=True, show_init=True, show_fit=False, x=cx, y=cy)
-            vw.spectrum_canvas.draw_idle()
+        # Redraw EVERY region's overlay (all stellar baselines + any line regions),
+        # not just the new one — the clear above dropped all lineactors, so redrawing
+        # only `rid` would make previously-drawn stellar templates disappear and
+        # leave their lineactor None (which then breaks Gaussian placement on them).
+        for _rid in df_cont['region_ID'].astype(int).unique():
+            vw.rebuild_plot(int(_rid), from_file=True, show_init=True, show_fit=False, x=cx, y=cy)
+        vw.spectrum_canvas.draw_idle()
         vw._mark_init_guess_spaxel()
         print(f"Stellar fit ({settings['library']}) spaxel ({cx},{cy}): "
               f"V={res['V']:.1f}  σ={res['sigma']:.1f}  χ²/dof={res['chi2']:.2f}")
 
-    def _write_stellar_region(self, settings, res, fit_range):
-        """Create or replace the stellar continuum region in df_cont. Returns the
-        region_ID."""
+    def _write_stellar_region(self, settings, res, fit_range, target_rid=None):
+        """Write a stellar continuum region to df_cont and return its region_ID.
+
+        target_rid is None  → append a NEW stellar region (so several stellar
+                              templates can coexist on their own ranges, like
+                              linear/poly/spline regions).
+        target_rid given    → update that existing region in place (Refit Stellar).
+        """
         global df_cont
         for col, default in _STELLAR_COLS.items():
             if col not in df_cont.columns:
@@ -8792,18 +8712,24 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             'stellar_scale_fit': res['scale'], 'stellar_moments': settings['moments'],
             'stellar_chi2': res['chi2'],
         }
-        existing = (df_cont.index[df_cont['cont_type'] == 'stellar']
-                    if 'cont_type' in df_cont.columns and len(df_cont) else [])
-        if len(existing) > 0:
-            idx = existing[0]
-            rid = df_cont.at[idx, 'region_ID']
-            for k, val in vals.items():
-                df_cont.at[idx, k] = val
-            return int(np.int64(rid))
-        rid = len(df_cont)
+        # Refit: update the targeted region in place.
+        if target_rid is not None:
+            match = df_cont.index[np.int64(df_cont['region_ID']) == np.int64(target_rid)]
+            if len(match) > 0:
+                idx = match[0]
+                for k, val in vals.items():
+                    df_cont.at[idx, k] = val
+                return int(np.int64(target_rid))
+        # Otherwise append a brand-new stellar region. Use max+1 (not len) so the
+        # id stays unique even after regions have been deleted (ids aren't renumbered).
+        rid = (int(np.int64(df_cont['region_ID']).max()) + 1
+               if len(df_cont) and 'region_ID' in df_cont.columns else 0)
         vals['region_ID'] = rid
         # Column-dict construction wraps list/None values as single object cells.
         df_new = pd.DataFrame({k: [v] for k, v in vals.items()})
+        # Preserve the canonical column order (region_ID stays at its usual index)
+        # even when df_cont started empty — add_continuum_buttons relies on it.
+        df_new = df_new.reindex(columns=df_cont.columns)
         df_cont = df_new if len(df_cont) == 0 else pd.concat([df_cont, df_new], ignore_index=True)
         return int(rid)
 
@@ -8820,7 +8746,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             fit_range=(float(r['x1']), float(r['x2'])),
             moments=int(r['stellar_moments']) if pd.notna(r.get('stellar_moments')) else 2,
             degree=-1, mdegree=10, sigma_guess=150.0, mask_lines=True)
-        self._fit_stellar_for_spaxel(settings)
+        self._fit_stellar_for_spaxel(settings, target_rid=int(np.int64(regionID)))
 
     def fit_stellar_cube(self):
         try:
@@ -8854,33 +8780,183 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     def _end_progress(self):
         self.fit_progress_frame.setVisible(False)
 
+    # ── Cube-fit parallelism ────────────────────────────────────────────────
+    def _fit_worker_count(self):
+        """Number of parallel fit-worker processes (1 = serial). Reads the
+        'Cores' spinbox if present, else defaults to CPU-1."""
+        default = max(1, (os.cpu_count() or 2) - 1)
+        spin = getattr(self, '_cores_spin', None)
+        try:
+            return int(spin.value()) if spin is not None else default
+        except Exception:
+            return default
+
+    def _fit_cube_serial(self, gated, params, z, progress_bar, status_label, total):
+        """Serial per-spaxel fit over `gated` spaxels (the fallback path and the
+        correctness oracle). Returns the list of stellar-kinematics rows; line
+        rows are appended to the global fit_results by fit_spaxel."""
+        from PyQt5.QtWidgets import QApplication
+        _stellar_preps = self._stellar_cube_prep()
+        _stellar_rows, done = [], 0
+        for (i, j) in gated:
+            if self._fit_cancelled:
+                break
+            if self.fit_progress_frame.isVisible() and psutil.virtual_memory().percent > 80:
+                QApplication.processEvents()
+            self.viewer_window.current_spaxel = (i, j)
+            for _prep in _stellar_preps:
+                _srow = self._stellar_fit_one(i, j, _prep)
+                if _srow is not None:
+                    _stellar_rows.append(_srow)
+            self.fit_spaxel(z, max_nfev=512, params_to_use=params)
+            done += 1
+            progress_bar.setValue(done)
+            status_label.setText(f"Fitting spaxel {done} / {total}")
+            QApplication.processEvents()
+            if done % 500 == 0 and psutil.virtual_memory().percent > 80:
+                gc.collect()
+        return _stellar_rows
+
+    def _fit_cube_parallel(self, gated, params, z, n_regions, n_lines, n_workers,
+                           progress_bar, status_label, total):
+        """Fit `gated` spaxels across `n_workers` processes. Line rows are
+        appended to the global fit_results; returns the stellar-kinematics rows.
+
+        The cube is shared read-only via shared memory; the constant context
+        (params, df/df_cont, model spec, stellar specs) is pickled once per
+        worker. Workers compute each spaxel's stellar fit + baseline and the
+        full line fit, returning only small row dicts (kinematics-only — no
+        per-spaxel optimal templates; those recompute lazily on view)."""
+        global fit_results
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from PyQt5.QtWidgets import QApplication
+
+        cube = np.ascontiguousarray(FITS_DATA)
+        shm = shared_memory.SharedMemory(create=True, size=int(cube.nbytes))
+        try:
+            shm_arr = np.ndarray(cube.shape, dtype=cube.dtype, buffer=shm.buf)
+            shm_arr[:] = cube[:]
+
+            # Lightweight stellar region specs (workers load/prepare the libs).
+            stellar_specs, stellar_mask = [], ()
+            if 'cont_type' in df_cont.columns:
+                for _, r in df_cont[df_cont['cont_type'] == 'stellar'].iterrows():
+                    stellar_specs.append(dict(
+                        rid=int(np.int64(r['region_ID'])),
+                        library=str(r['stellar_library']),
+                        fit_range=(float(r['x1']), float(r['x2'])),
+                        moments=int(r['stellar_moments']) if pd.notna(r.get('stellar_moments')) else 2))
+                if stellar_specs and len(df) > 0 and 'Centroid_0' in df.columns:
+                    stellar_mask = df['Centroid_0'].astype(float).to_numpy()
+
+            R = _safe_float(df_obs.loc[0, 'resolvingpower']) if len(df_obs) else np.nan
+            R = 3000.0 if not np.isfinite(R) or R <= 0 else R
+
+            # Strip unpicklable matplotlib actor columns before shipping df/df_cont.
+            df_w = df.drop(columns=['curveactor'], errors='ignore').copy()
+            df_cont_w = df_cont.drop(columns=['lineactor'], errors='ignore').copy()
+
+            ctx = dict(
+                shm_name=shm.name, shape=tuple(cube.shape), dtype=str(cube.dtype),
+                wavelengths=np.asarray(wavelengths, float),
+                params_dumps=params.dumps(), n_regions=int(n_regions),
+                n_lines=int(n_lines), df=df_w, df_cont=df_cont_w, z=z, R=R,
+                sequential=bool(getattr(self, '_sequential_fit', False)),
+                max_nfev=512, stellar_specs=stellar_specs, stellar_mask=stellar_mask)
+
+            # Precompute RA/Dec for all gated spaxels (keeps WCS out of workers).
+            xs = np.array([ij[0] for ij in gated])
+            ys = np.array([ij[1] for ij in gated])
+            try:
+                ras, decs = self.viewer_window.pixel_to_ra_dec(xs, ys)
+                ras = np.atleast_1d(ras); decs = np.atleast_1d(decs)
+            except Exception:
+                ras = np.full(len(gated), np.nan); decs = np.full(len(gated), np.nan)
+            tasks = [(int(xs[k]), int(ys[k]), float(ras[k]), float(decs[k]))
+                     for k in range(len(gated))]
+
+            print(f"Parallel Fit Cube: {len(tasks)} spaxels across {n_workers} workers")
+            mpctx = mp.get_context('spawn')
+            _stellar_rows, done = [], 0
+            # Pin BLAS to 1 thread per worker so N workers don't oversubscribe the
+            # cores. Spawned children inherit the env (workers spawn lazily on the
+            # first submit), so keep it pinned for the whole pool lifetime and
+            # restore afterwards — setting it inside the worker is too late because
+            # numpy/OpenBLAS read it at import.
+            _thr_vars = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+                         'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS')
+            _thr_saved = {k: os.environ.get(k) for k in _thr_vars}
+            for k in _thr_vars:
+                os.environ[k] = '1'
+            try:
+                ex = ProcessPoolExecutor(max_workers=n_workers, mp_context=mpctx,
+                                         initializer=HyperCube_fit._worker_init,
+                                         initargs=(ctx,))
+                try:
+                    futures = [ex.submit(HyperCube_fit._worker_fit_one, t) for t in tasks]
+                    for fut in as_completed(futures):
+                        if self._fit_cancelled:
+                            break
+                        try:
+                            line_rows, srows = fut.result()
+                        except Exception as e:
+                            print(f"worker task error: {type(e).__name__}: {e}")
+                            line_rows, srows = [], []
+                        fit_results.extend(line_rows)
+                        _stellar_rows.extend(srows)
+                        done += 1
+                        if done % 16 == 0 or done == len(tasks):
+                            progress_bar.setValue(done)
+                            status_label.setText(f"Fitting spaxel {done} / {total}")
+                            QApplication.processEvents()
+                finally:
+                    ex.shutdown(wait=not self._fit_cancelled, cancel_futures=True)
+            finally:
+                for k, v in _thr_saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            return _stellar_rows
+        finally:
+            shm.close()
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+
     def _stellar_cube_prep(self):
-        """Prepare a per-spaxel stellar fit across the cube. Returns a dict
-        (lib, velscale, z, R, mask, moments, fit_range) or None if there is no
-        stellar region / pPXF is unavailable."""
+        """Prepare a per-spaxel stellar fit across the cube. Returns a LIST of
+        prep dicts (one per stellar region, each carrying its own region_ID/lib/
+        velscale/fit_range/moments), or [] if there is no stellar region /
+        pPXF is unavailable."""
         if hcppxf is None or FITS_DATA is None:
-            return None
+            return []
         sreg = (df_cont[df_cont['cont_type'] == 'stellar']
                 if isinstance(df_cont, pd.DataFrame) and 'cont_type' in df_cont.columns
                 else None)
         if sreg is None or len(sreg) == 0:
-            return None
-        r = sreg.iloc[0]
-        library = str(r['stellar_library'])
-        fit_range = (float(r['x1']), float(r['x2']))
-        moments = int(r['stellar_moments']) if pd.notna(r.get('stellar_moments')) else 2
+            return []
         z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
         z = 0.0 if not np.isfinite(z) else z
         R = _safe_float(df_obs.loc[0, 'resolvingpower']) if len(df_obs) else np.nan
         R = 3000.0 if not np.isfinite(R) or R <= 0 else R
-        velscale, lam_rest = hcppxf.galaxy_velscale(wavelengths, z, fit_range)
-        lib = _STELLAR_LIBS.get(library) or hcppxf.TemplateLibrary(library).load()
-        _STELLAR_LIBS[library] = lib
-        lib.prepare(velscale, R, lam_rest)
         mask = (df['Centroid_0'].astype(float).to_numpy()
                 if len(df) > 0 and 'Centroid_0' in df.columns else ())
-        return dict(lib=lib, velscale=velscale, z=z, R=R, mask=mask,
-                    moments=moments, fit_range=fit_range, library=library)
+        preps = []
+        for _, r in sreg.iterrows():
+            library = str(r['stellar_library'])
+            fit_range = (float(r['x1']), float(r['x2']))
+            moments = int(r['stellar_moments']) if pd.notna(r.get('stellar_moments')) else 2
+            velscale, lam_rest = hcppxf.galaxy_velscale(wavelengths, z, fit_range)
+            lib = _STELLAR_LIBS.get(library) or hcppxf.TemplateLibrary(library).load()
+            _STELLAR_LIBS[library] = lib
+            lib.prepare(velscale, R, lam_rest)
+            preps.append(dict(rid=int(np.int64(r['region_ID'])), lib=lib,
+                              velscale=velscale, z=z, R=R, mask=mask,
+                              moments=moments, fit_range=fit_range, library=library))
+        return preps
 
     def _stellar_fit_one(self, i, j, prep):
         """pPXF for one spaxel; caches the optimal template and returns a
@@ -8896,12 +8972,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 sigma_guess=150.0, velscale=prep['velscale'])
         except Exception:
             return None
-        STELLAR_CACHE[(i, j)] = res['cache']
+        STELLAR_CACHE[(i, j, int(prep['rid']))] = res['cache']
         try:
             ra, dec = vw.pixel_to_ra_dec(i, j)
         except Exception:
             ra, dec = np.nan, np.nan
-        return {'spaxel_x': i, 'spaxel_y': j, 'RA': float(ra), 'Dec': float(dec),
+        return {'spaxel_x': i, 'spaxel_y': j, 'region_ID': int(prep['rid']),
+                'RA': float(ra), 'Dec': float(dec),
                 'stellar_V': res['V'], 'stellar_sigma': res['sigma'],
                 'stellar_h3': res['h3'], 'stellar_h4': res['h4'],
                 'stellar_scale': res['scale'], 'stellar_chi2': res['chi2'],
@@ -8912,14 +8989,15 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         (stellar kinematics only — no emission lines)."""
         global df_stellar
         from PyQt5.QtWidgets import QMessageBox, QApplication
-        prep = self._stellar_cube_prep()
-        if prep is None:
+        preps = self._stellar_cube_prep()
+        if not preps:
             QMessageBox.warning(self, 'Stellar Cube Fit',
                                 'Add a stellar template to a spaxel first.')
             return
         nx, ny = FITS_DATA.shape[2], FITS_DATA.shape[1]
         smap = globals().get('snr_map', None)
-        total = int(np.sum(smap >= snr_value)) if smap is not None else nx * ny
+        nspax = int(np.sum(smap >= snr_value)) if smap is not None else nx * ny
+        total = nspax * len(preps)
         self._begin_progress(total, 'Stellar fit')
 
         rows, done = [], 0
@@ -8929,13 +9007,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     break
                 if smap is not None and smap[j, i] < snr_value:
                     continue
-                row = self._stellar_fit_one(i, j, prep)
-                if row is None:
-                    continue
-                rows.append(row)
-                done += 1
-                if done % 10 == 0:
-                    self._update_progress(done, f"Stellar fit {done} / {total}")
+                for prep in preps:
+                    row = self._stellar_fit_one(i, j, prep)
+                    done += 1
+                    if row is not None:
+                        rows.append(row)
+                    if done % 10 == 0:
+                        self._update_progress(done, f"Stellar fit {done} / {total}")
             if self._fit_cancelled:
                 break
 
@@ -8946,17 +9024,21 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         if len(df_stellar) == 0:
             QMessageBox.information(self, 'Stellar Cube Fit', 'No spaxels fit.')
 
-    def _current_stellar_kin(self):
-        """(V, σ) for the current spaxel from its cache, df_stellar, else NaN."""
+    def _current_stellar_kin(self, rid=None):
+        """(V, σ) for the current spaxel's stellar region `rid`, from its cache,
+        df_stellar, else NaN."""
         vw = self.viewer_window
         if vw is None or vw.current_spaxel is None:
             return np.nan, np.nan
-        key = (int(vw.current_spaxel[0]), int(vw.current_spaxel[1]))
-        cache = STELLAR_CACHE.get(key)
-        if cache is not None and 'V' in cache:
-            return _safe_float(cache.get('V')), _safe_float(cache.get('sigma'))
+        x, y = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
+        if rid is not None:
+            cache = STELLAR_CACHE.get((x, y, int(rid)))
+            if cache is not None and 'V' in cache:
+                return _safe_float(cache.get('V')), _safe_float(cache.get('sigma'))
         if isinstance(df_stellar, pd.DataFrame) and len(df_stellar) and 'spaxel_x' in df_stellar.columns:
-            sr = df_stellar[(df_stellar['spaxel_x'] == key[0]) & (df_stellar['spaxel_y'] == key[1])]
+            sr = df_stellar[(df_stellar['spaxel_x'] == x) & (df_stellar['spaxel_y'] == y)]
+            if rid is not None and 'region_ID' in df_stellar.columns:
+                sr = sr[sr['region_ID'] == int(rid)]
             if len(sr):
                 return _safe_float(sr.iloc[0].get('stellar_V')), _safe_float(sr.iloc[0].get('stellar_sigma'))
         return np.nan, np.nan
@@ -8966,9 +9048,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         values (called on cursor move so they track the hovered spaxel)."""
         if 'cont_type' not in df_cont.columns:
             return
-        cur_V, cur_sig = self._current_stellar_kin()
         for rid in df_cont.loc[df_cont['cont_type'] == 'stellar', 'region_ID']:
             rid = int(np.int64(rid))
+            cur_V, cur_sig = self._current_stellar_kin(rid)
             b = self.buttons_dict.get((rid, 'stellar~vmap'))
             if b is not None:
                 b.setText(_fmt(cur_V))
@@ -8976,16 +9058,24 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             if b is not None:
                 b.setText(_fmt(cur_sig))
 
-    def _stellar_map(self, col):
-        """Display a per-spaxel stellar map (e.g. stellar_V / stellar_sigma)."""
+    def _stellar_map(self, col, rid=None):
+        """Display a per-spaxel stellar map (e.g. stellar_V / stellar_sigma) for
+        stellar region `rid` (None = all rows, for back-compat)."""
         from PyQt5.QtWidgets import QMessageBox
         if not isinstance(df_stellar, pd.DataFrame) or len(df_stellar) == 0:
             QMessageBox.information(self, 'Stellar Map',
                                     'Run "Fit Stellar (Cube)" first.')
             return
+        rows = df_stellar
+        if rid is not None and 'region_ID' in df_stellar.columns:
+            rows = df_stellar[df_stellar['region_ID'] == int(rid)]
+        if len(rows) == 0:
+            QMessageBox.information(self, 'Stellar Map',
+                                    'No stellar fit for this region yet.')
+            return
         ny, nx = FITS_DATA.shape[1], FITS_DATA.shape[2]
         arr = np.full((ny, nx), np.nan)
-        for _, row in df_stellar.iterrows():
+        for _, row in rows.iterrows():
             arr[int(row['spaxel_y']), int(row['spaxel_x'])] = _safe_float(row.get(col))
         cmap = 'bwr' if col == 'stellar_V' else 'plasma'
         self.viewer_window.draw_image(arr, cmap=cmap, scale='linear', from_fits=False)
@@ -9492,39 +9582,40 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             # df_fit = pd.concat([df_fit, new_results], ignore_index=True)
             
         else:
-            # If a stellar region exists, fit pPXF per spaxel first (so the line
-            # fit sees each spaxel's own stellar baseline subtracted), and build
-            # the stellar V/σ maps in the SAME pass — one "Fit Cube" does both.
-            _stellar_prep = self._stellar_cube_prep()
-            _stellar_rows = []
+            # Normal fit over all SNR-gated spaxels. Each spaxel is a full-model
+            # fit (continuum of any type + lines across N regions). Distributed
+            # across worker processes when Cores > 1; otherwise serial. Any stellar
+            # region is fit per spaxel in the same pass (kinematics → V/σ maps;
+            # baseline subtracted before the line fit).
             self._fit_cancelled = False
-            # Normal fitting procedure for all spaxels
-            for i in range(nx):
-                for j in range(ny):
-                    if snr_map[j,i] >= snr_value:
-                        if self._fit_cancelled:
-                            break
-                        if self.fit_progress_frame.isVisible() and psutil.virtual_memory().percent > 80:
-                            QApplication.processEvents()
+            _has_stellar = ('cont_type' in df_cont.columns and
+                            bool((df_cont['cont_type'] == 'stellar').any()))
+            gated = [(i, j) for i in range(nx) for j in range(ny)
+                     if snr_map[j, i] >= snr_value]
+            total = max(len(gated), 1)
+            progress_bar.setRange(0, total)
+            progress_bar.setValue(0)
+            n_workers = self._fit_worker_count()
 
-                        self.viewer_window.current_spaxel = (i, j)
-                        if _stellar_prep is not None:
-                            _srow = self._stellar_fit_one(i, j, _stellar_prep)
-                            if _srow is not None:
-                                _stellar_rows.append(_srow)
-                        self.fit_spaxel(z, max_nfev=512, params_to_use=params)
+            if (n_workers > 1 and len(gated) > 1
+                    and not self.viewer_window.is_1d_spectrum):
+                try:
+                    _stellar_rows = self._fit_cube_parallel(
+                        gated, params, z, Nregions, Nlines, n_workers,
+                        progress_bar, status_label, total)
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"Parallel fit failed ({type(e).__name__}: {e}); "
+                          f"falling back to serial.")
+                    fit_results.clear()
+                    _stellar_rows = self._fit_cube_serial(
+                        gated, params, z, progress_bar, status_label, total)
+            else:
+                _stellar_rows = self._fit_cube_serial(
+                    gated, params, z, progress_bar, status_label, total)
 
-                        current_spaxel = i * ny + j + 1
-                        progress_bar.setValue(current_spaxel)
-                        status_label.setText(f"Fitting spaxel {current_spaxel} / {total_spaxels}")
-                        QApplication.processEvents()
-
-                        if current_spaxel % 500 == 0 and psutil.virtual_memory().percent > 80:
-                            gc.collect()
-                if self._fit_cancelled:
-                    break
-
-            if _stellar_prep is not None:
+            if _has_stellar:
                 df_stellar = pd.DataFrame(_stellar_rows)
             # After fitting, create the results dataframe
             df_fit = pd.DataFrame(fit_results)
@@ -11024,8 +11115,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             cx = cy = 0
             if vw.current_spaxel is not None:
                 cx, cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
-            # Push the edit into this spaxel's cache so the baseline reflects it.
-            _cache = STELLAR_CACHE.get((cx, cy))
+            # Push the edit into this spaxel/region's cache so the baseline reflects it.
+            # Ensure the cache exists first (parallel fits store kinematics only).
+            vw._ensure_stellar_cache(cx, cy, int(np.int64(frame_id)))
+            _cache = STELLAR_CACHE.get((cx, cy, int(np.int64(frame_id))))
             if _cache is not None:
                 _ckey = {'stellar_V_0': 'V', 'stellar_sigma_0': 'sigma',
                          'stellar_scale_0': 'scale', 'stellar_h3_0': 'h3',
