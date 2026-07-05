@@ -49,6 +49,17 @@ def eval_poly(coefs, x1, x2, x):
         return np.full_like(x, c[0])
     return np.polynomial.Chebyshev(c, domain=[float(x1), float(x2)])(x)
 
+def eval_power_law(slope, amp, x):
+    """Evaluate a power law. 
+    """
+
+    x = np.asarray(x, dtype=float)
+
+    # set the pivot wavelength to half of the wavelength range    
+    x_p = 0.5 * ( x.max() + x.min() )
+
+    return amp * (x/x_p) ** slope
+
 # Vectorized Gaussian computation
 def sum_gaussians(x, params, num_gaussians):
     if num_gaussians == 0:
