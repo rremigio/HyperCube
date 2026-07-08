@@ -51,6 +51,11 @@ try:
 except Exception as _e:
     hcppxf = None
     print(f"pPXF stellar fitting unavailable: {_e}")
+try:
+    import HyperCube_FeII as hcfeii
+except Exception as _e:
+    hcfeii = None
+    print(f"Fe II templates unavailable: {_e}")
 
 
 
@@ -106,6 +111,52 @@ _STELLAR_COLS = {
     'stellar_h4_fit': np.nan, 'stellar_scale_fit': np.nan, 'stellar_moments': 2,
     'stellar_chi2': np.nan,
 }
+
+# Prepared Fe II templates, keyed by (name, round(velscale,4), round(z,6)) so a
+# re-fit at the same velscale/z reuses the log-rebinned template (mirrors _STELLAR_LIBS).
+_FEII_TEMPLATES = {}
+
+# Columns a power-law continuum region adds to df_cont. Amplitude is anchored at
+# the region midpoint (pivot); slope is dimensionless. No per-spaxel cache.
+_POWERLAW_COLS = {
+    'pl_amp_0': np.nan, 'pl_slope_0': np.nan,
+    'pl_amp_fit': np.nan, 'pl_slope_fit': np.nan,
+}
+
+# Columns an Fe II template continuum region adds to df_cont. amp scales the
+# normalized template; v (km/s) shifts it; sigma (km/s) broadens it.
+_FEII_COLS = {
+    'feii_template': '', 'feii_amp_0': np.nan, 'feii_v_0': np.nan,
+    'feii_sigma_0': np.nan, 'feii_amp_fit': np.nan, 'feii_v_fit': np.nan,
+    'feii_sigma_fit': np.nan,
+}
+
+
+def _prepare_feii_template(name, z, fit_range):
+    """Load + log-rebin an Fe II template for (name, velscale, z) and cache it.
+
+    velscale is derived from the cube wavelengths over fit_range (reusing pPXF's
+    galaxy_velscale). Returns a prepared HyperCube_FeII.FeIITemplate, or None if
+    the Fe II module is unavailable or the load fails."""
+    if hcfeii is None or not name:
+        return None
+    try:
+        z = float(z) if np.isfinite(_safe_float(z)) else 0.0
+        if hcppxf is not None:
+            velscale, _ = hcppxf.galaxy_velscale(wavelengths, z, fit_range)
+        else:
+            # Fallback: median km/s per pixel over the fit range.
+            lam = np.asarray(wavelengths, float) / (1.0 + z)
+            velscale = float(np.median(np.diff(lam)) / np.median(lam) * hcfeii.C_KMS)
+        key = (name, round(float(velscale), 4), round(float(z), 6))
+        tmpl = _FEII_TEMPLATES.get(key)
+        if tmpl is None:
+            tmpl = hcfeii.FeIITemplate(name).load_and_prepare(velscale, z)
+            _FEII_TEMPLATES[key] = tmpl
+        return tmpl
+    except Exception as e:
+        print(f"Fe II template prep failed ({name}): {type(e).__name__}: {e}")
+        return None
 
 global spectrum
 
@@ -3088,6 +3139,11 @@ class ViewerWindow(QMainWindow):
         df_obs      = session.get('df_obs', df_obs)
         df          = session.get('df', df)
         df_cont     = session.get('df_cont', df_cont)
+        # Backfill power-law / Fe II columns for sessions saved before they existed.
+        if isinstance(df_cont, pd.DataFrame):
+            for _c, _d in {**_POWERLAW_COLS, **_FEII_COLS}.items():
+                if _c not in df_cont.columns:
+                    df_cont[_c] = _d
         df_fit      = session.get('df_fit', df_fit)
         fit_results = session.get('fit_results', fit_results)
         if session.get('snr_map') is not None:
@@ -5006,6 +5062,30 @@ class ViewerWindow(QMainWindow):
             cfit = _as_float_list(region['poly_coef_fit'].item()) if 'poly_coef_fit' in region.columns else []
             coefs = cfit if (use_fit and len(cfit) > 0) else c0
             return self._eval_poly(coefs, x1, x2, x_vals)
+        if ctype == 'powerlaw':
+            x1 = float(region['x1'].item()); x2 = float(region['x2'].item())
+            pivot = 0.5 * (x1 + x2)
+            _sfx = '_fit' if use_fit else '_0'
+            amp = _safe_float(region[f'pl_amp{_sfx}'].item()) if f'pl_amp{_sfx}' in region.columns else np.nan
+            slope = _safe_float(region[f'pl_slope{_sfx}'].item()) if f'pl_slope{_sfx}' in region.columns else np.nan
+            if not np.isfinite(amp) or not np.isfinite(slope):
+                return np.zeros_like(x_vals)
+            return HyperCube_ModelFunctions.eval_power_law(slope, amp, x_vals, pivot)
+        if ctype == 'feii':
+            x1 = float(region['x1'].item()); x2 = float(region['x2'].item())
+            name = str(region['feii_template'].item()) if 'feii_template' in region.columns else ''
+            _sfx = '_fit' if use_fit else '_0'
+            amp = _safe_float(region[f'feii_amp{_sfx}'].item()) if f'feii_amp{_sfx}' in region.columns else np.nan
+            v = _safe_float(region[f'feii_v{_sfx}'].item()) if f'feii_v{_sfx}' in region.columns else np.nan
+            sig = _safe_float(region[f'feii_sigma{_sfx}'].item()) if f'feii_sigma{_sfx}' in region.columns else np.nan
+            if not (np.isfinite(amp) and np.isfinite(v) and np.isfinite(sig)):
+                return np.zeros_like(x_vals)
+            z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
+            z = 0.0 if not np.isfinite(z) else z
+            tmpl = _prepare_feii_template(name, z, (x1, x2))
+            if tmpl is None:
+                return np.zeros_like(x_vals)
+            return np.nan_to_num(tmpl.eval(x_vals, amp, v, sig))
         # Linear
         if use_fit:
             m = np.float64(region['Slope_fit'].item()); b = np.float64(region['Intercept_fit'].item())
@@ -5189,6 +5269,25 @@ class ViewerWindow(QMainWindow):
                     ky = _as_float_list(region.iloc[0][_pfx + "knots_y_fit"])
                     self.m, self.b = np.nan, np.nan
                     y_line = self._eval_spline(kx, ky, x_vals)
+                elif _ctype == 'powerlaw':
+                    self.m, self.b = np.nan, np.nan
+                    amp = _safe_float(region.iloc[0].get(_pfx + "pl_amp_fit"))
+                    slope = _safe_float(region.iloc[0].get(_pfx + "pl_slope_fit"))
+                    pivot = 0.5 * (self.x1 + self.x2)
+                    y_line = (HyperCube_ModelFunctions.eval_power_law(slope, amp, x_vals, pivot)
+                              if np.isfinite(amp) and np.isfinite(slope) else np.zeros_like(x_vals))
+                elif _ctype == 'feii':
+                    self.m, self.b = np.nan, np.nan
+                    name = str(_model_reg.iloc[0].get('feii_template', '') or '')
+                    amp = _safe_float(region.iloc[0].get(_pfx + "feii_amp_fit"))
+                    v = _safe_float(region.iloc[0].get(_pfx + "feii_v_fit"))
+                    sig = _safe_float(region.iloc[0].get(_pfx + "feii_sigma_fit"))
+                    z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
+                    z = 0.0 if not np.isfinite(z) else z
+                    tmpl = _prepare_feii_template(name, z, (self.x1, self.x2))
+                    y_line = (np.nan_to_num(tmpl.eval(x_vals, amp, v, sig))
+                              if (tmpl is not None and np.isfinite(amp) and np.isfinite(v)
+                                  and np.isfinite(sig)) else np.zeros_like(x_vals))
                 else:
                     self.m = np.float64(region.iloc[0][_pfx + "slope_fit"].item())
                     self.b = np.float64(region.iloc[0][_pfx + "intercept_fit"].item())
@@ -5923,6 +6022,75 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         grid_layout.addWidget(del_btn, 1, ncol + 4)
         self.buttons_dict[(regionID, 'continuum_delete')] = del_btn
 
+    def _add_powerlaw_continuum_buttons(self, regionID, grid_layout):
+        """Compact panel for a power-law continuum region: name, type, x-range,
+        editable amp / slope initial guesses, delete."""
+        reg = df_cont.loc[df_cont['region_ID'] == regionID]
+        if len(reg) == 0:
+            return
+        r = reg.iloc[0]
+        cells = [('Name', 'continuum~Continuum Name', str(r['Continuum Name']), True),
+                 ('Type', 'continuum~cont_type', 'powerlaw', False),
+                 ('x1', 'continuum~x1', _fmt(r['x1']), False),
+                 ('x2', 'continuum~x2', _fmt(r['x2']), False),
+                 ('amp', 'powerlaw~pl_amp_0', _fmt(r.get('pl_amp_0')), True),
+                 ('slope', 'powerlaw~pl_slope_0', _fmt(r.get('pl_slope_0')), True)]
+        for c, (lbl, key, txt, editable) in enumerate(cells):
+            grid_layout.addWidget(QLabel(lbl), 0, c)
+            b = FrameButton(txt, 0, c, regionID, key)
+            if editable:
+                b.clicked.connect(partial(self.on_button_click, data_frame=df_cont,
+                                          frame_id=regionID, button_name=key))
+            else:
+                b.setDisabled(True)
+            grid_layout.addWidget(b, 1, c)
+            self.buttons_dict[(regionID, key)] = b
+        ncol = len(cells)
+        del_btn = FrameButton('x', 0, ncol, regionID, 'continuum_delete')
+        del_btn.setStyleSheet("background-color: lightcoral; color: black;")
+        if self._edit_mode():
+            del_btn.setEnabled(False)
+            del_btn.setToolTip('Disabled while editing a single spaxel (schema is locked)')
+        else:
+            del_btn.clicked.connect(partial(self.on_deleteregion_button_click, frame_id=regionID))
+        grid_layout.addWidget(del_btn, 1, ncol)
+        self.buttons_dict[(regionID, 'continuum_delete')] = del_btn
+
+    def _add_feii_continuum_buttons(self, regionID, grid_layout):
+        """Compact panel for an Fe II template continuum region: name, type,
+        template, editable amp / v / σ initial guesses, delete."""
+        reg = df_cont.loc[df_cont['region_ID'] == regionID]
+        if len(reg) == 0:
+            return
+        r = reg.iloc[0]
+        tmpl = str(r.get('feii_template', '') or '')
+        cells = [('Name', 'continuum~Continuum Name', str(r['Continuum Name']), True),
+                 ('Type', 'continuum~cont_type', 'feii', False),
+                 ('Template', 'continuum~feii_template', tmpl, False),
+                 ('amp', 'feii~feii_amp_0', _fmt(r.get('feii_amp_0')), True),
+                 ('v (km/s)', 'feii~feii_v_0', _fmt(r.get('feii_v_0')), True),
+                 ('σ (km/s)', 'feii~feii_sigma_0', _fmt(r.get('feii_sigma_0')), True)]
+        for c, (lbl, key, txt, editable) in enumerate(cells):
+            grid_layout.addWidget(QLabel(lbl), 0, c)
+            b = FrameButton(txt, 0, c, regionID, key)
+            if editable:
+                b.clicked.connect(partial(self.on_button_click, data_frame=df_cont,
+                                          frame_id=regionID, button_name=key))
+            else:
+                b.setDisabled(True)
+            grid_layout.addWidget(b, 1, c)
+            self.buttons_dict[(regionID, key)] = b
+        ncol = len(cells)
+        del_btn = FrameButton('x', 0, ncol, regionID, 'continuum_delete')
+        del_btn.setStyleSheet("background-color: lightcoral; color: black;")
+        if self._edit_mode():
+            del_btn.setEnabled(False)
+            del_btn.setToolTip('Disabled while editing a single spaxel (schema is locked)')
+        else:
+            del_btn.clicked.connect(partial(self.on_deleteregion_button_click, frame_id=regionID))
+        grid_layout.addWidget(del_btn, 1, ncol)
+        self.buttons_dict[(regionID, 'continuum_delete')] = del_btn
+
     def _edit_poly_degree(self, regionID):
         """Dialog to change a polynomial region's degree; re-seeds the Chebyshev
         coefficients by re-fitting the displayed spectrum over the region range."""
@@ -6067,12 +6235,20 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         if _rtype == 'stellar':
             self._add_stellar_continuum_buttons(regionID, grid_layout)
             return
+        if _rtype == 'powerlaw':
+            self._add_powerlaw_continuum_buttons(regionID, grid_layout)
+            return
+        if _rtype == 'feii':
+            self._add_feii_continuum_buttons(regionID, grid_layout)
+            return
 
         # Columns not rendered as buttons here (region_ID/lineactor and the
-        # spline/poly-only columns, which never appear for linear regions).
+        # spline/poly/stellar/AGN-only columns, which never appear for linear
+        # regions but exist on df_cont once such a region has been added).
         _hidden_cont_cols = {'region_ID', 'lineactor',
                              'cont_type', 'knots_x', 'knots_y_0', 'knots_y_fit',
                              'poly_degree', 'poly_coef_0', 'poly_coef_fit'}
+        _hidden_cont_cols |= set(_STELLAR_COLS) | set(_POWERLAW_COLS) | set(_FEII_COLS)
         # Add Labels (continuum button labels)
         for col, col_name in enumerate(df_cont.columns):
             if col_name not in _hidden_cont_cols:
@@ -6686,18 +6862,27 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.stellar_template_button  = QPushButton('Stellar Template…')
         self.stellar_template_button.setToolTip(
             'Fit a stellar continuum (pPXF) to this spaxel and add it as a region')
+        self.power_law_button = QPushButton('Power Law…')
+        self.power_law_button.setToolTip(
+            'Add a power-law continuum region (amp + slope fit jointly) — for Type 1 AGN')
+        self.feii_template_button = QPushButton('Fe II Template…')
+        self.feii_template_button.setToolTip(
+            'Add an Fe II template continuum region (amp + velocity + dispersion) — for Type 1 AGN')
 
         self.fit_spaxel_button.clicked.connect(self.fit_single_spaxel)
         self.clear_spaxel_fit_button.clicked.connect(self.clear_spaxel_fit)
         self.cancel_edit_button.clicked.connect(self.cancel_spaxel_edit)
         self.toggle_edited_button.clicked.connect(lambda: self.viewer_window.toggle_edited_overlay())
         self.stellar_template_button.clicked.connect(self.open_stellar_templates)
+        self.power_law_button.clicked.connect(self.open_power_law)
+        self.feii_template_button.clicked.connect(self.open_feii_template)
         # Cancel Edit is only meaningful while editing a single spaxel.
         self.cancel_edit_button.setEnabled(self._edit_mode())
 
         for btn in [self.fit_spaxel_button, self.clear_spaxel_fit_button,
                     self.cancel_edit_button, self.toggle_edited_button,
-                    self.stellar_template_button]:
+                    self.stellar_template_button, self.power_law_button,
+                    self.feii_template_button]:
             btn.setFixedHeight(28)
             row1.addWidget(btn)
         row1.addStretch()
@@ -7827,6 +8012,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     df_cont[_kcol] = df_cont[_kcol].apply(_as_float_list)
             if 'poly_degree' not in df_cont.columns:
                 df_cont['poly_degree'] = np.nan
+            # Backfill power-law / Fe II columns for older files.
+            for _c, _d in {**_POWERLAW_COLS, **_FEII_COLS}.items():
+                if _c not in df_cont.columns:
+                    df_cont[_c] = _d
 
             # Read df (third section, after second empty row)
             df_header_index = split_indices[2] + 1
@@ -8521,6 +8710,241 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.rebuild_fit_panel(show_fit=False)
         print('Cleared all fits for the cube.')
 
+    # ── Power-law & Fe II continuum (Type 1 AGN) ─────────────────────────────
+
+    def _spaxel_flux_guess(self, x1, x2):
+        """Median flux of the current spaxel over [x1, x2] (a scale for amp
+        initial guesses). Returns 1.0 if unavailable."""
+        try:
+            vw = self.viewer_window
+            cx, cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
+            spec = (vw.get_spectrum_at_spaxel(cx, cy)
+                    if vw.is_1d_spectrum is False else FITS_DATA)
+            spec = np.asarray(spec, dtype=float)
+            sel = (np.asarray(wavelengths, float) >= min(x1, x2)) & \
+                  (np.asarray(wavelengths, float) <= max(x1, x2))
+            med = np.nanmedian(spec[sel]) if np.any(sel) else np.nan
+            return float(med) if np.isfinite(med) and med != 0 else 1.0
+        except Exception:
+            return 1.0
+
+    def _redraw_after_cont_region(self, cx, cy):
+        """Refresh panel + overlays after adding/updating a continuum region.
+        Mirrors the redraw tail of _fit_stellar_for_spaxel."""
+        vw = self.viewer_window
+        for ln in vw.spectrum_ax.lines[:]:
+            if ln.get_label() != '_child0':
+                try: ln.remove()
+                except ValueError: pass
+        vw.gaussian_component_lines.clear()
+        if 'lineactor' in df_cont.columns:
+            df_cont['lineactor'] = None
+        self.rebuild_fit_panel(show_fit=False, x=cx, y=cy)
+        for _rid in df_cont['region_ID'].astype(int).unique():
+            vw.rebuild_plot(int(_rid), from_file=True, show_init=True, show_fit=False, x=cx, y=cy)
+        vw.spectrum_canvas.draw_idle()
+        vw._mark_init_guess_spaxel()
+
+    def open_power_law(self):
+        """Dialog to add/configure a power-law continuum region for this spaxel."""
+        try:
+            self._open_power_law_impl()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.critical(None, 'Power Law', f'{type(e).__name__}: {e}')
+
+    def _open_power_law_impl(self):
+        from PyQt5.QtWidgets import QMessageBox
+        vw = self.viewer_window
+        if FITS_DATA is None or vw.current_spaxel is None:
+            QMessageBox.warning(self, 'Power Law', 'Open a cube and select a spaxel first.')
+            return
+        lam_lo, lam_hi = float(np.nanmin(wavelengths)), float(np.nanmax(wavelengths))
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Power-Law Continuum')
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel('Power law: amp · (λ / λ_pivot) ^ slope\n'
+                           'λ_pivot is the midpoint of the fit range; amp and slope are fit.'))
+        rrow = QHBoxLayout(); rrow.addWidget(QLabel('Fit range (Å):'))
+        e1 = QLineEdit(f"{lam_lo:.1f}"); e2 = QLineEdit(f"{lam_hi:.1f}")
+        rrow.addWidget(e1); rrow.addWidget(QLabel('to')); rrow.addWidget(e2)
+        v.addLayout(rrow)
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel('amp guess:'))
+        amp_e = QLineEdit(f"{self._spaxel_flux_guess(lam_lo, lam_hi):.4g}")
+        prow.addWidget(amp_e)
+        prow.addWidget(QLabel('slope guess:'))
+        slope_e = QLineEdit('-1.5')
+        prow.addWidget(slope_e)
+        v.addLayout(prow)
+        brow = QHBoxLayout(); ok = QPushButton('Add'); ok.setDefault(True)
+        cancel = QPushButton('Cancel')
+        brow.addStretch(); brow.addWidget(cancel); brow.addWidget(ok); v.addLayout(brow)
+        cancel.clicked.connect(dlg.reject)
+
+        def _accept():
+            try:
+                r0, r1 = float(e1.text()), float(e2.text())
+                amp0, slope0 = float(amp_e.text()), float(slope_e.text())
+            except ValueError:
+                QMessageBox.warning(dlg, 'Power Law', 'Invalid numeric input.'); return
+            dlg._settings = dict(fit_range=(min(r0, r1), max(r0, r1)),
+                                 pl_amp=amp0, pl_slope=slope0)
+            dlg.accept()
+        ok.clicked.connect(_accept)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        s = dlg._settings
+        rid = self._write_powerlaw_region(s['fit_range'], s['pl_amp'], s['pl_slope'])
+        cx, cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
+        self._redraw_after_cont_region(cx, cy)
+        print(f"Added power-law region {rid}: amp={s['pl_amp']:.4g} slope={s['pl_slope']:.3g} "
+              f"over {s['fit_range'][0]:.1f}-{s['fit_range'][1]:.1f} Å")
+
+    def _write_powerlaw_region(self, fit_range, pl_amp, pl_slope, target_rid=None):
+        """Append (or update) a cont_type='powerlaw' region and return its ID."""
+        global df_cont
+        for col, default in _POWERLAW_COLS.items():
+            if col not in df_cont.columns:
+                df_cont[col] = default
+        vals = {
+            'Continuum Name': 'Power Law', 'x1': round(fit_range[0], 2),
+            'x2': round(fit_range[1], 2), 'Slope_0': np.nan, 'Intercept_0': np.nan,
+            'Slope_fit': np.nan, 'Intercept_fit': np.nan, 'cont_type': 'powerlaw',
+            'knots_x': [], 'knots_y_0': [], 'knots_y_fit': [], 'poly_degree': np.nan,
+            'poly_coef_0': [], 'poly_coef_fit': [], 'lineactor': None,
+            'pl_amp_0': pl_amp, 'pl_slope_0': pl_slope,
+            'pl_amp_fit': pl_amp, 'pl_slope_fit': pl_slope,
+        }
+        return self._append_or_update_cont_region(vals, target_rid)
+
+    def open_feii_template(self):
+        """Dialog to add/configure an Fe II template continuum region."""
+        try:
+            self._open_feii_template_impl()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.critical(None, 'Fe II Template', f'{type(e).__name__}: {e}')
+
+    def _open_feii_template_impl(self):
+        from PyQt5.QtWidgets import QMessageBox
+        vw = self.viewer_window
+        if hcfeii is None:
+            QMessageBox.warning(self, 'Fe II Template', 'Fe II module is unavailable.')
+            return
+        if FITS_DATA is None or vw.current_spaxel is None:
+            QMessageBox.warning(self, 'Fe II Template', 'Open a cube and select a spaxel first.')
+            return
+        tmpls = hcfeii.list_templates()
+        if not tmpls:
+            QMessageBox.warning(self, 'Fe II Template', 'No Fe II templates found on disk.')
+            return
+        z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else np.nan
+        z = 0.0 if not np.isfinite(z) else z
+        lam_lo, lam_hi = float(np.nanmin(wavelengths)), float(np.nanmax(wavelengths))
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Fe II Template Continuum')
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel('Fe II template:'))
+        combo = QtWidgets.QComboBox()
+        names = list(tmpls.keys())
+        for nm in names:
+            combo.addItem(f"{tmpls[nm]['label']}", nm)
+        v.addWidget(combo)
+        info = QLabel(''); info.setStyleSheet('color: gray; font-size: 11px;')
+        info.setWordWrap(True); v.addWidget(info)
+
+        def _update_info():
+            m = tmpls[names[combo.currentIndex()]]
+            rlo, rhi = lam_lo / (1 + z), lam_hi / (1 + z)
+            info.setText(
+                f"{m.get('note', '')}\nTemplate coverage (rest): "
+                f"{m.get('lam_min', '?')}–{m.get('lam_max', '?')} Å\n"
+                f"Data rest-frame: {rlo:.0f}–{rhi:.0f} Å   (z = {z:g})")
+        combo.currentIndexChanged.connect(_update_info); _update_info()
+
+        rrow = QHBoxLayout(); rrow.addWidget(QLabel('Fit range (Å):'))
+        e1 = QLineEdit(f"{lam_lo:.1f}"); e2 = QLineEdit(f"{lam_hi:.1f}")
+        rrow.addWidget(e1); rrow.addWidget(QLabel('to')); rrow.addWidget(e2)
+        v.addLayout(rrow)
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel('amp:'))
+        amp_e = QLineEdit(f"{self._spaxel_flux_guess(lam_lo, lam_hi):.4g}"); prow.addWidget(amp_e)
+        prow.addWidget(QLabel('v (km/s):'))
+        v_e = QLineEdit('0'); prow.addWidget(v_e)
+        prow.addWidget(QLabel('σ (km/s):'))
+        sig_e = QLineEdit('2000'); prow.addWidget(sig_e)
+        v.addLayout(prow)
+        brow = QHBoxLayout(); ok = QPushButton('Add'); ok.setDefault(True)
+        cancel = QPushButton('Cancel')
+        brow.addStretch(); brow.addWidget(cancel); brow.addWidget(ok); v.addLayout(brow)
+        cancel.clicked.connect(dlg.reject)
+
+        def _accept():
+            try:
+                r0, r1 = float(e1.text()), float(e2.text())
+                amp0, v0, sig0 = float(amp_e.text()), float(v_e.text()), float(sig_e.text())
+            except ValueError:
+                QMessageBox.warning(dlg, 'Fe II Template', 'Invalid numeric input.'); return
+            dlg._settings = dict(template=names[combo.currentIndex()],
+                                 fit_range=(min(r0, r1), max(r0, r1)),
+                                 amp=amp0, v=v0, sigma=sig0)
+            dlg.accept()
+        ok.clicked.connect(_accept)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        s = dlg._settings
+        rid = self._write_feii_region(s['template'], s['fit_range'], s['amp'], s['v'], s['sigma'])
+        # Warm the template cache so the init-guess overlay draws immediately.
+        _prepare_feii_template(s['template'], z, s['fit_range'])
+        cx, cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
+        self._redraw_after_cont_region(cx, cy)
+        print(f"Added Fe II region {rid} ({s['template']}): amp={s['amp']:.4g} "
+              f"v={s['v']:.1f} σ={s['sigma']:.1f} over {s['fit_range'][0]:.1f}-{s['fit_range'][1]:.1f} Å")
+
+    def _write_feii_region(self, template, fit_range, amp, v, sigma, target_rid=None):
+        """Append (or update) a cont_type='feii' region and return its ID."""
+        global df_cont
+        for col, default in _FEII_COLS.items():
+            if col not in df_cont.columns:
+                df_cont[col] = default
+        vals = {
+            'Continuum Name': 'Fe II', 'x1': round(fit_range[0], 2),
+            'x2': round(fit_range[1], 2), 'Slope_0': np.nan, 'Intercept_0': np.nan,
+            'Slope_fit': np.nan, 'Intercept_fit': np.nan, 'cont_type': 'feii',
+            'knots_x': [], 'knots_y_0': [], 'knots_y_fit': [], 'poly_degree': np.nan,
+            'poly_coef_0': [], 'poly_coef_fit': [], 'lineactor': None,
+            'feii_template': template, 'feii_amp_0': amp, 'feii_v_0': v,
+            'feii_sigma_0': sigma, 'feii_amp_fit': amp, 'feii_v_fit': v,
+            'feii_sigma_fit': sigma,
+        }
+        return self._append_or_update_cont_region(vals, target_rid)
+
+    def _append_or_update_cont_region(self, vals, target_rid=None):
+        """Shared writer: update the target region in place, or append a new one
+        with a fresh region_ID (max+1). Mirrors _write_stellar_region."""
+        global df_cont
+        if target_rid is not None:
+            match = df_cont.index[np.int64(df_cont['region_ID']) == np.int64(target_rid)]
+            if len(match) > 0:
+                idx = match[0]
+                for k, val in vals.items():
+                    df_cont.at[idx, k] = val
+                return int(np.int64(target_rid))
+        rid = (int(np.int64(df_cont['region_ID']).max()) + 1
+               if len(df_cont) and 'region_ID' in df_cont.columns else 0)
+        vals['region_ID'] = rid
+        df_new = pd.DataFrame({k: [v] for k, v in vals.items()})
+        df_new = df_new.reindex(columns=df_cont.columns)
+        df_cont = df_new if len(df_cont) == 0 else pd.concat([df_cont, df_new], ignore_index=True)
+        return int(rid)
+
     # ── Stellar (pPXF) continuum ─────────────────────────────────────────────
 
     def open_stellar_templates(self):
@@ -9081,6 +9505,24 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.viewer_window.draw_image(arr, cmap=cmap, scale='linear', from_fits=False)
 
 
+    def _build_feii_region_templates(self, cont, z):
+        """Return {1-based region number -> prepared Fe II template} for every
+        'feii' continuum region in `cont`. Region numbering matches the param
+        naming used in the fit (positional index + 1). Regions whose template
+        fails to load are omitted (their baseline renders as zeros)."""
+        templates = {}
+        if hcfeii is None or not isinstance(cont, pd.DataFrame) or 'cont_type' not in cont.columns:
+            return templates
+        for i, row in cont.iterrows():
+            if str(row.get('cont_type')) != 'feii':
+                continue
+            name = str(row.get('feii_template', '') or '')
+            fit_range = (float(row['x1']), float(row['x2']))
+            tmpl = _prepare_feii_template(name, z, fit_range)
+            if tmpl is not None:
+                templates[i + 1] = tmpl
+        return templates
+
     def fit_single_spaxel(self):
         try:
             self._fit_single_spaxel_impl()
@@ -9124,16 +9566,53 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             is_poly = (_ctype == 'poly' and len(_pc) >= 1)
             is_spline = (_ctype == 'spline' and len(_kx) >= 2 and len(_kx) == len(_ky))
             is_stellar = (_ctype == 'stellar')
+            is_powerlaw = (_ctype == 'powerlaw')
+            is_feii = (_ctype == 'feii')
 
             slope = row['Slope_0'] if np.isfinite(row['Slope_0']) else 0
             intercept = row['Intercept_0'] if np.isfinite(row['Intercept_0']) else 0
             # Stellar continuum is a fixed baseline subtracted from the spectrum
-            # before the line fit, so its model continuum is held at zero.
-            if is_stellar:
+            # before the line fit; power-law / Fe II carry the continuum through
+            # their own free params. In all three cases the linear slope/intercept
+            # model continuum is held at zero.
+            if is_stellar or is_powerlaw or is_feii:
                 slope = intercept = 0
 
-            params.add(f'slope{i + 1}', value=slope, vary=not (is_spline or is_poly or is_stellar))
-            params.add(f'intercept{i + 1}', value=intercept, vary=not (is_spline or is_poly or is_stellar))
+            _linear_off = is_spline or is_poly or is_stellar or is_powerlaw or is_feii
+            params.add(f'slope{i + 1}', value=slope, vary=not _linear_off)
+            params.add(f'intercept{i + 1}', value=intercept, vary=not _linear_off)
+
+            # Power-law continuum: amp (at region midpoint) + slope, both free.
+            if is_powerlaw:
+                _pl_amp = _safe_float(row.get('pl_amp_0'))
+                _pl_slope = _safe_float(row.get('pl_slope_0'))
+                if not np.isfinite(_pl_amp):
+                    _pl_amp = 1.0
+                if not np.isfinite(_pl_slope):
+                    _pl_slope = -1.5
+                params.add(f'PL{i + 1}', value=1, vary=False)
+                params.add(f'pl_amp{i + 1}', value=_pl_amp, vary=True)
+                params.add(f'pl_slope{i + 1}', value=_pl_slope, vary=True)
+            else:
+                params.add(f'PL{i + 1}', value=0, vary=False)
+
+            # Fe II template continuum: amp + velocity offset + dispersion, free.
+            if is_feii:
+                _fe_amp = _safe_float(row.get('feii_amp_0'))
+                _fe_v = _safe_float(row.get('feii_v_0'))
+                _fe_sig = _safe_float(row.get('feii_sigma_0'))
+                if not np.isfinite(_fe_amp):
+                    _fe_amp = 1.0
+                if not np.isfinite(_fe_v):
+                    _fe_v = 0.0
+                if not np.isfinite(_fe_sig) or _fe_sig <= 0:
+                    _fe_sig = 2000.0
+                params.add(f'FE{i + 1}', value=1, vary=False)
+                params.add(f'feii_amp{i + 1}', value=_fe_amp, vary=True, min=0.0)
+                params.add(f'feii_v{i + 1}', value=_fe_v, vary=True, min=-3000.0, max=3000.0)
+                params.add(f'feii_sigma{i + 1}', value=_fe_sig, vary=True, min=100.0, max=10000.0)
+            else:
+                params.add(f'FE{i + 1}', value=0, vary=False)
 
             if is_poly:
                 params.add(f'NP{i + 1}', value=len(_pc), vary=False)
@@ -9193,7 +9672,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         Nlines = len(np.unique(df['Line_ID']))
         add_dataframe_constraints_to_params(df, params)
         print(f'Nregions={Nregions}, Nlines={Nlines}')
-        model_maker = HyperCube_ModelFunctions.PiecewiseModel(n_regions=Nregions, n_gaussians=Nlines)
+        # Prepared Fe II templates for any 'feii' regions (keyed by 1-based region
+        # number) get baked into the model so model_function can render them.
+        region_templates = self._build_feii_region_templates(df_cont, z)
+        model_maker = HyperCube_ModelFunctions.PiecewiseModel(
+            n_regions=Nregions, n_gaussians=Nlines, region_templates=region_templates)
         piecewise_model = Model(model_maker.model_function)
 
         fit_results = []
@@ -9265,6 +9748,23 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                  bad_spaxels_override=None):
         global df, df_fit, fit_results, snr_mask, piecewise_model, line, new_results#,params
         global base_df_cont, base_df, spaxel_overrides, df_stellar
+
+        # Power-law / Fe II continuum regions are only wired into the interactive
+        # single-spaxel fit so far; the parallel worker builds its model without
+        # the Fe II template. Block the cube fit here rather than return silently
+        # wrong results across every spaxel. (Parallel AGN continuum is a planned
+        # follow-up.)
+        if isinstance(df_cont, pd.DataFrame) and 'cont_type' in df_cont.columns:
+            _agn = df_cont[df_cont['cont_type'].isin(['powerlaw', 'feii'])]
+            if len(_agn) > 0:
+                from PyQt5.QtWidgets import QMessageBox
+                names = ', '.join(sorted(set(_agn['cont_type'].astype(str))))
+                QMessageBox.warning(
+                    self, 'Fit Cube',
+                    f'Cube fitting of power-law / Fe II continuum regions ({names}) '
+                    'is not supported yet — use "Fit Spaxel" for these. Remove or '
+                    'convert the AGN continuum regions to run a cube fit.')
+                return
 
         # A fresh cube fit (re)defines the locked schema template that all
         # per-spaxel overrides must conform to, and invalidates old overrides.
@@ -10354,6 +10854,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     # Stellar continuum cells are handled by the dedicated block
                     # below; skip the per-line lookup (would fail on df_cont).
                     button_type = 'stellar'
+                elif button_name.split('~')[0] in ('powerlaw', 'feii'):
+                    # Power-law / Fe II initial-guess cells are handled by the
+                    # dedicated block below; skip the per-line lookup.
+                    button_type = button_name.split('~')[0]
                 # elif button_name.split('~')[1] == 'Line_Name':
                 #     string = str(data_frame.loc[(data_frame['region_ID'] == np.float64(frame_id)) & (np.float64(data_frame['Line_ID'])==np.float64(button_name.split(',')[0]))][button_name.split('~')[1]].item())
                 else:
@@ -10396,6 +10900,25 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 ok_btn = QPushButton('OK'); ok_btn.setDefault(True)
                 ok_btn.clicked.connect(lambda: [self.on_submit(tb, df_cont, frame_id, button_name, button_type='stellar_param'), dialog.accept()])
                 tb.returnPressed.connect(lambda: [self.on_submit(tb, df_cont, frame_id, button_name, button_type='stellar_param'), dialog.accept()])
+                cancel_btn = QPushButton('Cancel'); cancel_btn.clicked.connect(dialog.reject)
+                btn_row.addWidget(ok_btn); btn_row.addWidget(cancel_btn)
+                layout.addLayout(btn_row)
+                dialog.exec_()
+
+            if button_name.split('~')[0] in ('powerlaw', 'feii'):
+                cparam = button_name.split('~')[1]   # e.g. pl_amp_0 / feii_amp_0
+                cur = df_cont.loc[np.int64(df_cont['region_ID']) == frame_id, cparam]
+                current_val = _fmt(cur.item()) if len(cur) else ''
+                dialog = QDialog(self)
+                dialog.setWindowTitle(f'Edit {cparam}')
+                layout = QVBoxLayout(dialog)
+                layout.addWidget(QLabel(f'{cparam}  (current: {current_val})'))
+                tb = QLineEdit(); tb.setText(current_val); tb.selectAll()
+                layout.addWidget(tb)
+                btn_row = QHBoxLayout()
+                ok_btn = QPushButton('OK'); ok_btn.setDefault(True)
+                ok_btn.clicked.connect(lambda: [self.on_submit(tb, df_cont, frame_id, button_name, button_type='cont_kin_param'), dialog.accept()])
+                tb.returnPressed.connect(lambda: [self.on_submit(tb, df_cont, frame_id, button_name, button_type='cont_kin_param'), dialog.accept()])
                 cancel_btn = QPushButton('Cancel'); cancel_btn.clicked.connect(dialog.reject)
                 btn_row.addWidget(ok_btn); btn_row.addWidget(cancel_btn)
                 layout.addLayout(btn_row)
@@ -11125,6 +11648,35 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                          'stellar_h4_0': 'h4'}.get(param)
                 if _ckey:
                     _cache[_ckey] = float(new_value)
+            for line in vw.spectrum_ax.lines[:]:
+                if line.get_linestyle() in ('--', 'dashed'):
+                    try: line.remove()
+                    except ValueError: pass
+            vw.gaussian_component_lines.clear()
+            for actor in df_cont.loc[df_cont["region_ID"] == frame_id, 'lineactor']:
+                if actor is not None and actor in vw.spectrum_ax.lines:
+                    try: actor.remove()
+                    except ValueError: pass
+            vw.rebuild_plot(region_ID=frame_id, from_file=False, show_init=True, show_fit=False, x=cx, y=cy)
+
+        elif button_type == 'cont_kin_param':
+            # Power-law / Fe II initial-guess edit: write both the _0 (init) and
+            # the _fit column so the init-guess overlay updates immediately.
+            param = button_name.split('~')[1]   # e.g. pl_amp_0 / feii_v_0
+            try:
+                new_value = np.float64(text_box.text())
+            except ValueError:
+                print(f"Invalid value: {text_box.text()}")
+                return
+            df_cont.loc[np.int64(df_cont['region_ID']) == frame_id, param] = new_value
+            _fitcol = param.replace('_0', '_fit')
+            if _fitcol in df_cont.columns:
+                df_cont.loc[np.int64(df_cont['region_ID']) == frame_id, _fitcol] = new_value
+            self.update_button_value(frame_id, button_name, _fmt(new_value))
+            vw = self.viewer_window
+            cx = cy = 0
+            if vw.current_spaxel is not None:
+                cx, cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
             for line in vw.spectrum_ax.lines[:]:
                 if line.get_linestyle() in ('--', 'dashed'):
                     try: line.remove()

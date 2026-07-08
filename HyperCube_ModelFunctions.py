@@ -49,16 +49,23 @@ def eval_poly(coefs, x1, x2, x):
         return np.full_like(x, c[0])
     return np.polynomial.Chebyshev(c, domain=[float(x1), float(x2)])(x)
 
-def eval_power_law(slope, amp, x):
-    """Evaluate a power law. 
+def eval_power_law(slope, amp, x, x_pivot=None):
+    """Evaluate a power law amp * (x / x_pivot) ** slope.
+
+    x_pivot anchors the amplitude (the flux at lambda = x_pivot). If None, it
+    defaults to the midpoint of the supplied x range (half of the fitted region),
+    which is the convention used when a caller does not pass an explicit pivot.
+    Passing x_pivot explicitly keeps the pivot identical between the fit and the
+    overlay, which sample x on different grids.
     """
 
     x = np.asarray(x, dtype=float)
 
-    # set the pivot wavelength to half of the wavelength range    
-    x_p = 0.5 * ( x.max() + x.min() )
+    if x_pivot is None:
+        # set the pivot wavelength to half of the wavelength range
+        x_pivot = 0.5 * (x.max() + x.min())
 
-    return amp * (x/x_p) ** slope
+    return amp * (x / x_pivot) ** slope
 
 # Vectorized Gaussian computation
 def sum_gaussians(x, params, num_gaussians):
@@ -68,10 +75,13 @@ def sum_gaussians(x, params, num_gaussians):
     return np.sum(amps[:, None] * np.exp(-0.5 * ((x - cens[:, None]) / sigmas[:, None]) ** 2), axis=0)
 
 class PiecewiseModel:
-    def __init__(self, n_regions, n_gaussians):
+    def __init__(self, n_regions, n_gaussians, region_templates=None):
         self.n_regions = n_regions
         self.n_gaussians = n_gaussians
-        
+        # {region_number (1-based) -> prepared HyperCube_FeII.FeIITemplate} for
+        # 'feii' continuum regions. Empty/None for models with no Fe II region.
+        self.region_templates = region_templates or {}
+
     def model_function(self, x, **kwargs):
         """
         Generalized piecewise model with N regions and M Gaussians
@@ -94,9 +104,12 @@ class PiecewiseModel:
                 continue
 
             # Continuum baseline: polynomial if NP{region}>=1 (Chebyshev over
-            # [x_start,x_end]); else spline if NK{region}>=2; else linear.
+            # [x_start,x_end]); else spline if NK{region}>=2; else power law if
+            # PL{region}>=1; else Fe II template if FE{region}>=1; else linear.
             n_poly = int(kwargs.get(f'NP{region}', 0))
             n_knots = int(kwargs.get(f'NK{region}', 0))
+            is_powerlaw = int(kwargs.get(f'PL{region}', 0)) >= 1
+            is_feii = int(kwargs.get(f'FE{region}', 0)) >= 1
             if n_poly >= 1:
                 coefs = [kwargs[f'polyc{region}_{j}'] for j in range(n_poly)]
                 baseline = eval_poly(coefs, x_start, x_end, x[region_mask])
@@ -104,6 +117,22 @@ class PiecewiseModel:
                 kx = [kwargs[f'knotx{region}_{k}'] for k in range(n_knots)]
                 ky = [kwargs[f'knoty{region}_{k}'] for k in range(n_knots)]
                 baseline = eval_spline(kx, ky, x[region_mask])
+            elif is_powerlaw:
+                # Amplitude anchored at the region midpoint (pivot), amp + slope free.
+                x_pivot = 0.5 * (x_start + x_end)
+                baseline = eval_power_law(kwargs[f'pl_slope{region}'],
+                                          kwargs[f'pl_amp{region}'],
+                                          x[region_mask], x_pivot)
+            elif is_feii:
+                # Fe II pseudo-continuum from a prepared empirical template; amp,
+                # velocity offset, and dispersion are free.
+                tmpl = self.region_templates.get(region)
+                if tmpl is None:
+                    baseline = np.zeros_like(x[region_mask])
+                else:
+                    baseline = tmpl.eval(x[region_mask], kwargs[f'feii_amp{region}'],
+                                         kwargs[f'feii_v{region}'],
+                                         kwargs[f'feii_sigma{region}'])
             else:
                 slope = kwargs[f'slope{region}']
                 intercept = kwargs[f'intercept{region}']

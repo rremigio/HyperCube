@@ -54,11 +54,13 @@ def _as_float_list(v):
 
 
 # ── model construction ───────────────────────────────────────────────────────
-def build_model(n_regions, n_lines):
+def build_model(n_regions, n_lines, region_templates=None):
     """Rebuild the piecewise (continuum + Gaussians) lmfit Model. Matches the
-    construction in HyperCube.fit_cube."""
+    construction in HyperCube.fit_cube. region_templates maps a 1-based region
+    number to a prepared Fe II template (for 'feii' continuum regions)."""
     maker = HyperCube_ModelFunctions.PiecewiseModel(n_regions=n_regions,
-                                                    n_gaussians=n_lines)
+                                                    n_gaussians=n_lines,
+                                                    region_templates=region_templates)
     return Model(maker.model_function)
 
 
@@ -249,7 +251,9 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
     for pname, param in params_scaled.items():
         if param.expr:
             continue
-        if pname.startswith('amp'):
+        # Amplitude-like params scale with the flux (line amps, power-law and
+        # Fe II amplitudes). Slope/velocity/dispersion params do NOT.
+        if pname.startswith(('amp', 'pl_amp', 'feii_amp')):
             param.set(value=param.value / flux_scale)
             if param.min is not None:
                 param.min = param.min / flux_scale
@@ -306,6 +310,8 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
             _mrow = df_cont[df_cont['region_ID'] == region_id]
             _model_ctype = (str(_mrow.iloc[0]['cont_type'])
                             if len(_mrow) and 'cont_type' in df_cont.columns else 'linear')
+            _is_pl = f'PL{region_index}' in params_to_use and int(params_to_use[f'PL{region_index}'].value) >= 1
+            _is_fe = f'FE{region_index}' in params_to_use and int(params_to_use[f'FE{region_index}'].value) >= 1
             if _model_ctype == 'stellar':
                 _ctype_out = 'stellar'
                 _scache = stellar_kin.get(region_id) or stellar_kin.get(int(region_id)) or {}
@@ -314,6 +320,20 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
                 cont_params[f'cont_region{region_index}_stellar_h3'] = _safe_float(_scache.get('h3'))
                 cont_params[f'cont_region{region_index}_stellar_h4'] = _safe_float(_scache.get('h4'))
                 cont_params[f'cont_region{region_index}_stellar_scale'] = _safe_float(_scache.get('scale'))
+            elif _is_pl:
+                _ctype_out = 'powerlaw'
+                cont_params[f'cont_region{region_index}_pl_amp_init'] = params_to_use[f'pl_amp{region_index}'].init_value
+                cont_params[f'cont_region{region_index}_pl_amp_fit'] = result.params[f'pl_amp{region_index}'].value * flux_scale
+                cont_params[f'cont_region{region_index}_pl_slope_init'] = params_to_use[f'pl_slope{region_index}'].init_value
+                cont_params[f'cont_region{region_index}_pl_slope_fit'] = result.params[f'pl_slope{region_index}'].value
+            elif _is_fe:
+                _ctype_out = 'feii'
+                cont_params[f'cont_region{region_index}_feii_amp_init'] = params_to_use[f'feii_amp{region_index}'].init_value
+                cont_params[f'cont_region{region_index}_feii_amp_fit'] = result.params[f'feii_amp{region_index}'].value * flux_scale
+                cont_params[f'cont_region{region_index}_feii_v_init'] = params_to_use[f'feii_v{region_index}'].init_value
+                cont_params[f'cont_region{region_index}_feii_v_fit'] = result.params[f'feii_v{region_index}'].value
+                cont_params[f'cont_region{region_index}_feii_sigma_init'] = params_to_use[f'feii_sigma{region_index}'].init_value
+                cont_params[f'cont_region{region_index}_feii_sigma_fit'] = result.params[f'feii_sigma{region_index}'].value
             else:
                 _ctype_out = 'poly' if _np_ >= 1 else ('spline' if _nk >= 2 else 'linear')
             cont_params[f'cont_region{region_index}_cont_type'] = _ctype_out
