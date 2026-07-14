@@ -158,6 +158,34 @@ def _prepare_feii_template(name, z, fit_range):
         print(f"Fe II template prep failed ({name}): {type(e).__name__}: {e}")
         return None
 
+
+def _region_components(row):
+    """Ordered list of continuum component dicts for a df_cont row (Series/dict).
+    Reads the authoritative 'components' cell; if absent/empty, synthesizes a
+    1-element list from the legacy cont_type + flat columns (back-compat)."""
+    get = row.get if hasattr(row, 'get') else (lambda k, d=None: d)
+    comps = HyperCube_ModelFunctions.coerce_components(get('components'))
+    if comps:
+        return comps
+    ct = get('cont_type')
+    ct = str(ct) if (ct is not None and pd.notna(ct)) else 'linear'
+    return [HyperCube_ModelFunctions.legacy_to_component(ct, row)]
+
+
+def _materialize_components(cont):
+    """Ensure df_cont has a real 'components' list per row (coercing CSV repr
+    strings and synthesizing from legacy cont_type/flat columns as needed).
+    Call on every df_cont load path so the composite panel/fit have a clean list."""
+    if not isinstance(cont, pd.DataFrame):
+        return cont
+    if len(cont) == 0:
+        if 'components' not in cont.columns:
+            cont['components'] = pd.Series(dtype=object)
+        return cont
+    cont['components'] = [_region_components(r) for _, r in cont.iterrows()]
+    return cont
+
+
 global spectrum
 
 global snr_map
@@ -193,7 +221,11 @@ data_cont_init = {'Continuum Name': [],
              # (coefficients are over the Chebyshev domain [x1, x2]).
              'poly_degree': [],
              'poly_coef_0': [],
-             'poly_coef_fit': []}
+             'poly_coef_fit': [],
+             # Composite continuum: ordered, additive list of component dicts (the
+             # authoritative continuum spec). The cont_type / flat columns above are
+             # retained only for back-compat migration (see _region_components).
+             'components': []}
 
 df_cont = pd.DataFrame(data_cont_init)
 
@@ -386,12 +418,17 @@ def _apply_velocity_constraint(found_op, right_side, line_id, df, params):
     if '_[' not in right_side or ']' not in right_side:
         return False
     ref_name = _ref_line_name(right_side)
-    cen_self = f'cen{line_id + 1}'
+    # Params are named by row position, not Line_ID (see _pos in
+    # add_dataframe_constraints_to_params); map both lines the same way.
+    _pos = {int(lid): i + 1 for i, lid in enumerate(df['Line_ID'].tolist())}
+    if line_id not in _pos:
+        return False
+    cen_self = f"cen{_pos[line_id]}"
     if cen_self not in params:
         return False
     try:
         other = df[df['Line_Name'] == ref_name].iloc[0]
-        cen_ref = f"cen{int(other['Line_ID']) + 1}"
+        cen_ref = f"cen{_pos[int(other['Line_ID'])]}"
     except (IndexError, KeyError, ValueError):
         return False
     if cen_ref not in params:
@@ -461,16 +498,37 @@ def _apply_velocity_constraint(found_op, right_side, line_id, df, params):
     return True
 
 
+def _constraint_number(s):
+    """Parse a bare numeric token in a constraint (e.g. a factor '0.33' or a
+    divisor '2.98'). Returns a float, or None if it is not a plain number."""
+    try:
+        return float(str(s).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def add_dataframe_constraints_to_params(df, params):
     """
-    Adds constraints to lmfit Parameters object, using:
+    Adds RELATIVE constraints (line-to-line ties/ratios) to the lmfit Parameters:
     - Additive offsets for centroid inequalities (cen1 >= cen2 → cen1 = cen2 + offset)
-    - Multiplicative ratios for all other inequalities (amp1 >= amp2 → amp1 = amp2 * ratio)
+    - Multiplicative / divisive ratios for other inequalities
+      (amp1 <= 0.33 * amp2, amp1 == amp2 / 2.98)
     - Direct expressions for equality constraints
+
+    ABSOLUTE per-parameter bounds (a hard min/max on one line's amp/centroid/sigma)
+    are NOT set here — they live in the *_lowlim / *_highlim columns, edited via the
+    σ0,min / σ0,max (and centroid/amp) buttons, which the fit reads directly.
     """
     if 'constraints' not in df.columns:
         print("Warning: 'constraints' column not found in DataFrame.")
         return
+
+    # lmfit params are named by ROW POSITION (amp{j}/cen{j}/sigma{j}, j=1..N in
+    # df order), NOT by Line_ID. Line_IDs can have gaps (deletions, custom lines
+    # added out of order via max(Line_ID)+1), so a line's param index is its
+    # position in df, not Line_ID+1. Map Line_ID -> 1-based positional index so
+    # the constraints target the same params the fit actually created.
+    _pos = {int(lid): i + 1 for i, lid in enumerate(df['Line_ID'].tolist())}
 
     for index, row in df.iterrows():
         line_id = int(row['Line_ID'])
@@ -513,7 +571,7 @@ def add_dataframe_constraints_to_params(df, params):
 
                 # Parse left side parameter
                 param1_base = ''.join(filter(str.isalpha, left_side)).lower()
-                param1_num = line_id + 1
+                param1_num = _pos[line_id]
                 param1_name = f"{param1_base}{param1_num}"
 
                 # VELOCITY constraints (tie / symmetric window / one-sided bound).
@@ -538,9 +596,9 @@ def add_dataframe_constraints_to_params(df, params):
                         try:
                             other_row = df[df['Line_Name'] == other_line_name].iloc[0]
                             other_line_id = int(other_row['Line_ID'])
-                            param2_num = other_line_id + 1
+                            param2_num = _pos[other_line_id]
                             param2_name = f"{param2_base}{param2_num}"
-                            
+
                             if param2_name not in params:
                                 print(f"Warning: Parameter not found in params: {param2_name}")
                                 continue
@@ -598,7 +656,8 @@ def add_dataframe_constraints_to_params(df, params):
                         except (IndexError, KeyError) as e:
                             print(f"Warning: Could not find line '{other_line_name}' for constraint: {constraint} - {e}")
                     else:
-                        print(f"Warning: Centroid constraint must reference another line: {constraint}")
+                        print(f"Warning: Centroid constraint must reference another line "
+                              f"(for an absolute centroid bound use the λobs,0 min/max buttons): {constraint}")
                     continue
 
                 # SPECIAL CASE: Sigma inequalities use additive offsets.
@@ -613,7 +672,7 @@ def add_dataframe_constraints_to_params(df, params):
                         try:
                             other_row = df[df['Line_Name'] == other_line_name].iloc[0]
                             other_line_id = int(other_row['Line_ID'])
-                            param2_name = f"sigma{other_line_id + 1}"
+                            param2_name = f"sigma{_pos[other_line_id]}"
 
                             if param2_name not in params:
                                 print(f"Warning: Parameter not found in params: {param2_name}")
@@ -654,7 +713,7 @@ def add_dataframe_constraints_to_params(df, params):
                                   f"for sigma constraint: {constraint} - {e}")
                     else:
                         print(f"Warning: Sigma inequality must reference another line "
-                              f"without a multiplicative factor: {constraint}")
+                              f"(for an absolute σ bound use the σ0,min / σ0,max buttons): {constraint}")
                     continue
 
                 # DEFAULT CASE: Non-centroid parameters use ratio method
@@ -667,26 +726,37 @@ def add_dataframe_constraints_to_params(df, params):
                     try:
                         other_row = df[df['Line_Name'] == other_line_name].iloc[0]
                         other_line_id = int(other_row['Line_ID'])
-                        param2_num = other_line_id + 1
+                        param2_num = _pos[other_line_id]
                         param2_name = f"{param2_base}{param2_num}"
-                        
+
                         if param2_name not in params:
                             print(f"Warning: Parameter not found in params: {param2_name}")
                             continue
-                            
-                        # Handle multiplicative factors
+
+                        # Handle a numeric factor on the referenced parameter:
+                        #   N * p,  p * N,  p / N  (e.g. amp_[OIII5007] / 2.98 for a
+                        #   doublet ratio), or  N / p  (reciprocal).
                         if '*' in right_side:
-                            left_part, right_part = [x.strip() for x in right_side.split('*')]
-                        
-                            # Check which part is numeric and which is the parameter
-                            if left_part.replace('.', '', 1).isdigit():
-                                factor = float(left_part)
-                                expr = f"{factor} * {param2_name}"
-                            elif right_part.replace('.', '', 1).isdigit():
-                                factor = float(right_part)
-                                expr = f"{factor} * {param2_name}"
+                            left_part, right_part = [x.strip() for x in right_side.split('*', 1)]
+                            lnum, rnum = _constraint_number(left_part), _constraint_number(right_part)
+                            if lnum is not None:
+                                expr = f"{lnum} * {param2_name}"
+                            elif rnum is not None:
+                                expr = f"{rnum} * {param2_name}"
                             else:
                                 print(f"Warning: Could not parse factor in constraint: {constraint}")
+                                continue
+                        elif '/' in right_side:
+                            left_part, right_part = [x.strip() for x in right_side.split('/', 1)]
+                            lnum, rnum = _constraint_number(left_part), _constraint_number(right_part)
+                            if rnum not in (None, 0) and '_[' in left_part:
+                                # p / N  →  (1/N) * p   (the usual line-ratio form)
+                                expr = f"{1.0 / rnum} * {param2_name}"
+                            elif lnum is not None and '_[' in right_part:
+                                # N / p  →  reciprocal, kept as a direct expression
+                                expr = f"{lnum} / {param2_name}"
+                            else:
+                                print(f"Warning: Could not parse divisor in constraint: {constraint}")
                                 continue
                         else:
                             expr = param2_name
@@ -728,7 +798,7 @@ def add_dataframe_constraints_to_params(df, params):
 
                                 other_row = df[df['Line_Name'] == other_line_name].iloc[0]
                                 other_line_id = int(other_row['Line_ID'])
-                                param_num = other_line_id + 1
+                                param_num = _pos[other_line_id]
                                 param_name = f"{param_base}{param_num}"
                                 
                                 if param_name not in params:
@@ -760,9 +830,10 @@ def add_dataframe_constraints_to_params(df, params):
                             
                     except (ValueError, IndexError, KeyError):
                         print(f"Warning: Could not parse complex expression in constraint: {constraint}")
-                
+
                 else:
-                    print(f"Warning: Unsupported right side format in constraint: {constraint}")
+                    print(f"Warning: Unsupported right side format in constraint "
+                          f"(absolute bounds go in the min/max buttons): {constraint}")
 
         except (ValueError, SyntaxError) as e:
             print(f"Warning: Could not parse constraints string for Line_ID {line_id} ({line_name}): {constraints_list_str} - {e}")
@@ -3139,11 +3210,13 @@ class ViewerWindow(QMainWindow):
         df_obs      = session.get('df_obs', df_obs)
         df          = session.get('df', df)
         df_cont     = session.get('df_cont', df_cont)
-        # Backfill power-law / Fe II columns for sessions saved before they existed.
+        # Backfill power-law / Fe II columns for sessions saved before they existed,
+        # then materialize the composite 'components' list per region.
         if isinstance(df_cont, pd.DataFrame):
             for _c, _d in {**_POWERLAW_COLS, **_FEII_COLS}.items():
                 if _c not in df_cont.columns:
                     df_cont[_c] = _d
+            df_cont = _materialize_components(df_cont)
         df_fit      = session.get('df_fit', df_fit)
         fit_results = session.get('fit_results', fit_results)
         if session.get('snr_map') is not None:
@@ -5031,67 +5104,87 @@ class ViewerWindow(QMainWindow):
         
         
         
-    def _region_baseline(self, region, x_vals, use_fit=False, xy=None):
-        """Continuum baseline y over x_vals for a single-row df_cont `region`
-        slice. Branches on cont_type: linear → slope·x+intercept; spline →
-        interpolating spline through the knots; stellar → pPXF optimal template
-        broadened by the LOSVD. use_fit selects the fitted params (Slope_fit /
-        knots_y_fit) when available, else the initial guess. `xy` selects which
-        spaxel's cached optimal template to use for a stellar region.
-        """
+    # Per-component breakdown-curve colours (power law orange, Fe II magenta,
+    # host/stellar cyan, poly/spline blue, linear grey).
+    _COMPONENT_COLORS = {'powerlaw': '#d7801a', 'feii': '#c840c8', 'stellar': '#00bcd4',
+                         'poly': '#6d8fff', 'spline': '#6d8fff', 'linear': '#8a8a8a'}
+    # Total continuum (sum of all continuum components, incl. Fe II).
+    _TOTAL_CONT_COLOR = '#5b8fc9'
+
+    def _draw_component_breakdown(self, comps, x_vals, x1, x2, use_fit, xy, region_slice):
+        """Draw one dotted curve per continuum component (its absolute contribution),
+        only when the region has >=2 components so the breakdown adds information."""
+        comps = [c for c in comps if isinstance(c, dict)]
+        if len(comps) < 2:
+            return
+        for comp in comps:
+            yc = self._component_baseline(comp, x_vals, x1, x2, use_fit=use_fit,
+                                          xy=xy, region=region_slice)
+            col = self._COMPONENT_COLORS.get(str(comp.get('type')), '#8a8a8a')
+            self.spectrum_ax.plot(x_vals, yc, color=col, lw=0.8, linestyle=':')
+
+    def _component_baseline(self, comp, x_vals, x1, x2, use_fit=False, xy=None, region=None):
+        """Baseline y over x_vals for ONE continuum component dict. `use_fit`
+        selects the _fit params (falling back to _0). Stellar renders from the
+        cached pPXF optimal template via _stellar_baseline. Used both to sum a
+        region's continuum and to draw the per-component breakdown."""
         x_vals = np.asarray(x_vals, dtype=float)
-        if region is None or len(region) == 0:
-            return np.zeros_like(x_vals)
-        ctype = 'linear'
-        if 'cont_type' in region.columns:
-            try:
-                ctype = str(region['cont_type'].item())
-            except Exception:
-                ctype = 'linear'
-        if ctype == 'stellar':
-            return self._stellar_baseline(region, x_vals, use_fit=use_fit, xy=xy)
-        if ctype == 'spline':
-            kx = _as_float_list(region['knots_x'].item())
-            ky0 = _as_float_list(region['knots_y_0'].item())
-            ky_fit = _as_float_list(region['knots_y_fit'].item()) if 'knots_y_fit' in region.columns else []
-            ky = ky_fit if (use_fit and len(ky_fit) == len(kx) and len(ky_fit) > 0) else ky0
-            return self._eval_spline(kx, ky, x_vals)
-        if ctype == 'poly':
-            x1 = float(region['x1'].item()); x2 = float(region['x2'].item())
-            c0 = _as_float_list(region['poly_coef_0'].item())
-            cfit = _as_float_list(region['poly_coef_fit'].item()) if 'poly_coef_fit' in region.columns else []
-            coefs = cfit if (use_fit and len(cfit) > 0) else c0
+        t = str(comp.get('type', 'linear'))
+        sfx = '_fit' if use_fit else '_0'
+
+        def _g(sub):
+            v = _safe_float(comp.get(sub + sfx))
+            return v if np.isfinite(v) else _safe_float(comp.get(sub + '_0'))
+
+        if t == 'linear':
+            m, b = _g('slope'), _g('intercept')
+            m = m if np.isfinite(m) else 0.0
+            b = b if np.isfinite(b) else 0.0
+            return m * x_vals + b
+        if t == 'poly':
+            coefs = HyperCube_ModelFunctions.as_float_list(comp.get('poly_coef' + sfx))
+            if not coefs:
+                coefs = HyperCube_ModelFunctions.as_float_list(comp.get('poly_coef_0'))
             return self._eval_poly(coefs, x1, x2, x_vals)
-        if ctype == 'powerlaw':
-            x1 = float(region['x1'].item()); x2 = float(region['x2'].item())
-            pivot = 0.5 * (x1 + x2)
-            _sfx = '_fit' if use_fit else '_0'
-            amp = _safe_float(region[f'pl_amp{_sfx}'].item()) if f'pl_amp{_sfx}' in region.columns else np.nan
-            slope = _safe_float(region[f'pl_slope{_sfx}'].item()) if f'pl_slope{_sfx}' in region.columns else np.nan
-            if not np.isfinite(amp) or not np.isfinite(slope):
+        if t == 'spline':
+            kx = HyperCube_ModelFunctions.as_float_list(comp.get('knots_x'))
+            ky = HyperCube_ModelFunctions.as_float_list(comp.get('knots_y' + sfx))
+            if len(ky) != len(kx):
+                ky = HyperCube_ModelFunctions.as_float_list(comp.get('knots_y_0'))
+            return self._eval_spline(kx, ky, x_vals)
+        if t == 'powerlaw':
+            amp, slope = _g('pl_amp'), _g('pl_slope')
+            if not (np.isfinite(amp) and np.isfinite(slope)):
                 return np.zeros_like(x_vals)
-            return HyperCube_ModelFunctions.eval_power_law(slope, amp, x_vals, pivot)
-        if ctype == 'feii':
-            x1 = float(region['x1'].item()); x2 = float(region['x2'].item())
-            name = str(region['feii_template'].item()) if 'feii_template' in region.columns else ''
-            _sfx = '_fit' if use_fit else '_0'
-            amp = _safe_float(region[f'feii_amp{_sfx}'].item()) if f'feii_amp{_sfx}' in region.columns else np.nan
-            v = _safe_float(region[f'feii_v{_sfx}'].item()) if f'feii_v{_sfx}' in region.columns else np.nan
-            sig = _safe_float(region[f'feii_sigma{_sfx}'].item()) if f'feii_sigma{_sfx}' in region.columns else np.nan
+            return HyperCube_ModelFunctions.eval_power_law(slope, amp, x_vals, 0.5 * (x1 + x2))
+        if t == 'feii':
+            amp, v, sig = _g('feii_amp'), _g('feii_v'), _g('feii_sigma')
             if not (np.isfinite(amp) and np.isfinite(v) and np.isfinite(sig)):
                 return np.zeros_like(x_vals)
             z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
             z = 0.0 if not np.isfinite(z) else z
-            tmpl = _prepare_feii_template(name, z, (x1, x2))
-            if tmpl is None:
-                return np.zeros_like(x_vals)
-            return np.nan_to_num(tmpl.eval(x_vals, amp, v, sig))
-        # Linear
-        if use_fit:
-            m = np.float64(region['Slope_fit'].item()); b = np.float64(region['Intercept_fit'].item())
-        else:
-            m = np.float64(region['Slope_0'].item()); b = np.float64(region['Intercept_0'].item())
-        return m * x_vals + b
+            tmpl = _prepare_feii_template(str(comp.get('feii_template', '') or ''), z, (x1, x2))
+            return np.nan_to_num(tmpl.eval(x_vals, amp, v, sig)) if tmpl is not None \
+                else np.zeros_like(x_vals)
+        if t == 'stellar' and region is not None:
+            return np.nan_to_num(self._stellar_baseline(region, x_vals, use_fit=use_fit, xy=xy))
+        return np.zeros_like(x_vals)
+
+    def _region_baseline(self, region, x_vals, use_fit=False, xy=None):
+        """Continuum baseline y over x_vals for a single-row df_cont `region`
+        slice: the SUM of the region's additive continuum components. `use_fit`
+        selects fitted params when available; `xy` selects the spaxel for a
+        stellar component's cached template."""
+        x_vals = np.asarray(x_vals, dtype=float)
+        if region is None or len(region) == 0:
+            return np.zeros_like(x_vals)
+        row = region.iloc[0]
+        x1 = _safe_float(row.get('x1')); x2 = _safe_float(row.get('x2'))
+        total = np.zeros_like(x_vals)
+        for comp in _region_components(row):
+            total = total + self._component_baseline(
+                comp, x_vals, x1, x2, use_fit=use_fit, xy=xy, region=region)
+        return total
 
     def _ensure_stellar_cache(self, x, y, rid):
         """Lazily compute & cache the pPXF optimal template for spaxel (x,y),
@@ -5100,18 +5193,21 @@ class ViewerWindow(QMainWindow):
         recomputed on demand here the first time its stellar baseline is drawn.
         No-op if already cached or pPXF/data unavailable."""
         key = (int(x), int(y), int(rid))
-        if (STELLAR_CACHE.get(key) is not None or hcppxf is None
-                or FITS_DATA is None or 'cont_type' not in df_cont.columns):
+        if (STELLAR_CACHE.get(key) is not None or hcppxf is None or FITS_DATA is None):
             return
-        reg = df_cont[(np.int64(df_cont['region_ID']) == np.int64(rid)) &
-                      (df_cont['cont_type'] == 'stellar')]
+        reg = df_cont[np.int64(df_cont['region_ID']) == np.int64(rid)]
         if len(reg) == 0:
             return
         r = reg.iloc[0]
+        # Find the region's stellar component (composite) or legacy stellar row.
+        comp = next((c for c in _region_components(r) if str(c.get('type')) == 'stellar'), None)
+        if comp is None:
+            return
         try:
-            library = str(r['stellar_library'])
+            library = str(comp.get('stellar_library', '') or '')
             fit_range = (float(r['x1']), float(r['x2']))
-            moments = int(r['stellar_moments']) if pd.notna(r.get('stellar_moments')) else 2
+            _m = _safe_float(comp.get('stellar_moments'))
+            moments = int(_m) if np.isfinite(_m) else 2
             z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
             z = 0.0 if not np.isfinite(z) else z
             R = _safe_float(df_obs.loc[0, 'resolvingpower']) if len(df_obs) else np.nan
@@ -5189,24 +5285,31 @@ class ViewerWindow(QMainWindow):
             self.m = np.float64(region["Slope_0"].item())
             self.b = np.float64(region["Intercept_0"].item())
 
-            # Generate updated Gaussian + continuum baseline (linear/spline/stellar)
+            # Composite continuum: draw each continuum component (breakdown, incl.
+            # Fe II magenta) + the total continuum; emission lines are drawn
+            # separately from zero (clean Gaussians).
             x_vals = np.linspace(self.x1, self.x2, 1000)
+            _icomps = _region_components(region.iloc[0])
             y_line = self._region_baseline(region, x_vals, use_fit=False, xy=(x, y))
-            
+            self._draw_component_breakdown(_icomps, x_vals, self.x1, self.x2,
+                                           False, (x, y), region)
+            self.spectrum_ax.plot(x_vals, y_line, color=self._TOTAL_CONT_COLOR,
+                                  lw=1.0, linestyle='-')
+
             # '''
             gaussians = df.loc[np.int64(df["region_ID"]) == region_ID]
 
             # Recompute all Gaussians from scratch (prevents runaway summing)
             y_gaussian_total = np.zeros_like(x_vals)
 
-            # Sum over all existing Gaussians in df
+            # Sum over all existing Gaussians in df (each drawn from zero)
             i = 0
             for _, row in gaussians.iterrows():
                 row['Amp_0'] = np.float64(row['Amp_0'])
                 row['Centroid_0'] = np.float64(row['Centroid_0'])
                 row['Sigma_0'] = np.float64(row['Sigma_0'])
                 gaussian = row["Amp_0"] * np.exp(-((x_vals - row["Centroid_0"]) ** 2) / (2 * row["Sigma_0"] ** 2))
-                new_curve, = self.spectrum_ax.plot(x_vals, gaussian+y_line, color='#d7801a', lw=1,linestyle='--')
+                new_curve, = self.spectrum_ax.plot(x_vals, gaussian, color='#d7801a', lw=1,linestyle='--')
                 df.loc[(np.int64(df['region_ID']==region_ID)) & (df['Line_ID'] == i), 'curveactor'] = new_curve
                 y_gaussian_total += gaussian
                 i = i+1
@@ -5222,15 +5325,13 @@ class ViewerWindow(QMainWindow):
                     line_obj.set_data(x_vals, y_new)
 
 
-            new_line, = self.spectrum_ax.plot(x_vals, y_new, color='lime', lw=1)
+            new_line, = self.spectrum_ax.plot(x_vals, y_new, color='lime', lw=1.6)
             df_cont.loc[np.int64(df_cont["region_ID"]) == region_ID, 'lineactor'] = new_line  # Update reference
 
 
         if show_fit == True:
-            # Model definition for this region (continuum type lives in df_cont).
+            # df_cont row for this region (holds x-range + the component list).
             _model_reg = df_cont.loc[np.int64(df_cont['region_ID']) == int(region_ID)]
-            _is_stellar = (len(_model_reg) > 0 and 'cont_type' in df_cont.columns
-                           and str(_model_reg.iloc[0]['cont_type']) == 'stellar')
             # Fitted emission-line rows for this spaxel/region (may be empty).
             if isinstance(df_fit, pd.DataFrame) and len(df_fit) > 0 and 'spaxel_x' in df_fit.columns:
                 region = df_fit.loc[(df_fit['spaxel_x'].astype(int) == int(x)) &
@@ -5239,67 +5340,51 @@ class ViewerWindow(QMainWindow):
             else:
                 region = df_fit.iloc[0:0] if isinstance(df_fit, pd.DataFrame) else pd.DataFrame()
 
-            if _is_stellar:
-                # Stellar baseline from the cached optimal template; draw it even
-                # if no emission lines were fit for this spaxel.
-                has_cache = STELLAR_CACHE.get((int(x), int(y), int(region_ID))) is not None
-                if not has_cache and len(region) == 0:
-                    return
-                self.x1 = float(_model_reg.iloc[0]['x1'])
-                self.x2 = float(_model_reg.iloc[0]['x2'])
-                x_vals = np.linspace(self.x1, self.x2, 1000)
-                self.m, self.b = np.nan, np.nan
-                y_line = np.nan_to_num(self._stellar_baseline(
-                    _model_reg, x_vals, use_fit=True, xy=(x, y)))
+            _pfx = "cont_region" + str(region_ID + 1) + "_"
+            # Fitted continuum = the region's fitted component list (from df_fit).
+            _fit_comps = (HyperCube_ModelFunctions.coerce_components(
+                              region.iloc[0].get(_pfx + "components"))
+                          if len(region) > 0 else [])
+            self.m, self.b = np.nan, np.nan
+            if _fit_comps:
+                self.x1 = _safe_float(region.iloc[0].get(_pfx + "x_start"))
+                self.x2 = _safe_float(region.iloc[0].get(_pfx + "x_end"))
+                _use_fit, _comps = True, _fit_comps
             else:
-                if len(region) == 0:
-                    return  # no fit data for this spaxel/region (e.g. below SNR cut)
-                _pfx = "cont_region" + str(region_ID + 1) + "_"
-                self.x1 = np.float64(region.iloc[0][_pfx + "x_start"].item())
-                self.x2 = np.float64(region.iloc[0][_pfx + "x_end"].item())
-                x_vals = np.linspace(self.x1, self.x2, 1000)
-                _ctype_col = _pfx + "cont_type"
-                _ctype = str(region.iloc[0][_ctype_col]) if _ctype_col in region.columns else 'linear'
-                if _ctype == 'poly':
-                    coefs = _as_float_list(region.iloc[0][_pfx + "poly_coef_fit"])
-                    self.m, self.b = np.nan, np.nan
-                    y_line = self._eval_poly(coefs, self.x1, self.x2, x_vals)
-                elif _ctype == 'spline':
-                    kx = _as_float_list(region.iloc[0][_pfx + "knots_x"])
-                    ky = _as_float_list(region.iloc[0][_pfx + "knots_y_fit"])
-                    self.m, self.b = np.nan, np.nan
-                    y_line = self._eval_spline(kx, ky, x_vals)
-                elif _ctype == 'powerlaw':
-                    self.m, self.b = np.nan, np.nan
-                    amp = _safe_float(region.iloc[0].get(_pfx + "pl_amp_fit"))
-                    slope = _safe_float(region.iloc[0].get(_pfx + "pl_slope_fit"))
-                    pivot = 0.5 * (self.x1 + self.x2)
-                    y_line = (HyperCube_ModelFunctions.eval_power_law(slope, amp, x_vals, pivot)
-                              if np.isfinite(amp) and np.isfinite(slope) else np.zeros_like(x_vals))
-                elif _ctype == 'feii':
-                    self.m, self.b = np.nan, np.nan
-                    name = str(_model_reg.iloc[0].get('feii_template', '') or '')
-                    amp = _safe_float(region.iloc[0].get(_pfx + "feii_amp_fit"))
-                    v = _safe_float(region.iloc[0].get(_pfx + "feii_v_fit"))
-                    sig = _safe_float(region.iloc[0].get(_pfx + "feii_sigma_fit"))
-                    z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
-                    z = 0.0 if not np.isfinite(z) else z
-                    tmpl = _prepare_feii_template(name, z, (self.x1, self.x2))
-                    y_line = (np.nan_to_num(tmpl.eval(x_vals, amp, v, sig))
-                              if (tmpl is not None and np.isfinite(amp) and np.isfinite(v)
-                                  and np.isfinite(sig)) else np.zeros_like(x_vals))
-                else:
-                    self.m = np.float64(region.iloc[0][_pfx + "slope_fit"].item())
-                    self.b = np.float64(region.iloc[0][_pfx + "intercept_fit"].item())
-                    y_line = self.m * x_vals + self.b  # The baseline (without Gaussians)
-            
+                # No fitted rows for this spaxel/region: fall back to the region's
+                # init components so a continuum-only / below-SNR region still draws
+                # (matches the old stellar-only behaviour). If nothing to show, skip.
+                if len(_model_reg) == 0:
+                    return
+                _has_stellar_cache = STELLAR_CACHE.get((int(x), int(y), int(region_ID))) is not None
+                if len(region) == 0 and not _has_stellar_cache:
+                    return
+                self.x1 = _safe_float(_model_reg.iloc[0].get('x1'))
+                self.x2 = _safe_float(_model_reg.iloc[0].get('x2'))
+                _use_fit, _comps = False, _region_components(_model_reg.iloc[0])
+
+            x_vals = np.linspace(self.x1, self.x2, 1000)
+            # Full continuum = sum of all continuum components (incl. Fe II). Draw
+            # each continuum component (breakdown, incl. Fe II in magenta) and the
+            # total continuum; emission lines are drawn separately from zero.
+            y_line = np.zeros_like(x_vals)
+            for comp in _comps:
+                y_line = y_line + self._component_baseline(
+                    comp, x_vals, self.x1, self.x2, use_fit=_use_fit, xy=(x, y),
+                    region=_model_reg)
+            self._draw_component_breakdown(_comps, x_vals, self.x1, self.x2,
+                                           _use_fit, (x, y), _model_reg)
+            self.spectrum_ax.plot(x_vals, y_line, color=self._TOTAL_CONT_COLOR,
+                                  lw=1.0, linestyle='-')
+
             # '''
             # gaussians = df.loc[np.int64(df["region_ID"]) == region_ID]
-    
+
             # Recompute all Gaussians from scratch (prevents runaway summing)
             y_gaussian_total = np.zeros_like(x_vals)
 
-            # Sum over all existing Gaussians in df
+            # Sum over all existing Gaussians in df (each drawn from zero — a clean
+            # Gaussian — since the continuum baseline can itself be jagged).
             for _, row in region.iterrows():
                 row['amp_fit'] = np.float64(row['amp_fit'])
                 row['cen_fit'] = np.float64(row['cen_fit'])
@@ -5307,7 +5392,7 @@ class ViewerWindow(QMainWindow):
                 plotcolor = row['color']
                 y_gaussian = row["amp_fit"] * np.exp(-((x_vals - row["cen_fit"]) ** 2) / (2 * row["sigma_fit"] ** 2))
                 y_gaussian_total += y_gaussian
-                fit_component, = self.spectrum_ax.plot(x_vals,y_line+y_gaussian,lw=1,linestyle='--',color=plotcolor)
+                fit_component, = self.spectrum_ax.plot(x_vals,y_gaussian,lw=1,linestyle='--',color=plotcolor)
 
 
             # Final y-values
@@ -5320,7 +5405,7 @@ class ViewerWindow(QMainWindow):
                     line_obj.set_data(x_vals, y_new)
 
 
-            new_line, = self.spectrum_ax.plot(x_vals, y_new, color='red', lw=0.5)
+            new_line, = self.spectrum_ax.plot(x_vals, y_new, color='red', lw=1.6)
             df_cont.loc[np.int64(df_cont["region_ID"]) == region_ID, 'lineactor'] = new_line  # Update reference
 
             # ── Push fitted values into the parameter buttons ─────────────
@@ -6221,129 +6306,192 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         apply_btn.clicked.connect(_apply)
         dlg.exec_()
 
+    # Per-component editable-guess cells: (label, sub-key, editable).
+    def _component_display_cells(self, comp):
+        t = str(comp.get('type'))
+        if t == 'linear':
+            return [('m', 'slope_0', True), ('b', 'intercept_0', True)]
+        if t == 'powerlaw':
+            return [('amp', 'pl_amp_0', True), ('slope', 'pl_slope_0', True)]
+        if t == 'feii':
+            return [('tmpl', 'feii_template', False), ('amp', 'feii_amp_0', True),
+                    ('v', 'feii_v_0', True), ('σ', 'feii_sigma_0', True)]
+        if t == 'poly':
+            return [('degree', 'poly_degree', False)]
+        if t == 'spline':
+            return [('#knots', '_nknots', False)]
+        if t == 'stellar':
+            cells = [('lib', 'stellar_library', False), ('V', 'stellar_V_0', True),
+                     ('σ', 'stellar_sigma_0', True), ('scale', 'stellar_scale_0', True)]
+            if int(_safe_float(comp.get('stellar_moments')) or 2) >= 4:
+                cells += [('h3', 'stellar_h3_0', True), ('h4', 'stellar_h4_0', True)]
+            return cells
+        return []
+
     def add_continuum_buttons(self, regionID, grid_layout):
-        # Spline regions get a dedicated, compact display (type, x-range, knot
-        # count, Edit knots…). Linear regions use the original column grid.
-        _reg = df_cont.loc[df_cont['region_ID'] == regionID]
-        _rtype = str(_reg.iloc[0]['cont_type']) if (len(_reg) > 0 and 'cont_type' in df_cont.columns) else 'linear'
-        if _rtype == 'spline':
-            self._add_spline_continuum_buttons(regionID, grid_layout)
+        """Composite-continuum region panel: a header (name, x-range, delete) then
+        one sub-row per additive component (type + editable guesses + remove) and
+        an 'Add component' menu."""
+        reg = df_cont.loc[df_cont['region_ID'] == regionID]
+        if len(reg) == 0:
             return
-        if _rtype == 'poly':
-            self._add_poly_continuum_buttons(regionID, grid_layout)
-            return
-        if _rtype == 'stellar':
-            self._add_stellar_continuum_buttons(regionID, grid_layout)
-            return
-        if _rtype == 'powerlaw':
-            self._add_powerlaw_continuum_buttons(regionID, grid_layout)
-            return
-        if _rtype == 'feii':
-            self._add_feii_continuum_buttons(regionID, grid_layout)
-            return
+        rrow = reg.iloc[0]
+        comps = _region_components(rrow)
+        locked = self._edit_mode()
 
-        # Columns not rendered as buttons here (region_ID/lineactor and the
-        # spline/poly/stellar/AGN-only columns, which never appear for linear
-        # regions but exist on df_cont once such a region has been added).
-        _hidden_cont_cols = {'region_ID', 'lineactor',
-                             'cont_type', 'knots_x', 'knots_y_0', 'knots_y_fit',
-                             'poly_degree', 'poly_coef_0', 'poly_coef_fit'}
-        _hidden_cont_cols |= set(_STELLAR_COLS) | set(_POWERLAW_COLS) | set(_FEII_COLS)
-        # Add Labels (continuum button labels)
-        for col, col_name in enumerate(df_cont.columns):
-            if col_name not in _hidden_cont_cols:
-                label = QLabel(col_name)
-                # label.setStyleSheet("""
-                #     font-family: "Segoe UI";
-                #     font-size: 12pt;
-                #     border: none;
-                #     padding-right: 10px;
-                #     padding-left: 10px;
-                #     padding-top: 5px;
-                #     padding-bottom: 5px;
-                #     background-color: snow;
-                #     color: black;
-                #     font: bold;
-                #     width: 64px;
-                # """)
-                grid_layout.addWidget(label, 0, col)
-            
-        # Add Data (continuum buttons)
-        _rid_col = df_cont.columns.get_loc('region_ID')  # look up by name, not a fixed index
-        for row in range(df_cont.shape[0]):
-           for col, col_name in enumerate(df_cont.columns):
-               if col_name not in _hidden_cont_cols:
-                   if np.int64(df_cont.iloc[row, _rid_col]) == np.int64(regionID):
-                       button_name = 'continuum~'+col_name
-                       # button_text = str(df_cont.iloc[row, col]) if 'fit' not in col_name.lower() else ''
-                       if (col_name == 'Continuum Name') or (type(df_cont.iloc[row, col]) == str):
-                             button_text = str(df_cont.iloc[row, col]) if 'fit' not in col_name.lower() else ''
-                       else:
-                             button_text = _fmt(df_cont.iloc[row, col]) if 'fit' not in col_name.lower() else ''
-                       button = FrameButton(button_text, row, col, regionID, button_name)
-                       # button.setStyleSheet("""
-                       #     font-family: "Segoe UI";
-                       #     font-size: 10pt;
-                       #     border: 2px solid;
-                       #     border-color: steelblue;
-                       #     border-radius: 5px;
-                       #     padding-right: 10px;
-                       #     padding-left: 10px;
-                       #     padding-top: 5px;
-                       #     padding-bottom: 5px;
-                       #     background-color: lightskyblue;
-                       #     highlight-color; cyan;
-                       #     color: k;
-                       #     font: bold;
-                       #     width: 64px;
-                       # """)
-                       
-                       if col >= 5:  # Check the 'fit' column in df_cont
-                           # button.setStyleSheet("""
-                           #     font-family: "Segoe UI";
-                           #     font-size: 12pt;
-                           #     border: 2px solid;
-                           #     border-color: black;
-                           #     border-radius: 5px;
-                           #     padding-right: 10px;
-                           #     padding-left: 10px;
-                           #     padding-top: 5px;
-                           #     padding-bottom: 5px;
-                           #     background-color: darkgrey;
-                           #     color: white;
-                           #     font: bold;
-                           #     width: 64px;
-                           # """)
-                           button.setDisabled(True)  # Disable the button
-                       else:
-                           button.clicked.connect(partial(self.on_button_click, data_frame=df_cont, frame_id=regionID, button_name=button_name))
-                       
-                       grid_layout.addWidget(button, 1, col)
-       
-                       # Store the button reference in buttons_dict by row/col
-                       self.buttons_dict[(regionID, button_name)] = button
-                       
-                       if col == 6:
-                            button_name = 'continuum_delete'
-                            delete_region_button = FrameButton('x', row, col, regionID, button_name)
-                            delete_region_button.setStyleSheet("""
-                                background-color: lightcoral; color: black;
-                                color: k;
-                            """)
-                            if self._edit_mode():
-                                delete_region_button.setEnabled(False)
-                                delete_region_button.setToolTip('Disabled while editing a single spaxel (schema is locked)')
-                            else:
-                                delete_region_button.clicked.connect(partial(self.on_deleteregion_button_click, frame_id=regionID))
+        # ── header row ──
+        for c, lbl in enumerate(['Continuum Name', 'x1', 'x2', '']):
+            grid_layout.addWidget(QLabel(lbl), 0, c)
+        name_btn = FrameButton(str(rrow['Continuum Name']), 0, 0, regionID, 'continuum~Continuum Name')
+        name_btn.clicked.connect(partial(self.on_button_click, data_frame=df_cont,
+                                         frame_id=regionID, button_name='continuum~Continuum Name'))
+        grid_layout.addWidget(name_btn, 1, 0)
+        self.buttons_dict[(regionID, 'continuum~Continuum Name')] = name_btn
+        for c, key in ((1, 'continuum~x1'), (2, 'continuum~x2')):
+            b = FrameButton(_fmt(rrow[key.split('~')[1]]), 0, c, regionID, key)
+            if not locked:
+                b.clicked.connect(partial(self.on_button_click, data_frame=df_cont,
+                                          frame_id=regionID, button_name=key))
+            else:
+                b.setDisabled(True)
+            grid_layout.addWidget(b, 1, c)
+            self.buttons_dict[(regionID, key)] = b
+        del_btn = FrameButton('× region', 0, 3, regionID, 'continuum_delete')
+        del_btn.setStyleSheet("background-color: lightcoral; color: black;")
+        if locked:
+            del_btn.setEnabled(False)
+            del_btn.setToolTip('Disabled while editing a single spaxel (schema is locked)')
+        else:
+            del_btn.clicked.connect(partial(self.on_deleteregion_button_click, frame_id=regionID))
+        grid_layout.addWidget(del_btn, 1, 3)
+        self.buttons_dict[(regionID, 'continuum_delete')] = del_btn
 
-                            grid_layout.addWidget(delete_region_button, 1, col+1)
-                            # Store the button reference in buttons_dict by row/col
-                            self.buttons_dict[(regionID, button_name)] = delete_region_button
-                       
-                       
-    def add_spectral_lines_button_header(self, grid_layout):
+        # ── one row per component ──
+        gr = 2
+        for k, comp in enumerate(comps):
+            t = str(comp.get('type'))
+            grid_layout.addWidget(QLabel(f'  ▸ {t}'), gr, 0)
+            c = 1
+            for label, sub, editable in self._component_display_cells(comp):
+                if sub == '_nknots':
+                    txt = str(len(HyperCube_ModelFunctions.as_float_list(comp.get('knots_x'))))
+                else:
+                    val = comp.get(sub)
+                    txt = str(val) if isinstance(val, str) else _fmt(val)
+                key = f'comp~{k}~{sub}'
+                b = FrameButton(f'{label}:{txt}', 0, c, regionID, key)
+                if editable:
+                    b.clicked.connect(partial(self.on_button_click, data_frame=df_cont,
+                                              frame_id=regionID, button_name=key))
+                else:
+                    b.setDisabled(True)
+                grid_layout.addWidget(b, gr, c)
+                self.buttons_dict[(regionID, key)] = b
+                c += 1
+            rm = FrameButton('remove', 0, c, regionID, f'comp_remove~{k}')
+            rm.setStyleSheet("background-color: #e0a0a0; color: black;")
+            if locked or len(comps) <= 1:
+                rm.setDisabled(True)
+                rm.setToolTip('Cannot remove the last component / while editing a spaxel')
+            else:
+                rm.clicked.connect(partial(self._remove_component, regionID, k))
+            grid_layout.addWidget(rm, gr, c)
+            self.buttons_dict[(regionID, f'comp_remove~{k}')] = rm
+            gr += 1
+
+        # ── add-component menu ──
+        add_btn = QPushButton('Add component ▾')
+        add_btn.setToolTip('Add a power law, Fe II template, linear, polynomial, '
+                           'or stellar component to this region')
+        if locked:
+            add_btn.setEnabled(False)
+        else:
+            add_btn.clicked.connect(partial(self._show_add_component_menu, regionID, add_btn))
+        grid_layout.addWidget(add_btn, gr, 0, 1, 2)
+
+        # Next free grid row (the line table starts here in the shared grid).
+        return gr + 1
+
+    # ── composite-component management ───────────────────────────────────────
+    def _region_idx(self, regionID):
+        m = df_cont.index[np.int64(df_cont['region_ID']) == np.int64(regionID)]
+        return m[0] if len(m) else None
+
+    def _set_region_components(self, regionID, comps):
+        """Write a region's component list and refresh panel + overlays."""
+        global df_cont
+        idx = self._region_idx(regionID)
+        if idx is None:
+            return
+        df_cont.at[idx, 'components'] = comps
+        self._refresh_after_component_change(regionID)
+
+    def _add_component(self, regionID, comp):
+        idx = self._region_idx(regionID)
+        if idx is None:
+            return
+        self._set_region_components(regionID, _region_components(df_cont.loc[idx]) + [comp])
+
+    def _remove_component(self, regionID, k):
+        idx = self._region_idx(regionID)
+        if idx is None:
+            return
+        comps = _region_components(df_cont.loc[idx])
+        if 0 <= k < len(comps) and len(comps) > 1:
+            self._set_region_components(regionID, comps[:k] + comps[k + 1:])
+
+    def _refresh_after_component_change(self, regionID):
+        """Rebuild the panel + redraw all region overlays after a component edit."""
+        vw = self.viewer_window
+        cx = cy = 0
+        if vw.current_spaxel is not None:
+            cx, cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
+        for ln in vw.spectrum_ax.lines[:]:
+            if ln.get_label() != '_child0':
+                try: ln.remove()
+                except ValueError: pass
+        vw.gaussian_component_lines.clear()
+        if 'lineactor' in df_cont.columns:
+            df_cont['lineactor'] = None
+        self.rebuild_fit_panel(show_fit=False, x=cx, y=cy)
+        for _rid in df_cont['region_ID'].astype(int).unique():
+            vw.rebuild_plot(int(_rid), from_file=True, show_init=True, show_fit=False, x=cx, y=cy)
+        vw.spectrum_canvas.draw_idle()
+        vw._mark_init_guess_spaxel()
+
+    def _show_add_component_menu(self, regionID, anchor_btn):
+        from PyQt5.QtWidgets import QMenu
+        idx = self._region_idx(regionID)
+        if idx is None:
+            return
+        row = df_cont.loc[idx]
+        x1, x2 = _safe_float(row.get('x1')), _safe_float(row.get('x2'))
+        amp0 = self._spaxel_flux_guess(x1, x2)
+        menu = QMenu(self)
+        items = [
+            ('Linear', lambda: self._add_component(regionID, {
+                'type': 'linear', 'slope_0': 0.0, 'intercept_0': amp0})),
+            ('Polynomial (deg 3)', lambda: self._add_component(regionID, {
+                'type': 'poly', 'poly_degree': 3, 'poly_coef_0': [amp0, 0.0, 0.0, 0.0]})),
+            ('Power Law', lambda: self._add_component(regionID, {
+                'type': 'powerlaw', 'pl_amp_0': amp0, 'pl_slope_0': -1.5})),
+        ]
+        if hcfeii is not None and hcfeii.list_templates():
+            _tname = next(iter(hcfeii.list_templates()))
+            items.append(('Fe II Template', lambda: self._add_component(regionID, {
+                'type': 'feii', 'feii_template': _tname, 'feii_amp_0': amp0,
+                'feii_v_0': 0.0, 'feii_sigma_0': 2000.0})))
+        if hcppxf is not None:
+            items.append(('Stellar Template… (pPXF)',
+                          lambda: self._add_stellar_component(regionID)))
+        for label, fn in items:
+            menu.addAction(label).triggered.connect(fn)
+        menu.exec_(anchor_btn.mapToGlobal(anchor_btn.rect().bottomLeft()))
+
+
+    def add_spectral_lines_button_header(self, grid_layout, start_row=0):
         button_columns = [
-            'Line Name', 
+            'Line Name',
             'SNR',
             '<i>&lambda;</i><sub>rest</sub>', 
             '<i>f</i><sub>&lambda;,0</sub>', 
@@ -6386,11 +6534,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             #     font: bold;
             #     width: 64px;
             # """)
-            grid_layout.addWidget(label, 2, col)
+            grid_layout.addWidget(label, start_row, col)
 
 
 
-    def add_spectral_lines(self, regionID, grid_layout):
+    def add_spectral_lines(self, regionID, grid_layout, start_row=0):
         global df_cont, df
         # Add Data (spectral line buttons)
         df_region = df.loc[np.int64(df['region_ID']) == np.int64(regionID)]
@@ -6402,7 +6550,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                               'Sigma_0','Sigma_0_lowlim','Sigma_0_highlim',
                               'Amp_fit', 'Centroid_fit', 'v_fit', 'Sigma_fit']
             
-            main_row_index = 3 + row * 2  # Reserve extra row space
+            # Line section starts at `start_row` (the line header); each line uses
+            # a main row + a spacer row (line `row` main = start_row+1+2*row).
+            main_row_index = start_row + 1 + row * 2
             limits_row_index = main_row_index + 1  # Place limit buttons in a separate row
             
             button_height = 24  # Standardized button height
@@ -6711,7 +6861,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 df_cont['Slope_fit'] = pd.to_numeric(df_cont['Slope_fit'], errors='coerce')
                 df_cont['Intercept_fit'] = pd.to_numeric(df_cont['Intercept_fit'], errors='coerce')
                 df_cont['region_ID'] = np.int64(df_cont['region_ID'])
-    
+                # Materialize composite components (coerce CSV repr / legacy columns).
+                df_cont = _materialize_components(df_cont)
+
                 # Load Emission Line Data (df)
                 df_columns = line_data[0]
                 df_values = line_data[1:]
@@ -7030,8 +7182,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             'poly_degree': [np.nan],
             'poly_coef_0': [[]],
             'poly_coef_fit': [[]],
+            'components': [[{'type': 'linear', 'slope_0': 0.0, 'intercept_0': 0.0,
+                             'slope_fit': np.nan, 'intercept_fit': np.nan}]],
         })
-        
+
         if len(df_cont) == 0:
             df_cont = placeholder_cont
         else:
@@ -8016,6 +8170,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             for _c, _d in {**_POWERLAW_COLS, **_FEII_COLS}.items():
                 if _c not in df_cont.columns:
                     df_cont[_c] = _d
+            # Materialize the composite 'components' list (coerces CSV repr strings
+            # and synthesizes from legacy cont_type/flat columns for older files).
+            df_cont = _materialize_components(df_cont)
 
             # Read df (third section, after second empty row)
             df_header_index = split_indices[2] + 1
@@ -8179,20 +8336,26 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
 
     def _stellar_baseline_total(self, spaxel):
-        """Sum of all stellar regions' baselines over `wavelengths` for `spaxel`
-        (zero outside each stellar region's range, and zero if no stellar region)."""
+        """Sum over `wavelengths` for `spaxel` of every region's STELLAR components
+        only (these are pre-subtracted before the joint fit; power-law / Fe II
+        components stay in the model). Zero outside each region's range."""
         total = np.zeros(np.asarray(wavelengths, float).shape)
-        if not isinstance(df_cont, pd.DataFrame) or 'cont_type' not in df_cont.columns:
+        if not isinstance(df_cont, pd.DataFrame):
             return total
         xy = (int(spaxel[0]), int(spaxel[1])) if spaxel is not None else None
         lam = np.asarray(wavelengths, float)
-        for rid in df_cont.loc[df_cont['cont_type'] == 'stellar', 'region_ID']:
-            region = df_cont.loc[np.int64(df_cont['region_ID']) == np.int64(rid)]
-            x1 = float(region['x1'].item()); x2 = float(region['x2'].item())
-            y = np.nan_to_num(self.viewer_window._region_baseline(
-                region, lam, use_fit=False, xy=xy))
+        vw = self.viewer_window
+        for _, row in df_cont.iterrows():
+            stellar = [c for c in _region_components(row) if str(c.get('type')) == 'stellar']
+            if not stellar:
+                continue
+            x1 = _safe_float(row.get('x1')); x2 = _safe_float(row.get('x2'))
+            region = df_cont.loc[np.int64(df_cont['region_ID']) == np.int64(row['region_ID'])]
             mask = (lam >= x1) & (lam <= x2)
-            total[mask] += y[mask]
+            for comp in stellar:
+                y = np.nan_to_num(vw._component_baseline(
+                    comp, lam, x1, x2, use_fit=False, xy=xy, region=region))
+                total[mask] += y[mask]
         return total
 
     def _fit_quality_metrics(self, spectrum, wavelengths, result, flux_scale):
@@ -8323,11 +8486,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             _ra, _dec = np.nan, np.nan
 
         # Per-region stellar kinematics for the result rows (from the cache the
-        # baseline step just ensured).
+        # baseline step just ensured) — for any region with a stellar component.
         stellar_kin = {}
-        if isinstance(df_cont, pd.DataFrame) and 'cont_type' in df_cont.columns:
-            for rid in df_cont.loc[df_cont['cont_type'] == 'stellar', 'region_ID']:
-                rid = int(np.int64(rid))
+        if isinstance(df_cont, pd.DataFrame):
+            for _, _row in df_cont.iterrows():
+                if not any(str(c.get('type')) == 'stellar' for c in _region_components(_row)):
+                    continue
+                rid = int(np.int64(_row['region_ID']))
                 sc = STELLAR_CACHE.get((cx, cy, rid))
                 if sc is not None:
                     stellar_kin[rid] = sc
@@ -8818,6 +8983,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             'poly_coef_0': [], 'poly_coef_fit': [], 'lineactor': None,
             'pl_amp_0': pl_amp, 'pl_slope_0': pl_slope,
             'pl_amp_fit': pl_amp, 'pl_slope_fit': pl_slope,
+            'components': [{'type': 'powerlaw', 'pl_amp_0': pl_amp, 'pl_slope_0': pl_slope,
+                            'pl_amp_fit': pl_amp, 'pl_slope_fit': pl_slope}],
         }
         return self._append_or_update_cont_region(vals, target_rid)
 
@@ -8923,6 +9090,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             'feii_template': template, 'feii_amp_0': amp, 'feii_v_0': v,
             'feii_sigma_0': sigma, 'feii_amp_fit': amp, 'feii_v_fit': v,
             'feii_sigma_fit': sigma,
+            'components': [{'type': 'feii', 'feii_template': template, 'feii_amp_0': amp,
+                            'feii_v_0': v, 'feii_sigma_0': sigma, 'feii_amp_fit': amp,
+                            'feii_v_fit': v, 'feii_sigma_fit': sigma}],
         }
         return self._append_or_update_cont_region(vals, target_rid)
 
@@ -8958,7 +9128,22 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.critical(None, 'Stellar Fit', f'{type(e).__name__}: {e}')
 
-    def _open_stellar_templates_impl(self):
+    def _add_stellar_component(self, regionID):
+        """Menu action: fit pPXF and append a stellar component to `regionID`."""
+        idx = self._region_idx(regionID)
+        rng = None
+        if idx is not None:
+            rng = (_safe_float(df_cont.loc[idx].get('x1')), _safe_float(df_cont.loc[idx].get('x2')))
+        try:
+            self._open_stellar_templates_impl(component_rid=int(np.int64(regionID)),
+                                              default_range=rng)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.critical(None, 'Stellar Fit', f'{type(e).__name__}: {e}')
+
+    def _open_stellar_templates_impl(self, component_rid=None, default_range=None):
         from PyQt5.QtWidgets import QMessageBox
         vw = self.viewer_window
         if hcppxf is None:
@@ -8977,6 +9162,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else np.nan
         z = 0.0 if not np.isfinite(z) else z
         lam_lo, lam_hi = float(np.nanmin(wavelengths)), float(np.nanmax(wavelengths))
+        if default_range and all(np.isfinite(_safe_float(v)) for v in default_range):
+            lam_lo, lam_hi = float(default_range[0]), float(default_range[1])
 
         dlg = QDialog(self)
         dlg.setWindowTitle('Stellar Templates (pPXF)')
@@ -9053,11 +9240,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         if dlg.exec_() != QDialog.Accepted:
             return
-        self._fit_stellar_for_spaxel(dlg._settings)
+        self._fit_stellar_for_spaxel(dlg._settings, component_rid=component_rid)
 
-    def _fit_stellar_for_spaxel(self, settings, target_rid=None):
-        """Run pPXF on the current spaxel and write a stellar continuum region.
-        target_rid=None appends a new region; otherwise the given region is refit."""
+    def _fit_stellar_for_spaxel(self, settings, target_rid=None, component_rid=None):
+        """Run pPXF on the current spaxel. target_rid=None appends a new stellar
+        region; target_rid refits that region; component_rid appends a stellar
+        COMPONENT to an existing (composite) region instead."""
         global df_cont, STELLAR_CACHE, _STELLAR_LIBS
         from PyQt5.QtWidgets import QMessageBox, QApplication
         vw = self.viewer_window
@@ -9088,7 +9276,20 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-        rid = self._write_stellar_region(settings, res, fit_range, target_rid=target_rid)
+        if component_rid is not None:
+            rid = int(np.int64(component_rid))
+            comp = {'type': 'stellar', 'stellar_library': settings['library'],
+                    'stellar_moments': int(settings['moments'])}
+            for _col, _key in (('stellar_V', 'V'), ('stellar_sigma', 'sigma'),
+                               ('stellar_h3', 'h3'), ('stellar_h4', 'h4'),
+                               ('stellar_scale', 'scale')):
+                comp[_col + '_0'] = _safe_float(res.get(_key))
+                comp[_col + '_fit'] = comp[_col + '_0']
+            idx = self._region_idx(rid)
+            if idx is not None:
+                df_cont.at[idx, 'components'] = _region_components(df_cont.loc[idx]) + [comp]
+        else:
+            rid = self._write_stellar_region(settings, res, fit_range, target_rid=target_rid)
         STELLAR_CACHE[(cx, cy, int(rid))] = res['cache']
         # Clear any previous model curves so a re-fit doesn't leave stale ones.
         for ln in vw.spectrum_ax.lines[:]:
@@ -9505,24 +9706,6 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.viewer_window.draw_image(arr, cmap=cmap, scale='linear', from_fits=False)
 
 
-    def _build_feii_region_templates(self, cont, z):
-        """Return {1-based region number -> prepared Fe II template} for every
-        'feii' continuum region in `cont`. Region numbering matches the param
-        naming used in the fit (positional index + 1). Regions whose template
-        fails to load are omitted (their baseline renders as zeros)."""
-        templates = {}
-        if hcfeii is None or not isinstance(cont, pd.DataFrame) or 'cont_type' not in cont.columns:
-            return templates
-        for i, row in cont.iterrows():
-            if str(row.get('cont_type')) != 'feii':
-                continue
-            name = str(row.get('feii_template', '') or '')
-            fit_range = (float(row['x1']), float(row['x2']))
-            tmpl = _prepare_feii_template(name, z, fit_range)
-            if tmpl is not None:
-                templates[i + 1] = tmpl
-        return templates
-
     def fit_single_spaxel(self):
         try:
             self._fit_single_spaxel_impl()
@@ -9553,91 +9736,28 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             z = df_obs['redshift'].item()
 
         params = Parameters()
+        region_components = {}   # {1-based region -> [in-model component descriptors]}
         for i, row in df_cont.iterrows():
             region_id = row['region_ID']
             params.add(f'x{i + 1}_start', value=row['x1'], vary=False)
             params.add(f'x{i + 1}_end', value=row['x2'], vary=False)
 
-            _ctype = str(row['cont_type']) if ('cont_type' in df_cont.columns
-                                               and pd.notna(row['cont_type'])) else 'linear'
-            _kx = _as_float_list(row['knots_x']) if 'knots_x' in df_cont.columns else []
-            _ky = _as_float_list(row['knots_y_0']) if 'knots_y_0' in df_cont.columns else []
-            _pc = _as_float_list(row['poly_coef_0']) if 'poly_coef_0' in df_cont.columns else []
-            is_poly = (_ctype == 'poly' and len(_pc) >= 1)
-            is_spline = (_ctype == 'spline' and len(_kx) >= 2 and len(_kx) == len(_ky))
-            is_stellar = (_ctype == 'stellar')
-            is_powerlaw = (_ctype == 'powerlaw')
-            is_feii = (_ctype == 'feii')
-
-            slope = row['Slope_0'] if np.isfinite(row['Slope_0']) else 0
-            intercept = row['Intercept_0'] if np.isfinite(row['Intercept_0']) else 0
-            # Stellar continuum is a fixed baseline subtracted from the spectrum
-            # before the line fit; power-law / Fe II carry the continuum through
-            # their own free params. In all three cases the linear slope/intercept
-            # model continuum is held at zero.
-            if is_stellar or is_powerlaw or is_feii:
-                slope = intercept = 0
-
-            _linear_off = is_spline or is_poly or is_stellar or is_powerlaw or is_feii
-            params.add(f'slope{i + 1}', value=slope, vary=not _linear_off)
-            params.add(f'intercept{i + 1}', value=intercept, vary=not _linear_off)
-
-            # Power-law continuum: amp (at region midpoint) + slope, both free.
-            if is_powerlaw:
-                _pl_amp = _safe_float(row.get('pl_amp_0'))
-                _pl_slope = _safe_float(row.get('pl_slope_0'))
-                if not np.isfinite(_pl_amp):
-                    _pl_amp = 1.0
-                if not np.isfinite(_pl_slope):
-                    _pl_slope = -1.5
-                params.add(f'PL{i + 1}', value=1, vary=False)
-                params.add(f'pl_amp{i + 1}', value=_pl_amp, vary=True)
-                params.add(f'pl_slope{i + 1}', value=_pl_slope, vary=True)
-            else:
-                params.add(f'PL{i + 1}', value=0, vary=False)
-
-            # Fe II template continuum: amp + velocity offset + dispersion, free.
-            if is_feii:
-                _fe_amp = _safe_float(row.get('feii_amp_0'))
-                _fe_v = _safe_float(row.get('feii_v_0'))
-                _fe_sig = _safe_float(row.get('feii_sigma_0'))
-                if not np.isfinite(_fe_amp):
-                    _fe_amp = 1.0
-                if not np.isfinite(_fe_v):
-                    _fe_v = 0.0
-                if not np.isfinite(_fe_sig) or _fe_sig <= 0:
-                    _fe_sig = 2000.0
-                params.add(f'FE{i + 1}', value=1, vary=False)
-                params.add(f'feii_amp{i + 1}', value=_fe_amp, vary=True, min=0.0)
-                params.add(f'feii_v{i + 1}', value=_fe_v, vary=True, min=-3000.0, max=3000.0)
-                params.add(f'feii_sigma{i + 1}', value=_fe_sig, vary=True, min=100.0, max=10000.0)
-            else:
-                params.add(f'FE{i + 1}', value=0, vary=False)
-
-            if is_poly:
-                params.add(f'NP{i + 1}', value=len(_pc), vary=False)
-                for j in range(len(_pc)):
-                    params.add(f'polyc{i + 1}_{j}', value=float(_pc[j]), vary=True)
-            else:
-                params.add(f'NP{i + 1}', value=0, vary=False)
-
-            if is_spline:
-                ptp = (max(_ky) - min(_ky)) if len(_ky) > 1 else 0.0
-                _delta = 0.5 * ptp if ptp > 0 else max(abs(np.mean(_ky)), 1.0)
-                params.add(f'NK{i + 1}', value=len(_kx), vary=False)
-                for k in range(len(_kx)):
-                    params.add(f'knotx{i + 1}_{k}', value=float(_kx[k]), vary=False)
-                    params.add(f'knoty{i + 1}_{k}', value=float(_ky[k]), vary=True,
-                               min=float(_ky[k]) - _delta, max=float(_ky[k]) + _delta)
-            else:
-                params.add(f'NK{i + 1}', value=0, vary=False)
-
-            if i < len(df_cont) - 1:
-                next_row = df_cont.iloc[i + 1]
-                params.add(f'x_int_{i + 1}_start', value=row['x2'], vary=False)
-                params.add(f'x_int_{i + 1}_end', value=next_row['x1'], vary=False)
-                params.add(f'slope_int_{i + 1}', value=slope, vary=True)
-                params.add(f'intercept_int_{i + 1}', value=intercept, vary=True)
+            # Composite continuum: add lmfit params for each IN-MODEL component
+            # (stellar is pre-subtracted, so it contributes no in-model params) and
+            # collect the structural descriptors the model sums. k counts in-model
+            # components only, matching the fit kernel + PiecewiseModel.
+            _x1r, _x2r = float(row['x1']), float(row['x2'])
+            _descs, _k = [], 0
+            for comp in _region_components(row):
+                if not HyperCube_ModelFunctions.is_in_model(comp.get('type')):
+                    continue
+                desc = HyperCube_ModelFunctions.add_component_params(params, i + 1, _k, comp)
+                if comp.get('type') == 'feii':
+                    desc['payload'] = _prepare_feii_template(
+                        str(comp.get('feii_template', '') or ''), z, (_x1r, _x2r))
+                _descs.append(desc)
+                _k += 1
+            region_components[i + 1] = _descs
 
             region_lines = df[df['region_ID'] == region_id]
             for j, line in enumerate(df.itertuples(), start=1):
@@ -9672,11 +9792,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         Nlines = len(np.unique(df['Line_ID']))
         add_dataframe_constraints_to_params(df, params)
         print(f'Nregions={Nregions}, Nlines={Nlines}')
-        # Prepared Fe II templates for any 'feii' regions (keyed by 1-based region
-        # number) get baked into the model so model_function can render them.
-        region_templates = self._build_feii_region_templates(df_cont, z)
+        # The additive component descriptors (built above, incl. prepared Fe II
+        # templates) are baked into the model so model_function can sum them.
         model_maker = HyperCube_ModelFunctions.PiecewiseModel(
-            n_regions=Nregions, n_gaussians=Nlines, region_templates=region_templates)
+            n_regions=Nregions, n_gaussians=Nlines, region_components=region_components)
         piecewise_model = Model(model_maker.model_function)
 
         fit_results = []
@@ -9749,21 +9868,28 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         global df, df_fit, fit_results, snr_mask, piecewise_model, line, new_results#,params
         global base_df_cont, base_df, spaxel_overrides, df_stellar
 
-        # Power-law / Fe II continuum regions are only wired into the interactive
-        # single-spaxel fit so far; the parallel worker builds its model without
-        # the Fe II template. Block the cube fit here rather than return silently
-        # wrong results across every spaxel. (Parallel AGN continuum is a planned
-        # follow-up.)
-        if isinstance(df_cont, pd.DataFrame) and 'cont_type' in df_cont.columns:
-            _agn = df_cont[df_cont['cont_type'].isin(['powerlaw', 'feii'])]
-            if len(_agn) > 0:
+        # Composite continua (multi-component regions, power-law / Fe II, or any
+        # component that differs from the region's legacy flat columns) are only
+        # wired into the interactive single-spaxel fit so far; the parallel worker
+        # builds its model from the legacy flat params and would silently mis-fit
+        # them. Block the cube fit here. (Parallel composite continuum is a
+        # planned follow-up.)
+        if isinstance(df_cont, pd.DataFrame):
+            _composite = False
+            for _, _r in df_cont.iterrows():
+                _cl = _region_components(_r)
+                _ct0 = str(_cl[0].get('type')) if _cl else 'linear'
+                if (len(_cl) != 1 or _ct0 in ('powerlaw', 'feii')
+                        or _ct0 != (str(_r.get('cont_type')) if pd.notna(_r.get('cont_type')) else 'linear')):
+                    _composite = True
+                    break
+            if _composite:
                 from PyQt5.QtWidgets import QMessageBox
-                names = ', '.join(sorted(set(_agn['cont_type'].astype(str))))
                 QMessageBox.warning(
                     self, 'Fit Cube',
-                    f'Cube fitting of power-law / Fe II continuum regions ({names}) '
-                    'is not supported yet — use "Fit Spaxel" for these. Remove or '
-                    'convert the AGN continuum regions to run a cube fit.')
+                    'Cube fitting of composite / power-law / Fe II continuum regions '
+                    'is not supported yet — use "Fit Spaxel" for these. Reduce regions '
+                    'to a single legacy continuum type to run a cube fit.')
                 return
 
         # A fresh cube fit (re)defines the locked schema template that all
@@ -10245,16 +10371,25 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         title_row.addWidget(del_btn)
         frame_layout.addLayout(title_row)
 
-        # ── Single grid: continuum header + continuum row + line header + line rows
+        # ── Single shared grid: continuum panel on top (a composite region uses a
+        # variable number of rows — one per additive component + an "Add component"
+        # button), then the line table starting right after it. One grid keeps the
+        # continuum and line columns aligned and lets the incremental add-line path
+        # target frame.layout().itemAt(1).
         grid_layout = QGridLayout()
         grid_layout.setHorizontalSpacing(6)
         grid_layout.setVerticalSpacing(3)
         grid_layout.setContentsMargins(4, 4, 4, 4)
         frame_layout.addLayout(grid_layout)
 
-        self.add_continuum_buttons(ID, grid_layout)
-        self.add_spectral_lines_button_header(grid_layout)
-        self.add_spectral_lines(ID, grid_layout)
+        # add_continuum_buttons returns the next free row; the line table starts
+        # there. Remember it per region so incremental line adds land correctly.
+        cont_rows = self.add_continuum_buttons(ID, grid_layout)
+        if not hasattr(self, '_cont_rows'):
+            self._cont_rows = {}
+        self._cont_rows[ID] = cont_rows
+        self.add_spectral_lines_button_header(grid_layout, cont_rows)
+        self.add_spectral_lines(ID, grid_layout, cont_rows)
 
         # Equal stretch on every column so content fills the frame width
         n_cols = 17
@@ -10270,9 +10405,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             add_line_btn.setToolTip('Disabled while editing a single spaxel (schema is locked)')
         else:
             add_line_btn.clicked.connect(partial(self.on_addline_widget, data_frame=df, frame_id=ID))
-        # Row = header(1) + continuum_header(1) + continuum_row(1) + line_header(1) + line_rows
+        # Line section starts at row `cont_rows`: header there, line r at
+        # cont_rows+1+2r, so +Line goes below the last line.
         n_lines = len(df.loc[df['region_ID'] == ID]) if 'region_ID' in df.columns else 0
-        grid_layout.addWidget(add_line_btn, 3 + n_lines * 2, 0)
+        grid_layout.addWidget(add_line_btn, cont_rows + 1 + n_lines * 2, 0)
         self.buttons_dict[(ID, '__add_line__')] = add_line_btn
 
         # ── Append to vertical scroll layout ────────────────────────────────
@@ -10522,8 +10658,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             return
     
     
-        # Get the grid layout inside the frame (second item in the card VBoxLayout)
+        # Card VBoxLayout: item 0 = title row, item 1 = the shared continuum+line
+        # grid. Continuum panel occupies the top `cont_rows` rows; the line table
+        # follows (header at cont_rows, line r main at cont_rows+1+2r).
         grid_layout = frame.layout().itemAt(1).layout()
+        cont_rows = getattr(self, '_cont_rows', {}).get(frame_id, 2)
 
         # Retrieve the stored + Line button and remove it from its current position
         add_line_button = self.buttons_dict.get((frame_id, '__add_line__'))
@@ -10541,9 +10680,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                           'Sigma_0', 'Sigma_0_lowlim', 'Sigma_0_highlim',
                           'Amp_fit', 'Centroid_fit', 'v_fit', 'Sigma_fit']
 
-        # grid row for the new line:
-        # row 0 = cont header, 1 = cont row, 2 = line header, 3..3+n-1 = line rows
-        grid_row = 3 + last_row_idx * 2
+        grid_row = cont_rows + 1 + last_row_idx * 2
 
         for col, col_name in enumerate(button_columns):
             button_name = str(np.int64(df_region.iloc[last_row_idx]['Line_ID'])) + '~' + col_name
@@ -10854,10 +10991,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     # Stellar continuum cells are handled by the dedicated block
                     # below; skip the per-line lookup (would fail on df_cont).
                     button_type = 'stellar'
-                elif button_name.split('~')[0] in ('powerlaw', 'feii'):
-                    # Power-law / Fe II initial-guess cells are handled by the
+                elif button_name.split('~')[0] == 'comp':
+                    # Composite-component initial-guess cells are handled by the
                     # dedicated block below; skip the per-line lookup.
-                    button_type = button_name.split('~')[0]
+                    button_type = 'comp'
                 # elif button_name.split('~')[1] == 'Line_Name':
                 #     string = str(data_frame.loc[(data_frame['region_ID'] == np.float64(frame_id)) & (np.float64(data_frame['Line_ID'])==np.float64(button_name.split(',')[0]))][button_name.split('~')[1]].item())
                 else:
@@ -10905,20 +11042,27 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 layout.addLayout(btn_row)
                 dialog.exec_()
 
-            if button_name.split('~')[0] in ('powerlaw', 'feii'):
-                cparam = button_name.split('~')[1]   # e.g. pl_amp_0 / feii_amp_0
-                cur = df_cont.loc[np.int64(df_cont['region_ID']) == frame_id, cparam]
-                current_val = _fmt(cur.item()) if len(cur) else ''
+            if button_name.split('~')[0] == 'comp':
+                # comp~{k}~{sub}: edit component k's initial-guess sub-param.
+                _parts = button_name.split('~')
+                _k = int(_parts[1]); sub = _parts[2]
+                _idx = self._region_idx(frame_id)
+                _cur = ''
+                if _idx is not None:
+                    _cl = _region_components(df_cont.loc[_idx])
+                    if 0 <= _k < len(_cl):
+                        _v = _cl[_k].get(sub)
+                        _cur = str(_v) if isinstance(_v, str) else _fmt(_v)
                 dialog = QDialog(self)
-                dialog.setWindowTitle(f'Edit {cparam}')
+                dialog.setWindowTitle(f'Edit {sub}')
                 layout = QVBoxLayout(dialog)
-                layout.addWidget(QLabel(f'{cparam}  (current: {current_val})'))
-                tb = QLineEdit(); tb.setText(current_val); tb.selectAll()
+                layout.addWidget(QLabel(f'{sub}  (current: {_cur})'))
+                tb = QLineEdit(); tb.setText(_cur); tb.selectAll()
                 layout.addWidget(tb)
                 btn_row = QHBoxLayout()
                 ok_btn = QPushButton('OK'); ok_btn.setDefault(True)
-                ok_btn.clicked.connect(lambda: [self.on_submit(tb, df_cont, frame_id, button_name, button_type='cont_kin_param'), dialog.accept()])
-                tb.returnPressed.connect(lambda: [self.on_submit(tb, df_cont, frame_id, button_name, button_type='cont_kin_param'), dialog.accept()])
+                ok_btn.clicked.connect(lambda: [self.on_submit(tb, df_cont, frame_id, button_name, button_type='component_param'), dialog.accept()])
+                tb.returnPressed.connect(lambda: [self.on_submit(tb, df_cont, frame_id, button_name, button_type='component_param'), dialog.accept()])
                 cancel_btn = QPushButton('Cancel'); cancel_btn.clicked.connect(dialog.reject)
                 btn_row.addWidget(ok_btn); btn_row.addWidget(cancel_btn)
                 layout.addLayout(btn_row)
@@ -11080,7 +11224,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     constraints_for_line = ['', '', '', '', '']
     
                 # Create the constraints text boxes with enumerators and initial values
-                text_box_constraints_01 = create_numbered_textbox(dialog, 1, f'e.g., amp <= amp_[line name]', constraints_for_line[0] if len(constraints_for_line) > 0 else '')
+                text_box_constraints_01 = create_numbered_textbox(dialog, 1, f'e.g., amp == amp_[line name] / 2.98', constraints_for_line[0] if len(constraints_for_line) > 0 else '')
                 text_box_constraints_02 = create_numbered_textbox(dialog, 2, '', constraints_for_line[1] if len(constraints_for_line) > 1 else '')
                 text_box_constraints_03 = create_numbered_textbox(dialog, 3, '', constraints_for_line[2] if len(constraints_for_line) > 2 else '')
                 text_box_constraints_04 = create_numbered_textbox(dialog, 4, '', constraints_for_line[3] if len(constraints_for_line) > 3 else '')
@@ -11244,14 +11388,19 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             "&nbsp;&nbsp;<tt>vel</tt> — velocity (converted to centroid internally)<br><br>"
             "<b>Operators:</b>&nbsp;&nbsp;"
             "<tt>&lt;=&nbsp;&nbsp;&lt;&nbsp;&nbsp;&gt;=&nbsp;&nbsp;&gt;&nbsp;&nbsp;==</tt><br><br>"
-            "<b>Format:</b><br>"
+            "<b>Format</b> (these are constraints <i>relative to another line</i>):<br>"
             "&nbsp;&nbsp;<tt>param op param_[line_name]</tt><br>"
-            "&nbsp;&nbsp;<tt>param op 0.5 * param_[line_name]</tt><br><br>"
+            "&nbsp;&nbsp;<tt>param op N * param_[line_name]</tt> — scaled reference<br>"
+            "&nbsp;&nbsp;<tt>param op param_[line_name] / N</tt> — divided reference<br><br>"
             "<b>Examples:</b><br>"
             "&nbsp;&nbsp;<tt>amp &lt;= amp_[Halpha]</tt><br>"
             "&nbsp;&nbsp;<tt>sigma &gt;= sigma_[Halpha_b]</tt><br>"
             "&nbsp;&nbsp;<tt>vel == vel_[nii_1]</tt><br>"
-            "&nbsp;&nbsp;<tt>amp &lt;= 0.33 * amp_[Halpha]</tt><br><br>"
+            "&nbsp;&nbsp;<tt>amp &lt;= 0.33 * amp_[Halpha]</tt><br>"
+            "&nbsp;&nbsp;<tt>amp == amp_[OIII5007] / 2.98</tt> — doublet ratio<br><br>"
+            "<b>Absolute bounds</b> (a hard min/max on a single line's parameter, "
+            "e.g. σ &lt; 1000 km/s) are set with the <b>σ0,min / σ0,max</b> and "
+            "centroid/amp min-max buttons in the line table, not here.<br><br>"
             "<b>Velocity ties & windows</b> (Δv in km/s, relative to the "
             "reference line):<br>"
             "&nbsp;&nbsp;<tt>vel == vel_[nii_1]</tt> — same velocity (Δv = 0)<br>"
@@ -11659,34 +11808,41 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     except ValueError: pass
             vw.rebuild_plot(region_ID=frame_id, from_file=False, show_init=True, show_fit=False, x=cx, y=cy)
 
-        elif button_type == 'cont_kin_param':
-            # Power-law / Fe II initial-guess edit: write both the _0 (init) and
-            # the _fit column so the init-guess overlay updates immediately.
-            param = button_name.split('~')[1]   # e.g. pl_amp_0 / feii_v_0
+        elif button_type == 'component_param':
+            # comp~{k}~{sub}: edit component k's initial-guess sub-param in the
+            # region's component list (writes both the _0 and its _fit mirror).
+            _parts = button_name.split('~')
+            _k = int(_parts[1]); sub = _parts[2]
             try:
                 new_value = np.float64(text_box.text())
             except ValueError:
                 print(f"Invalid value: {text_box.text()}")
                 return
-            df_cont.loc[np.int64(df_cont['region_ID']) == frame_id, param] = new_value
-            _fitcol = param.replace('_0', '_fit')
-            if _fitcol in df_cont.columns:
-                df_cont.loc[np.int64(df_cont['region_ID']) == frame_id, _fitcol] = new_value
-            self.update_button_value(frame_id, button_name, _fmt(new_value))
-            vw = self.viewer_window
-            cx = cy = 0
-            if vw.current_spaxel is not None:
-                cx, cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
-            for line in vw.spectrum_ax.lines[:]:
-                if line.get_linestyle() in ('--', 'dashed'):
-                    try: line.remove()
-                    except ValueError: pass
-            vw.gaussian_component_lines.clear()
-            for actor in df_cont.loc[df_cont["region_ID"] == frame_id, 'lineactor']:
-                if actor is not None and actor in vw.spectrum_ax.lines:
-                    try: actor.remove()
-                    except ValueError: pass
-            vw.rebuild_plot(region_ID=frame_id, from_file=False, show_init=True, show_fit=False, x=cx, y=cy)
+            _idx = self._region_idx(frame_id)
+            if _idx is None:
+                return
+            comps = _region_components(df_cont.loc[_idx])
+            if not (0 <= _k < len(comps)):
+                return
+            comps[_k][sub] = float(new_value)
+            _fitk = sub.replace('_0', '_fit')
+            if _fitk != sub:
+                comps[_k][_fitk] = float(new_value)
+            df_cont.at[_idx, 'components'] = comps
+            # Editing a stellar component's kinematics must update the cached
+            # optimal template so the pre-subtracted baseline re-renders (no pPXF).
+            if str(comps[_k].get('type')) == 'stellar':
+                vw = self.viewer_window
+                if vw.current_spaxel is not None:
+                    _cx, _cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
+                    _cache = STELLAR_CACHE.get((_cx, _cy, int(np.int64(frame_id))))
+                    _ckey = {'stellar_V_0': 'V', 'stellar_sigma_0': 'sigma',
+                             'stellar_scale_0': 'scale', 'stellar_h3_0': 'h3',
+                             'stellar_h4_0': 'h4'}.get(sub)
+                    if _cache is not None and _ckey:
+                        _cache[_ckey] = float(new_value)
+            # Rebuild the panel (button face carries a label prefix) + overlays.
+            self._refresh_after_component_change(frame_id)
 
         elif button_type == 'RestWavelength':
             new_value = ast.literal_eval(text_box.text())
