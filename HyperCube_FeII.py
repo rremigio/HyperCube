@@ -45,7 +45,7 @@ _FOLDER = os.path.join(_HERE, 'feii_templates')
 
 TEMPLATES = {
     'park2022': {
-        'folder': 'park2022',
+        'folder': 'park_2022',
         'kind': 'spectrum',
         'fwhm': 15.0,
         'label': 'Park et al. 2022 Fe II Template',

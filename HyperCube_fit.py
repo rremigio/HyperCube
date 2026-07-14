@@ -54,11 +54,14 @@ def _as_float_list(v):
 
 
 # ── model construction ───────────────────────────────────────────────────────
-def build_model(n_regions, n_lines):
+def build_model(n_regions, n_lines, region_components=None):
     """Rebuild the piecewise (continuum + Gaussians) lmfit Model. Matches the
-    construction in HyperCube.fit_cube."""
+    construction in HyperCube.fit_cube. region_components maps a 1-based region
+    number to the ordered list of in-model component structural descriptors
+    (see HyperCube_ModelFunctions.PiecewiseModel)."""
     maker = HyperCube_ModelFunctions.PiecewiseModel(n_regions=n_regions,
-                                                    n_gaussians=n_lines)
+                                                    n_gaussians=n_lines,
+                                                    region_components=region_components)
     return Model(maker.model_function)
 
 
@@ -94,7 +97,6 @@ def staged_fit(model, y, params, wavelengths, max_nfev, df):
 
     try:
         broad_amps = {f'amp{i_b}' for (_i_n, i_b) in pairs}
-        cont_prefixes = ('slope', 'intercept', 'polyc', 'knoty')
         orig_vary = {name: p.vary for name, p in params.items()}
 
         # Stage 1 — core only: suppress free broad amplitudes.
@@ -117,7 +119,7 @@ def staged_fit(model, y, params, wavelengths, max_nfev, df):
             elif name.startswith('offset_vel') or name.startswith('ratio'):
                 continue
             elif (name.startswith(('amp', 'cen', 'sigma')) or
-                  name.startswith(cont_prefixes)):
+                  HyperCube_ModelFunctions.is_component_param(name)):
                 if p.expr is None:
                     p.vary = False
         r2 = model.fit(y, p2, x=wavelengths, max_nfev=max_nfev)
@@ -249,21 +251,12 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
     for pname, param in params_scaled.items():
         if param.expr:
             continue
-        if pname.startswith('amp'):
-            param.set(value=param.value / flux_scale)
-            if param.min is not None:
-                param.min = param.min / flux_scale
-            if param.max is not None:
-                param.max = param.max / flux_scale
-        elif pname.startswith('intercept'):
-            param.set(value=param.value / flux_scale)
-        elif pname.startswith('knoty'):
-            param.set(value=param.value / flux_scale)
-            if param.min is not None and np.isfinite(param.min):
-                param.min = param.min / flux_scale
-            if param.max is not None and np.isfinite(param.max):
-                param.max = param.max / flux_scale
-        elif pname.startswith('polyc'):
+        # Amplitude-like params scale with the flux: line amplitudes (amp{j}) and
+        # the flux-scaled continuum-component params (intercept, pl_amp, feii_amp,
+        # poly coefficients, spline knot y's — see HyperCube_ModelFunctions).
+        # Slope / velocity / dispersion params do NOT.
+        _is_line_amp = pname.startswith('amp') and pname[3:].isdigit()
+        if _is_line_amp or HyperCube_ModelFunctions.is_flux_scaled_param(pname):
             param.set(value=param.value / flux_scale)
             if param.min is not None and np.isfinite(param.min):
                 param.min = param.min / flux_scale
@@ -292,52 +285,40 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
             region_id = line.region_ID
             region_index = df_cont[df_cont['region_ID'] == region_id].index[0] + 1
 
+            # Fitted continuum as an additive component list. Each in-model
+            # component's _fit fields are filled from result.params (the k index
+            # counts in-model components only, matching the param builder); a
+            # pre-subtracted stellar component gets this spaxel's kinematics.
+            _mrow = df_cont[df_cont['region_ID'] == region_id]
+            _comps = (HyperCube_ModelFunctions.coerce_components(_mrow.iloc[0]['components'])
+                      if len(_mrow) and 'components' in df_cont.columns else [])
+            if not _comps and len(_mrow):
+                _lct = (str(_mrow.iloc[0]['cont_type'])
+                        if 'cont_type' in df_cont.columns and pd.notna(_mrow.iloc[0].get('cont_type'))
+                        else 'linear')
+                _comps = [HyperCube_ModelFunctions.legacy_to_component(_lct, _mrow.iloc[0])]
+
+            _fitted, _k = [], 0
+            for _comp in _comps:
+                if HyperCube_ModelFunctions.is_in_model(_comp.get('type')):
+                    _fitted.append(HyperCube_ModelFunctions.component_fit_from_params(
+                        _comp, region_index, _k, result.params, flux_scale))
+                    _k += 1
+                else:  # stellar (pre-subtracted): carry this spaxel's kinematics
+                    _sc = stellar_kin.get(region_id) or stellar_kin.get(int(region_id)) or {}
+                    _sf = dict(_comp)
+                    for _col, _key in (('stellar_V', 'V'), ('stellar_sigma', 'sigma'),
+                                       ('stellar_h3', 'h3'), ('stellar_h4', 'h4'),
+                                       ('stellar_scale', 'scale')):
+                        if _sc.get(_key) is not None:
+                            _sf[_col + '_fit'] = _safe_float(_sc.get(_key))
+                    _fitted.append(_sf)
+
             cont_params = {
                 f'cont_region{region_index}_x_start': params_to_use[f'x{region_index}_start'].value,
                 f'cont_region{region_index}_x_end': params_to_use[f'x{region_index}_end'].value,
-                f'cont_region{region_index}_slope_init': params_to_use[f'slope{region_index}'].init_value,
-                f'cont_region{region_index}_slope_fit': result.params[f'slope{region_index}'].value * flux_scale,
-                f'cont_region{region_index}_intercept_init': params_to_use[f'intercept{region_index}'].init_value,
-                f'cont_region{region_index}_intercept_fit': result.params[f'intercept{region_index}'].value * flux_scale
+                f'cont_region{region_index}_components': _fitted,
             }
-
-            _nk = int(params_to_use[f'NK{region_index}'].value) if f'NK{region_index}' in params_to_use else 0
-            _np_ = int(params_to_use[f'NP{region_index}'].value) if f'NP{region_index}' in params_to_use else 0
-            _mrow = df_cont[df_cont['region_ID'] == region_id]
-            _model_ctype = (str(_mrow.iloc[0]['cont_type'])
-                            if len(_mrow) and 'cont_type' in df_cont.columns else 'linear')
-            if _model_ctype == 'stellar':
-                _ctype_out = 'stellar'
-                _scache = stellar_kin.get(region_id) or stellar_kin.get(int(region_id)) or {}
-                cont_params[f'cont_region{region_index}_stellar_V'] = _safe_float(_scache.get('V'))
-                cont_params[f'cont_region{region_index}_stellar_sigma'] = _safe_float(_scache.get('sigma'))
-                cont_params[f'cont_region{region_index}_stellar_h3'] = _safe_float(_scache.get('h3'))
-                cont_params[f'cont_region{region_index}_stellar_h4'] = _safe_float(_scache.get('h4'))
-                cont_params[f'cont_region{region_index}_stellar_scale'] = _safe_float(_scache.get('scale'))
-            else:
-                _ctype_out = 'poly' if _np_ >= 1 else ('spline' if _nk >= 2 else 'linear')
-            cont_params[f'cont_region{region_index}_cont_type'] = _ctype_out
-            if _np_ >= 1:
-                cont_params[f'cont_region{region_index}_poly_degree'] = _np_ - 1
-                cont_params[f'cont_region{region_index}_poly_coef_init'] = [
-                    params_to_use[f'polyc{region_index}_{j}'].init_value for j in range(_np_)]
-                cont_params[f'cont_region{region_index}_poly_coef_fit'] = [
-                    result.params[f'polyc{region_index}_{j}'].value * flux_scale for j in range(_np_)]
-            if _nk >= 2:
-                cont_params[f'cont_region{region_index}_knots_x'] = [
-                    params_to_use[f'knotx{region_index}_{k}'].value for k in range(_nk)]
-                cont_params[f'cont_region{region_index}_knots_y_init'] = [
-                    params_to_use[f'knoty{region_index}_{k}'].init_value for k in range(_nk)]
-                cont_params[f'cont_region{region_index}_knots_y_fit'] = [
-                    result.params[f'knoty{region_index}_{k}'].value * flux_scale for k in range(_nk)]
-
-            if region_index < len(df_cont):
-                cont_params.update({
-                    f'cont_region{region_index}_x_int_start': params_to_use[f'x_int_{region_index}_start'].value,
-                    f'cont_region{region_index}_x_int_end': params_to_use[f'x_int_{region_index}_end'].value,
-                    f'cont_region{region_index}_slope_int_init': params_to_use[f'slope_int_{region_index}'].init_value,
-                    f'cont_region{region_index}_slope_int_fit': result.params[f'slope_int_{region_index}'].value,
-                })
 
             amp_key = f'amp{line_idx}'
             cen_key = f'cen{line_idx}'
