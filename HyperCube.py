@@ -159,6 +159,60 @@ def _prepare_feii_template(name, z, fit_range):
         return None
 
 
+def _build_type1_bundle(components, lines, z, region_bounds, wl=None):
+    """Freeze the unresolved AGN bundle at a nucleus spaxel: sum the FITTED
+    unresolved continuum components (power law / Fe II / linear) and the FITTED
+    unresolved BLR emission lines over the wavelength grid, returning the frozen
+    bundle flux (physical units == the nucleus). This becomes the payload of a
+    'type1_agn' component whose only free param — agn_amp, =1 at the nucleus —
+    scales it across the cube (the amplitude map traces the PSF).
+
+    components    : fitted unresolved continuum component dicts (with *_fit fields).
+    lines         : fitted unresolved line dicts, each {'amp','cen','sigma'} (fit).
+    region_bounds : (x1, x2) of the region — sets the power-law pivot.
+    Returns (wl, bundle_flux) as numpy arrays.
+    """
+    wl = np.asarray(wavelengths if wl is None else wl, float)
+    x1, x2 = float(region_bounds[0]), float(region_bounds[1])
+    pivot = 0.5 * (x1 + x2)
+    bundle = np.zeros_like(wl)
+    for c in (components or []):
+        t = str(c.get('type'))
+        if t == 'powerlaw':
+            a, s = _safe_float(c.get('pl_amp_fit')), _safe_float(c.get('pl_slope_fit'))
+            if np.isfinite(a) and np.isfinite(s):
+                bundle = bundle + HyperCube_ModelFunctions.eval_power_law(s, a, wl, pivot)
+        elif t == 'feii':
+            a = _safe_float(c.get('feii_amp_fit'))
+            v = _safe_float(c.get('feii_v_fit'))
+            sg = _safe_float(c.get('feii_sigma_fit'))
+            tmpl = _prepare_feii_template(str(c.get('feii_template', '') or ''), z, (x1, x2))
+            if tmpl is not None and np.isfinite(a) and np.isfinite(v) and np.isfinite(sg):
+                bundle = bundle + tmpl.eval(wl, a, v, sg)
+        elif t == 'linear':
+            m, b = _safe_float(c.get('slope_fit')), _safe_float(c.get('intercept_fit'))
+            if np.isfinite(m) and np.isfinite(b):
+                bundle = bundle + (m * wl + b)
+    for ln in (lines or []):
+        a = _safe_float(ln.get('amp'))
+        cen = _safe_float(ln.get('cen'))
+        sg = _safe_float(ln.get('sigma'))
+        if np.isfinite(a) and np.isfinite(cen) and np.isfinite(sg) and sg > 0:
+            bundle = bundle + a * np.exp(-(wl - cen) ** 2 / (2 * sg ** 2))
+    return wl, bundle
+
+
+def _type1_component_from_bundle(wl, bundle, nucleus_spaxel=None):
+    """Wrap a frozen bundle (wl, flux) as a 'type1_agn' component dict. The vector
+    is stored inline so the component is self-contained (session/CSV round-trip);
+    _build_fit_params attaches it as the eval payload."""
+    return {'type': 'type1_agn', 'agn_amp_0': 1.0, 'agn_amp_fit': np.nan,
+            'bundle_wl': [float(v) for v in np.asarray(wl, float)],
+            'bundle_flux': [float(v) for v in np.asarray(bundle, float)],
+            'nucleus_spaxel': (list(nucleus_spaxel)
+                               if nucleus_spaxel is not None else None)}
+
+
 def _region_components(row):
     """Ordered list of continuum component dicts for a df_cont row (Series/dict).
     Reads the authoritative 'components' cell; if absent/empty, synthesizes a
@@ -879,6 +933,11 @@ def _build_fit_params(df, df_cont, z):
             if comp.get('type') == 'feii':
                 desc['payload'] = _prepare_feii_template(
                     str(comp.get('feii_template', '') or ''), z, (_x1r, _x2r))
+            elif comp.get('type') == 'type1_agn':
+                # Frozen bundle vector stored inline on the component (see
+                # _type1_component_from_bundle) -> eval payload (wl, flux).
+                desc['payload'] = (np.asarray(comp.get('bundle_wl', []), float),
+                                   np.asarray(comp.get('bundle_flux', []), float))
             _descs.append(desc)
             _k += 1
         region_components[i + 1] = _descs
