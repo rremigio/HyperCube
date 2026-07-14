@@ -431,7 +431,11 @@ def _worker_init(ctx):
 
     params = Parameters()
     params.loads(ctx['params_dumps'])
-    model = build_model(ctx['n_regions'], ctx['n_lines'])
+    # Rebuild the SAME composite model the main process used — region_components
+    # carries each region's in-model component descriptors (incl. prepared Fe II
+    # payloads). Falls back to the legacy flat model when absent (empty dict).
+    model = build_model(ctx['n_regions'], ctx['n_lines'],
+                        region_components=ctx.get('region_components') or None)
 
     # Prepare a stellar template library per region spec (once per worker).
     preps = []
