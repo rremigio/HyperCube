@@ -213,6 +213,51 @@ def _type1_component_from_bundle(wl, bundle, nucleus_spaxel=None):
                                if nucleus_spaxel is not None else None)}
 
 
+def _region_bundle(row):
+    """The region's frozen type1_agn bundle component dict, or None if unlocked."""
+    b = row.get('type1_bundle') if hasattr(row, 'get') else None
+    return b if (isinstance(b, dict) and str(b.get('type')) == 'type1_agn') else None
+
+
+def _apply_type1_substitution(df, df_cont):
+    """Cube-fit VIEW of (df, df_cont) for the Type 1 resolved/unresolved split.
+    Non-destructive: inputs are untouched; new frames are returned.
+
+    For each region with a LOCKED bundle (df_cont 'type1_bundle' set):
+      - its continuum becomes [resolved components] + [the frozen type1_agn
+        bundle]; flagged UNRESOLVED continuum components (PL / Fe II) are dropped
+        (already baked into the bundle);
+      - its UNRESOLVED (BLR) lines are dropped from df — also baked into the
+        bundle — leaving only resolved host/narrow lines to fit per spaxel.
+    Regions with no bundle pass through unchanged. The interactive nucleus fit
+    does NOT call this (it fits every component/line freely).
+    """
+    if not isinstance(df_cont, pd.DataFrame) or 'type1_bundle' not in df_cont.columns:
+        return df, df_cont
+    locked_regions, new_components, any_locked = set(), [], False
+    for _, row in df_cont.iterrows():
+        bundle = _region_bundle(row)
+        comps = _region_components(row)
+        if bundle is None:
+            new_components.append(comps)
+            continue
+        any_locked = True
+        locked_regions.add(row['region_ID'])
+        resolved = [c for c in comps if not bool(c.get('unresolved'))]
+        new_components.append(resolved + [dict(bundle)])
+    if not any_locked:
+        return df, df_cont
+    df_cont_sub = df_cont.copy()
+    df_cont_sub['components'] = new_components
+
+    df_sub = df
+    if isinstance(df, pd.DataFrame) and len(df) and 'unresolved' in df.columns:
+        drop = (df['unresolved'] == True) & (df['region_ID'].isin(locked_regions))
+        if bool(np.any(drop)):
+            df_sub = df[~drop].reset_index(drop=True)
+    return df_sub, df_cont_sub
+
+
 def _region_components(row):
     """Ordered list of continuum component dicts for a df_cont row (Series/dict).
     Reads the authoritative 'components' cell; if absent/empty, synthesizes a
@@ -279,7 +324,12 @@ data_cont_init = {'Continuum Name': [],
              # Composite continuum: ordered, additive list of component dicts (the
              # authoritative continuum spec). The cont_type / flat columns above are
              # retained only for back-compat migration (see _region_components).
-             'components': []}
+             'components': [],
+             # Type 1 AGN: the frozen unresolved-bundle component dict for this
+             # region (a 'type1_agn' component with the inline bundle vector), or
+             # None. Derived, non-destructive snapshot set by "Lock nucleus"; the
+             # cube fit substitutes it for the region's flagged unresolved items.
+             'type1_bundle': []}
 
 df_cont = pd.DataFrame(data_cont_init)
 
@@ -302,6 +352,11 @@ data_lines_init = {'Line_ID': [],
         'Centroid_fit': [],
         'Sigma_fit': [],
         'region_ID': [],
+        # Type 1 AGN: True marks this line as part of the spatially UNRESOLVED
+        # bundle (a BLR broad line) — fit freely at the nucleus, then frozen into
+        # the type1_agn bundle and dropped from the per-spaxel free-line set in the
+        # cube fit. Absent/False = a resolved (host / narrow) line fit per spaxel.
+        'unresolved': [],
         'curveactor': []}
 
 df = pd.DataFrame(data_lines_init)
