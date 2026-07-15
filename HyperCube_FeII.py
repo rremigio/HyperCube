@@ -187,6 +187,11 @@ def _vel_convolve(spec, velscale, v, sigma):
     sig_pix = sigma / velscale
     v_pix = float(v) / velscale
     half = int(np.ceil(5 * sig_pix + abs(v_pix))) + 1
+    # Keep the kernel no longer than the signal: np.convolve(mode='same') returns
+    # length max(len(spec), len(k)), so a kernel longer than spec (large sigma/|v|,
+    # or a narrow template) yields an oversized output that mismatches the caller's
+    # wavelength grid in np.interp ("fp and xp are not of the same length").
+    half = max(1, min(half, (len(spec) - 1) // 2))
     x = np.arange(-half, half + 1)
     k = np.exp(-0.5 * ((x - v_pix) / sig_pix) ** 2)
     s = k.sum()

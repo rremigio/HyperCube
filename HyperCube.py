@@ -5554,9 +5554,16 @@ class ViewerWindow(QMainWindow):
             _model_reg = df_cont.loc[np.int64(df_cont['region_ID']) == int(region_ID)]
             # Fitted emission-line rows for this spaxel/region (may be empty).
             if isinstance(df_fit, pd.DataFrame) and len(df_fit) > 0 and 'spaxel_x' in df_fit.columns:
-                region = df_fit.loc[(df_fit['spaxel_x'].astype(int) == int(x)) &
-                                    (df_fit['spaxel_y'].astype(int) == int(y)) &
-                                    (df_fit['region_ID'].astype(int) == int(region_ID))]
+                # NaN-safe: failed-fit rows carry only spaxel_x/y (no region_ID),
+                # so region_ID is NaN there — coerce instead of astype(int), which
+                # raises IntCastingNaNError on NaN and crashed the app.
+                _sx = pd.to_numeric(df_fit['spaxel_x'], errors='coerce')
+                _sy = pd.to_numeric(df_fit['spaxel_y'], errors='coerce')
+                _rid = (pd.to_numeric(df_fit['region_ID'], errors='coerce')
+                        if 'region_ID' in df_fit.columns
+                        else pd.Series(np.nan, index=df_fit.index))
+                region = df_fit.loc[(_sx == int(x)) & (_sy == int(y))
+                                    & (_rid == int(region_ID))]
             else:
                 region = df_fit.iloc[0:0] if isinstance(df_fit, pd.DataFrame) else pd.DataFrame()
 
