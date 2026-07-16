@@ -5462,6 +5462,36 @@ class ViewerWindow(QMainWindow):
             col = self._COMPONENT_COLORS.get(str(comp.get('type')), '#8a8a8a')
             self.spectrum_ax.plot(x_vals, yc, color=col, lw=0.8, linestyle=':')
 
+    # Host continuum (sum of resolved components, i.e. everything but the AGN bundle).
+    _HOST_CONT_COLOR = '#2e8b57'
+
+    def _draw_type1_split(self, comps, x_vals, x1, x2, use_fit, xy, region_slice):
+        """When a region carries a frozen Type 1 AGN bundle, draw the unresolved
+        AGN (purple) and the resolved HOST continuum (green = sum of every other
+        component, e.g. stellar template + any linear/poly) as two separate,
+        clearly-visible curves — the decomposition the user cares about. Returns
+        True if an AGN bundle was present (so the caller can skip the generic,
+        fainter per-component breakdown)."""
+        comps = [c for c in comps if isinstance(c, dict)]
+        agn = [c for c in comps if str(c.get('type')) == 'type1_agn']
+        if not agn:
+            return False
+
+        def _sum(cs):
+            y = np.zeros_like(x_vals)
+            for c in cs:
+                y = y + self._component_baseline(c, x_vals, x1, x2, use_fit=use_fit,
+                                                 xy=xy, region=region_slice)
+            return y
+
+        self.spectrum_ax.plot(x_vals, _sum(agn), lw=1.4, linestyle='-',
+                              color=self._COMPONENT_COLORS['type1_agn'])
+        host = [c for c in comps if str(c.get('type')) != 'type1_agn']
+        if host:
+            self.spectrum_ax.plot(x_vals, _sum(host), lw=1.4, linestyle='-',
+                                  color=self._HOST_CONT_COLOR)
+        return True
+
     def _component_baseline(self, comp, x_vals, x1, x2, use_fit=False, xy=None, region=None):
         """Baseline y over x_vals for ONE continuum component dict. `use_fit`
         selects the _fit params (falling back to _0). Stellar renders from the
@@ -5639,8 +5669,10 @@ class ViewerWindow(QMainWindow):
             x_vals = np.linspace(self.x1, self.x2, 1000)
             _icomps = _region_components(region.iloc[0])
             y_line = self._region_baseline(region, x_vals, use_fit=False, xy=(x, y))
-            self._draw_component_breakdown(_icomps, x_vals, self.x1, self.x2,
-                                           False, (x, y), region)
+            if not self._draw_type1_split(_icomps, x_vals, self.x1, self.x2,
+                                          False, (x, y), region):
+                self._draw_component_breakdown(_icomps, x_vals, self.x1, self.x2,
+                                               False, (x, y), region)
             self.spectrum_ax.plot(x_vals, y_line, color=self._TOTAL_CONT_COLOR,
                                   lw=1.0, linestyle='-')
 
@@ -5727,8 +5759,10 @@ class ViewerWindow(QMainWindow):
                 y_line = y_line + self._component_baseline(
                     comp, x_vals, self.x1, self.x2, use_fit=_use_fit, xy=(x, y),
                     region=_model_reg)
-            self._draw_component_breakdown(_comps, x_vals, self.x1, self.x2,
-                                           _use_fit, (x, y), _model_reg)
+            if not self._draw_type1_split(_comps, x_vals, self.x1, self.x2,
+                                          _use_fit, (x, y), _model_reg):
+                self._draw_component_breakdown(_comps, x_vals, self.x1, self.x2,
+                                               _use_fit, (x, y), _model_reg)
             self.spectrum_ax.plot(x_vals, y_line, color=self._TOTAL_CONT_COLOR,
                                   lw=1.0, linestyle='-')
 
