@@ -687,6 +687,48 @@ def _constraint_number(s):
         return None
 
 
+def _break_constraint_cycles(params):
+    """Break circular constraint expressions in `params`. A user tying two lines
+    to each OTHER (e.g. velA==velB on line A AND velB==velA on line B) produces
+    exprs cenA=f(cenB) and cenB=g(cenA) — a cycle lmfit evaluates by infinite
+    recursion (RecursionError, which fails the whole spaxel). A tie is symmetric,
+    so one direction is redundant: detect any parameter whose expr chain returns
+    to itself and drop that expr (make it free), keeping the other direction as a
+    valid one-way tie. Warns so the redundant/contradictory constraint is visible."""
+    import re as _re
+
+    def _refs(expr):
+        return [n for n in _re.findall(r'[A-Za-z_][A-Za-z0-9_]*', expr or '')
+                if n in params]
+
+    changed = True
+    while changed:
+        changed = False
+        for name in list(params.keys()):
+            expr = params[name].expr
+            if not expr:
+                continue
+            seen, stack, cyclic = set(), list(_refs(expr)), False
+            while stack:
+                r = stack.pop()
+                if r == name:
+                    cyclic = True
+                    break
+                if r in seen:
+                    continue
+                seen.add(r)
+                stack.extend(_refs(params[r].expr))
+            if cyclic:
+                print(f"Warning: circular constraint on '{name}' (expr={expr!r}) — "
+                      f"dropping it to avoid infinite recursion. A line-to-line tie "
+                      f"only needs to be set in ONE direction.")
+                params[name].expr = None
+                params[name].vary = True
+                changed = True
+                break   # params mutated; restart the scan
+    return params
+
+
 def add_dataframe_constraints_to_params(df, params):
     """
     Adds RELATIVE constraints (line-to-line ties/ratios) to the lmfit Parameters:
@@ -1017,6 +1059,10 @@ def add_dataframe_constraints_to_params(df, params):
 
         except (ValueError, SyntaxError) as e:
             print(f"Warning: Could not parse constraints string for Line_ID {line_id} ({line_name}): {constraints_list_str} - {e}")
+
+    # Break any circular tie a user may have set in both directions before it
+    # reaches lmfit (a cycle => RecursionError that fails the whole spaxel).
+    _break_constraint_cycles(params)
 
 
 def _build_fit_params(df, df_cont, z):
