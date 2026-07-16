@@ -258,6 +258,50 @@ def _apply_type1_substitution(df, df_cont):
     return df_sub, df_cont_sub
 
 
+def _type1_bundles_from_fit(df, df_cont, df_fit, cx, cy, z):
+    """Freeze the Type 1 AGN bundle(s) from the nucleus spaxel (cx, cy)'s FIT.
+    For each region with >=1 fitted unresolved item, sum its fitted unresolved
+    continuum components (read from df_fit's cont_region{r}_components, which
+    preserve the 'unresolved' flag) + its fitted unresolved (BLR) lines into a
+    frozen bundle. Returns {df_cont_index: type1_agn component dict}. Pure —
+    the caller writes the results into df_cont['type1_bundle']."""
+    out = {}
+    if not (isinstance(df_fit, pd.DataFrame) and len(df_fit)
+            and 'spaxel_x' in df_fit.columns):
+        return out
+    _sx = pd.to_numeric(df_fit['spaxel_x'], errors='coerce')
+    _sy = pd.to_numeric(df_fit['spaxel_y'], errors='coerce')
+    spx = df_fit[(_sx == int(cx)) & (_sy == int(cy))]
+    if len(spx) == 0:
+        return out
+    unresolved_ids = set()
+    if isinstance(df, pd.DataFrame) and 'unresolved' in df.columns:
+        unresolved_ids = set(pd.to_numeric(
+            df.loc[df['unresolved'] == True, 'Line_ID'], errors='coerce').dropna().tolist())
+    _rrid = (pd.to_numeric(spx['region_ID'], errors='coerce')
+             if 'region_ID' in spx.columns else pd.Series(np.nan, index=spx.index))
+    for idx, crow in df_cont.iterrows():
+        rid = crow['region_ID']
+        region_index = df_cont[df_cont['region_ID'] == rid].index[0] + 1
+        reg_rows = spx[_rrid == rid]
+        comps_fit = (HyperCube_ModelFunctions.coerce_components(
+                         reg_rows.iloc[0].get(f'cont_region{region_index}_components'))
+                     if len(reg_rows) else [])
+        unres_comps = [c for c in comps_fit if bool(c.get('unresolved'))]
+        unres_lines = []
+        for _, lr in reg_rows.iterrows():
+            if _safe_float(lr.get('LineID')) in unresolved_ids:
+                unres_lines.append({'amp': _safe_float(lr.get('amp_fit')),
+                                    'cen': _safe_float(lr.get('cen_fit')),
+                                    'sigma': _safe_float(lr.get('sigma_fit'))})
+        if not unres_comps and not unres_lines:
+            continue
+        wl, bundle = _build_type1_bundle(unres_comps, unres_lines, z,
+                                         (crow['x1'], crow['x2']))
+        out[idx] = _type1_component_from_bundle(wl, bundle, (cx, cy))
+    return out
+
+
 def _region_components(row):
     """Ordered list of continuum component dicts for a df_cont row (Series/dict).
     Reads the authoritative 'components' cell; if absent/empty, synthesizes a
@@ -5327,7 +5371,9 @@ class ViewerWindow(QMainWindow):
     # Per-component breakdown-curve colours (power law orange, Fe II magenta,
     # host/stellar cyan, poly/spline blue, linear grey).
     _COMPONENT_COLORS = {'powerlaw': '#d7801a', 'feii': '#c840c8', 'stellar': '#00bcd4',
-                         'poly': '#6d8fff', 'spline': '#6d8fff', 'linear': '#8a8a8a'}
+                         'poly': '#6d8fff', 'spline': '#6d8fff', 'linear': '#8a8a8a',
+                         # frozen unresolved Type 1 AGN bundle
+                         'type1_agn': '#8e24aa'}
     # Total continuum (sum of all continuum components, incl. Fe II).
     _TOTAL_CONT_COLOR = '#5b8fc9'
 
@@ -5388,6 +5434,15 @@ class ViewerWindow(QMainWindow):
                 else np.zeros_like(x_vals)
         if t == 'stellar' and region is not None:
             return np.nan_to_num(self._stellar_baseline(region, x_vals, use_fit=use_fit, xy=xy))
+        if t == 'type1_agn':
+            # Frozen unresolved bundle scaled by its amplitude (agn_amp_fit for the
+            # per-spaxel fit, else the nucleus reference agn_amp_0 = 1).
+            amp = _g('agn_amp')
+            wl_b = HyperCube_ModelFunctions.as_float_list(comp.get('bundle_wl'))
+            fl_b = HyperCube_ModelFunctions.as_float_list(comp.get('bundle_flux'))
+            if not np.isfinite(amp) or len(wl_b) < 2 or len(wl_b) != len(fl_b):
+                return np.zeros_like(x_vals)
+            return amp * np.interp(x_vals, wl_b, fl_b)
         return np.zeros_like(x_vals)
 
     def _region_baseline(self, region, x_vals, use_fit=False, xy=None):
