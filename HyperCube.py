@@ -10090,6 +10090,17 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         else:
             z = df_obs['redshift'].item()
     
+        # Type 1 AGN: cube-fit on the resolved/unresolved VIEW. For any region
+        # with a LOCKED bundle, _apply_type1_substitution swaps its flagged
+        # unresolved components + broad lines for the single frozen type1_agn
+        # bundle (one free agn_amp/spaxel). Non-destructive — we rebind the
+        # globals to the view only for the fit and restore the raw df/df_cont
+        # afterward (below), so overlays / editing / re-fitting see the full data.
+        # No-op (view is the raw frames) when nothing is locked.
+        _type1_raw_df, _type1_raw_dfc = df, df_cont
+        df, df_cont = _apply_type1_substitution(df, df_cont)
+        _type1_swapped = (df is not _type1_raw_df) or (df_cont is not _type1_raw_dfc)
+
         # Model parameters — SAME shared builder as the interactive path, so a
         # composite continuum cube-fits identically to a single-spaxel fit. The
         # region_components (incl. prepared Fe II payloads) are threaded to the
@@ -10288,7 +10299,14 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 df_stellar = pd.DataFrame(_stellar_rows)
             # After fitting, create the results dataframe
             df_fit = pd.DataFrame(fit_results)
-        
+
+        # Type 1: restore the raw (un-substituted) df/df_cont now the fit is done.
+        # The per-spaxel overlay below reads fitted components from df_fit (which
+        # already hold the fitted type1_agn/agn_amp), so it renders correctly on
+        # the raw frames; editing / re-fitting again see the full component list.
+        if _type1_swapped:
+            df, df_cont = _type1_raw_df, _type1_raw_dfc
+
         # Clean up the dataframe
         if 'fit_success' in df_fit.columns:
             # Handle failed fits
