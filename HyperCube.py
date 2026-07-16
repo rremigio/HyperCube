@@ -10132,6 +10132,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         if isinstance(df, pd.DataFrame) and len(df):
             if 'unresolved' not in df.columns:
                 df['unresolved'] = False
+            # A reindex/concat can leave 'unresolved' float64 (NaN), into which a
+            # bool assignment warns (future error). Normalise to a real bool column
+            # (missing -> False) first — build the list explicitly to avoid the
+            # fillna/downcast deprecation too.
+            df['unresolved'] = [bool(v) if pd.notna(v) else False
+                                for v in df['unresolved']]
             for lid, cb in line_boxes.items():
                 df.loc[df['Line_ID'] == lid, 'unresolved'] = bool(cb.isChecked())
         for idx, cr in df_cont.iterrows():
@@ -10320,7 +10326,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
     def fit_cube(self, refit=False, rchisq_thresh=None, qual_col=None, qual_op='>',
                  bad_spaxels_override=None):
-        global df, df_fit, fit_results, snr_mask, piecewise_model, line, new_results#,params
+        global df, df_cont, df_fit, fit_results, snr_mask, piecewise_model, line, new_results#,params
         global base_df_cont, base_df, spaxel_overrides, df_stellar
 
         # Composite continua (multi-component regions, power-law / Fe II, stellar
