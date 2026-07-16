@@ -7303,6 +7303,21 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.feii_template_button.setToolTip(
             'Add an Fe II template continuum region (amp + velocity + dispersion) — for Type 1 AGN')
 
+        # Type 1 AGN: mark unresolved features, freeze them at the nucleus, or clear.
+        self.type1_button = QPushButton('Type 1 AGN ▾')
+        self.type1_button.setToolTip(
+            'Resolved/unresolved decomposition for a Type 1 AGN:\n'
+            '• Mark Unresolved… — flag the power law / Fe II / broad lines that make up\n'
+            '  the spatially unresolved (point-source) AGN.\n'
+            '• Lock Nucleus — freeze those FITTED features at the current spaxel into one\n'
+            '  bundle; Fit Cube then scales it by a single amplitude per spaxel (PSF).\n'
+            '• Unlock — clear the frozen bundle and fit the AGN freely again.')
+        _t1menu = QMenu(self.type1_button)
+        _t1menu.addAction('Mark Unresolved Features…', self.open_type1_unresolved_dialog)
+        _t1menu.addAction('Lock Nucleus', self.lock_type1_nucleus)
+        _t1menu.addAction('Unlock (clear bundle)', self.unlock_type1_nucleus)
+        self.type1_button.setMenu(_t1menu)
+
         self.fit_spaxel_button.clicked.connect(self.fit_single_spaxel)
         self.clear_spaxel_fit_button.clicked.connect(self.clear_spaxel_fit)
         self.cancel_edit_button.clicked.connect(self.cancel_spaxel_edit)
@@ -7316,7 +7331,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         for btn in [self.fit_spaxel_button, self.clear_spaxel_fit_button,
                     self.cancel_edit_button, self.toggle_edited_button,
                     self.stellar_template_button, self.power_law_button,
-                    self.feii_template_button]:
+                    self.feii_template_button, self.type1_button]:
             btn.setFixedHeight(28)
             row1.addWidget(btn)
         row1.addStretch()
@@ -9991,6 +10006,132 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         cmap = 'bwr' if col == 'stellar_V' else 'plasma'
         self.viewer_window.draw_image(arr, cmap=cmap, scale='linear', from_fits=False)
 
+
+    def open_type1_unresolved_dialog(self):
+        """Checkbox dialog to flag which emission lines and continuum components
+        are spatially UNRESOLVED (the Type 1 AGN bundle: power law + Fe II + BLR
+        broad lines). Writes df['unresolved'] and each component's 'unresolved'."""
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QCheckBox,
+                                     QLabel, QPushButton, QGroupBox, QScrollArea, QWidget)
+        global df, df_cont
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Mark Unresolved Features (Type 1 AGN)')
+        outer = QVBoxLayout(dlg)
+        outer.addWidget(QLabel(
+            'Check the spatially UNRESOLVED (point-source AGN) features — the power\n'
+            'law, Fe II, and broad emission lines. "Lock Nucleus" freezes these,\n'
+            'as fitted at the current spaxel, into one bundle scaled per spaxel.'))
+        _scroll = QScrollArea(); _scroll.setWidgetResizable(True)
+        _inner = QWidget(); lay = QVBoxLayout(_inner)
+        _scroll.setWidget(_inner); outer.addWidget(_scroll)
+
+        line_boxes, comp_boxes = {}, {}
+        gb_l = QGroupBox('Emission lines'); ll = QVBoxLayout(gb_l)
+        if isinstance(df, pd.DataFrame) and len(df):
+            _has = 'unresolved' in df.columns
+            for _, r in df.iterrows():
+                lid = int(r['Line_ID'])
+                cb = QCheckBox(f"{r.get('Line_Name', 'line')}   (region {int(r['region_ID'])})")
+                cb.setChecked(bool(r.get('unresolved')) if _has else False)
+                ll.addWidget(cb); line_boxes[lid] = cb
+        if not line_boxes:
+            ll.addWidget(QLabel('  (no lines yet)'))
+        lay.addWidget(gb_l)
+
+        gb_c = QGroupBox('Continuum components'); cl = QVBoxLayout(gb_c)
+        _any_c = False
+        for idx, cr in df_cont.iterrows():
+            for k, c in enumerate(_region_components(cr)):
+                cb = QCheckBox(f"region {int(cr['region_ID'])}:  {c.get('type')}")
+                cb.setChecked(bool(c.get('unresolved')))
+                cl.addWidget(cb); comp_boxes[(idx, k)] = cb; _any_c = True
+        if not _any_c:
+            cl.addWidget(QLabel('  (no continuum components yet)'))
+        lay.addWidget(gb_c)
+
+        brow = QHBoxLayout(); cancel = QPushButton('Cancel'); ok = QPushButton('Apply')
+        ok.setDefault(True); brow.addStretch(); brow.addWidget(cancel); brow.addWidget(ok)
+        outer.addLayout(brow)
+        cancel.clicked.connect(dlg.reject); ok.clicked.connect(dlg.accept)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        if isinstance(df, pd.DataFrame) and len(df):
+            if 'unresolved' not in df.columns:
+                df['unresolved'] = False
+            for lid, cb in line_boxes.items():
+                df.loc[df['Line_ID'] == lid, 'unresolved'] = bool(cb.isChecked())
+        for idx, cr in df_cont.iterrows():
+            comps = [dict(c) for c in _region_components(cr)]
+            for k in range(len(comps)):
+                cb = comp_boxes.get((idx, k))
+                if cb is not None:
+                    comps[k]['unresolved'] = bool(cb.isChecked())
+            df_cont.at[idx, 'components'] = comps
+
+    def lock_type1_nucleus(self):
+        """Freeze the current spaxel's fitted unresolved features into per-region
+        type1_agn bundles (df_cont['type1_bundle']). Non-destructive: raw
+        components/lines are untouched; Fit Cube substitutes the bundle."""
+        from PyQt5.QtWidgets import QMessageBox
+        vw = self.viewer_window
+        if vw is None or getattr(vw, 'current_spaxel', None) is None:
+            QMessageBox.warning(self, 'Lock Nucleus', 'Select and fit a nucleus spaxel first.')
+            return
+        _flagged_line = (isinstance(df, pd.DataFrame) and 'unresolved' in df.columns
+                         and bool((df['unresolved'] == True).any()))
+        _flagged_comp = any(bool(c.get('unresolved'))
+                            for _, r in df_cont.iterrows() for c in _region_components(r))
+        if not (_flagged_line or _flagged_comp):
+            QMessageBox.warning(self, 'Lock Nucleus',
+                'Nothing is marked unresolved. Use "Mark Unresolved Features…" to flag the '
+                'AGN power law / Fe II / broad lines, fit this spaxel, then lock.')
+            return
+        cx, cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
+        z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
+        z = 0.0 if not np.isfinite(z) else z
+        try:
+            bundles = _type1_bundles_from_fit(df, df_cont, df_fit, cx, cy, z)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, 'Lock Nucleus', f'Failed to build the bundle:\n{e}')
+            return
+        if not bundles:
+            QMessageBox.warning(self, 'Lock Nucleus',
+                f'No fitted unresolved components/lines found for spaxel ({cx},{cy}). '
+                'Fit THIS spaxel (with the AGN features marked unresolved) before locking.')
+            return
+        for idx, comp in bundles.items():
+            df_cont.at[idx, 'type1_bundle'] = comp
+        QMessageBox.information(self, 'Lock Nucleus',
+            f'Locked the Type 1 AGN bundle at spaxel ({cx},{cy}) for {len(bundles)} region(s).\n'
+            'Fit Cube will now scale this frozen bundle by one amplitude per spaxel.')
+        self._refresh_type1_overlay(cx, cy)
+
+    def unlock_type1_nucleus(self):
+        """Clear all frozen Type 1 bundles so the AGN continuum fits freely again."""
+        from PyQt5.QtWidgets import QMessageBox
+        if 'type1_bundle' not in df_cont.columns or df_cont['type1_bundle'].isna().all():
+            QMessageBox.information(self, 'Unlock', 'No Type 1 bundle is locked.')
+            return
+        df_cont['type1_bundle'] = None
+        QMessageBox.information(self, 'Unlock',
+            'Cleared the Type 1 AGN bundle(s). Cube fits will fit the AGN continuum '
+            'freely per spaxel again.')
+        vw = self.viewer_window
+        if vw is not None and getattr(vw, 'current_spaxel', None) is not None:
+            self._refresh_type1_overlay(int(vw.current_spaxel[0]), int(vw.current_spaxel[1]))
+
+    def _refresh_type1_overlay(self, cx, cy):
+        """Redraw the current spaxel's model after a lock/unlock state change."""
+        vw = self.viewer_window
+        try:
+            for region_ID in np.unique(np.int64(df_cont['region_ID'])):
+                vw.rebuild_plot(region_ID, from_file=True, show_init=False,
+                                show_fit=True, x=cx, y=cy)
+            vw.spectrum_canvas.draw_idle()
+        except Exception:
+            pass
 
     def fit_single_spaxel(self):
         try:
