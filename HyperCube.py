@@ -321,12 +321,39 @@ def _materialize_components(cont):
     Call on every df_cont load path so the composite panel/fit have a clean list."""
     if not isinstance(cont, pd.DataFrame):
         return cont
+    # Type 1 AGN: ensure the frozen-bundle column exists (older sessions/CSVs
+    # predate it) and coerce any CSV repr-string cells back to dicts.
+    if 'type1_bundle' not in cont.columns:
+        cont['type1_bundle'] = None
+    else:
+        cont['type1_bundle'] = [_coerce_type1_bundle(v) for v in cont['type1_bundle']]
     if len(cont) == 0:
         if 'components' not in cont.columns:
             cont['components'] = pd.Series(dtype=object)
         return cont
     cont['components'] = [_region_components(r) for _, r in cont.iterrows()]
     return cont
+
+
+def _coerce_type1_bundle(value):
+    """A df_cont 'type1_bundle' cell -> a type1_agn component dict or None. Handles
+    a real dict (session pickle) and a repr string (CSV round-trip)."""
+    if isinstance(value, dict):
+        return value if str(value.get('type')) == 'type1_agn' else None
+    if isinstance(value, str) and value.strip() and value.strip().lower() != 'nan':
+        try:
+            v = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            # repr() of a dict holding np.nan / np.inf writes bare `nan`/`inf`,
+            # which ast.literal_eval rejects — map them to None and retry (same
+            # fix as coerce_components).
+            try:
+                _clean = re.sub(r'[-+]?\b(?:nan|inf|Infinity)\b', 'None', value)
+                v = ast.literal_eval(_clean)
+            except (ValueError, SyntaxError):
+                return None
+        return v if isinstance(v, dict) and str(v.get('type')) == 'type1_agn' else None
+    return None
 
 
 global spectrum
@@ -10101,6 +10128,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 f'No fitted unresolved components/lines found for spaxel ({cx},{cy}). '
                 'Fit THIS spaxel (with the AGN features marked unresolved) before locking.')
             return
+        if 'type1_bundle' not in df_cont.columns:
+            df_cont['type1_bundle'] = None
         for idx, comp in bundles.items():
             df_cont.at[idx, 'type1_bundle'] = comp
         QMessageBox.information(self, 'Lock Nucleus',
