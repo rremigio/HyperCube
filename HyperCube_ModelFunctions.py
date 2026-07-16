@@ -198,8 +198,12 @@ def legacy_to_component(cont_type, row):
                 'feii_v_fit': _cf(g('feii_v_fit')), 'feii_sigma_fit': _cf(g('feii_sigma_fit'))}
     if ct == 'stellar':
         mom = _cf(g('stellar_moments'))
+        _md = _cf(g('stellar_mdegree'))
+        _dg = _cf(g('stellar_degree'))
         comp = {'type': 'stellar', 'stellar_library': str(g('stellar_library', '') or ''),
-                'stellar_moments': int(mom) if np.isfinite(mom) else 2}
+                'stellar_moments': int(mom) if np.isfinite(mom) else 2,
+                'stellar_mdegree': int(_md) if np.isfinite(_md) else 10,
+                'stellar_degree': int(_dg) if np.isfinite(_dg) else -1}
         for f in ('stellar_V', 'stellar_sigma', 'stellar_h3', 'stellar_h4', 'stellar_scale'):
             comp[f + '_0'] = _cf(g(f + '_0'))
             comp[f + '_fit'] = _cf(g(f + '_fit'))

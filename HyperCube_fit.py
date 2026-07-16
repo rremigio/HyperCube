@@ -391,7 +391,8 @@ def fit_stellar_one(spectrum, wavelengths, z, R, prep):
         res = hcppxf.fit_stellar(
             flux, wavelengths, z, R, prep['lib'],
             fit_range=prep['fit_range'], mask_centroids=prep['mask'],
-            moments=prep['moments'], degree=-1, mdegree=10,
+            moments=prep['moments'], degree=prep.get('degree', -1),
+            mdegree=prep.get('mdegree', 10),
             sigma_guess=150.0, velscale=prep['velscale'])
     except Exception:
         return None, np.zeros_like(lam)
@@ -448,6 +449,8 @@ def _worker_init(ctx):
                 lib.prepare(velscale, R, lam_rest)
                 preps.append(dict(rid=spec['rid'], lib=lib, velscale=velscale,
                                   mask=ctx['stellar_mask'], moments=spec['moments'],
+                                  mdegree=spec.get('mdegree', 10),
+                                  degree=spec.get('degree', -1),
                                   fit_range=spec['fit_range'], library=spec['library']))
             except Exception as e:
                 print(f"worker stellar prep failed ({spec.get('library')}): {e}")

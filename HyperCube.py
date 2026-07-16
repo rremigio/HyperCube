@@ -109,6 +109,7 @@ _STELLAR_COLS = {
     'stellar_h3_0': np.nan, 'stellar_h4_0': np.nan, 'stellar_scale_0': np.nan,
     'stellar_V_fit': np.nan, 'stellar_sigma_fit': np.nan, 'stellar_h3_fit': np.nan,
     'stellar_h4_fit': np.nan, 'stellar_scale_fit': np.nan, 'stellar_moments': 2,
+    'stellar_mdegree': 10, 'stellar_degree': -1,
     'stellar_chi2': np.nan,
 }
 
@@ -1169,10 +1170,14 @@ def _stellar_specs_from_components(df_cont):
             if not library:
                 continue
             _m = _safe_float(comp.get('stellar_moments'))
+            _md = _safe_float(comp.get('stellar_mdegree'))
+            _dg = _safe_float(comp.get('stellar_degree'))
             specs.append(dict(
                 rid=int(np.int64(r['region_ID'])),
                 library=library,
                 moments=int(_m) if np.isfinite(_m) else 2,
+                mdegree=int(_md) if np.isfinite(_md) else 10,
+                degree=int(_dg) if np.isfinite(_dg) else -1,
                 x1=float(r['x1']), x2=float(r['x2'])))
     return specs
 
@@ -5586,6 +5591,10 @@ class ViewerWindow(QMainWindow):
             fit_range = (float(r['x1']), float(r['x2']))
             _m = _safe_float(comp.get('stellar_moments'))
             moments = int(_m) if np.isfinite(_m) else 2
+            _md = _safe_float(comp.get('stellar_mdegree'))
+            mdegree = int(_md) if np.isfinite(_md) else 10
+            _dg = _safe_float(comp.get('stellar_degree'))
+            degree = int(_dg) if np.isfinite(_dg) else -1
             z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
             z = 0.0 if not np.isfinite(z) else z
             R = _safe_float(df_obs.loc[0, 'resolvingpower']) if len(df_obs) else np.nan
@@ -5599,7 +5608,7 @@ class ViewerWindow(QMainWindow):
                     if len(df) > 0 and 'Centroid_0' in df.columns else ())
             res = hcppxf.fit_stellar(spectrum, wavelengths, z, R, lib,
                                      fit_range=fit_range, mask_centroids=mask,
-                                     moments=moments, degree=-1, mdegree=10,
+                                     moments=moments, degree=degree, mdegree=mdegree,
                                      sigma_guess=150.0, velscale=velscale)
             STELLAR_CACHE[key] = res['cache']
         except Exception as e:
@@ -9683,7 +9692,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         if component_rid is not None:
             rid = int(np.int64(component_rid))
             comp = {'type': 'stellar', 'stellar_library': settings['library'],
-                    'stellar_moments': int(settings['moments'])}
+                    'stellar_moments': int(settings['moments']),
+                    # Persist the pPXF polynomial choice so the cube / per-spaxel
+                    # fits use the SAME (physical) model as this reference fit —
+                    # mdegree=0 keeps the host physical (no multiplicative poly that
+                    # would otherwise absorb an AGN power law / Fe II).
+                    'stellar_mdegree': int(settings.get('mdegree', 10)),
+                    'stellar_degree': int(settings.get('degree', -1))}
             for _col, _key in (('stellar_V', 'V'), ('stellar_sigma', 'sigma'),
                                ('stellar_h3', 'h3'), ('stellar_h4', 'h4'),
                                ('stellar_scale', 'scale')):
@@ -9739,6 +9754,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             'stellar_V_fit': res['V'], 'stellar_sigma_fit': res['sigma'],
             'stellar_h3_fit': res['h3'], 'stellar_h4_fit': res['h4'],
             'stellar_scale_fit': res['scale'], 'stellar_moments': settings['moments'],
+            'stellar_mdegree': int(settings.get('mdegree', 10)),
+            'stellar_degree': int(settings.get('degree', -1)),
             'stellar_chi2': res['chi2'],
         }
         # Refit: update the targeted region in place.
@@ -9769,12 +9786,16 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         if len(reg) == 0:
             return
         r = reg.iloc[0]
+        _md = _safe_float(r.get('stellar_mdegree'))
+        _dg = _safe_float(r.get('stellar_degree'))
         settings = dict(
             library=str(r.get('stellar_library', '') or
                         next(iter(hcppxf.list_libraries()), '')),
             fit_range=(float(r['x1']), float(r['x2'])),
             moments=int(r['stellar_moments']) if pd.notna(r.get('stellar_moments')) else 2,
-            degree=-1, mdegree=10, sigma_guess=150.0, mask_lines=True)
+            degree=int(_dg) if np.isfinite(_dg) else -1,
+            mdegree=int(_md) if np.isfinite(_md) else 10,
+            sigma_guess=150.0, mask_lines=True)
         self._fit_stellar_for_spaxel(settings, target_rid=int(np.int64(regionID)))
 
     def fit_stellar_cube(self):
@@ -9876,7 +9897,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             for _s in _stellar_specs_from_components(df_cont):
                 stellar_specs.append(dict(
                     rid=_s['rid'], library=_s['library'],
-                    fit_range=(_s['x1'], _s['x2']), moments=_s['moments']))
+                    fit_range=(_s['x1'], _s['x2']), moments=_s['moments'],
+                    mdegree=_s['mdegree'], degree=_s['degree']))
             if stellar_specs and len(df) > 0 and 'Centroid_0' in df.columns:
                 stellar_mask = df['Centroid_0'].astype(float).to_numpy()
 
@@ -9988,7 +10010,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             lib.prepare(velscale, R, lam_rest)
             preps.append(dict(rid=_s['rid'], lib=lib,
                               velscale=velscale, z=z, R=R, mask=mask,
-                              moments=moments, fit_range=fit_range, library=library))
+                              moments=moments, mdegree=_s['mdegree'],
+                              degree=_s['degree'], fit_range=fit_range, library=library))
         return preps
 
     def _stellar_fit_one(self, i, j, prep):
@@ -10001,7 +10024,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             res = hcppxf.fit_stellar(
                 flux, wavelengths, prep['z'], prep['R'], prep['lib'],
                 fit_range=prep['fit_range'], mask_centroids=prep['mask'],
-                moments=prep['moments'], degree=-1, mdegree=10,
+                moments=prep['moments'], degree=prep.get('degree', -1),
+                mdegree=prep.get('mdegree', 10),
                 sigma_guess=150.0, velscale=prep['velscale'])
         except Exception:
             return None
