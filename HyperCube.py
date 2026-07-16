@@ -10174,10 +10174,16 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 f'No fitted unresolved components/lines found for spaxel ({cx},{cy}). '
                 'Fit THIS spaxel (with the AGN features marked unresolved) before locking.')
             return
-        if 'type1_bundle' not in df_cont.columns:
-            df_cont['type1_bundle'] = None
+        # Store the (dict) bundle cells robustly: df.at with a dict value trips
+        # pandas' Series-alignment path, and an all-None column can be inferred as
+        # float64 (dict -> LossySetitemError -> crash). Rebuild the whole column as
+        # an explicit object Series instead.
+        _col = (list(df_cont['type1_bundle']) if 'type1_bundle' in df_cont.columns
+                else [None] * len(df_cont))
+        _pos = {ix: i for i, ix in enumerate(df_cont.index)}
         for idx, comp in bundles.items():
-            df_cont.at[idx, 'type1_bundle'] = comp
+            _col[_pos[idx]] = comp
+        df_cont['type1_bundle'] = pd.Series(_col, index=df_cont.index, dtype=object)
         QMessageBox.information(self, 'Lock Nucleus',
             f'Locked the Type 1 AGN bundle at spaxel ({cx},{cy}) for {len(bundles)} region(s).\n'
             'Fit Cube will now scale this frozen bundle by one amplitude per spaxel.')
@@ -11962,6 +11968,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         global df
         if 'kgroup' not in df.columns:
             df['kgroup'] = ['' for _ in range(len(df))]
+        # kgroup holds label strings ('K1', ''); a reindex can leave the column
+        # float64 (NaN), into which a string assignment warns (and will error in
+        # future pandas). Ensure object dtype first.
+        if df['kgroup'].dtype != object:
+            df['kgroup'] = df['kgroup'].astype(object)
         df.loc[df['Line_Name'] == line_name, 'kgroup'] = group
         if not group:
             # A line just removed from its group is no longer rebuilt by the
