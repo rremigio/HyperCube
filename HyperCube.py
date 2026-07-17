@@ -109,6 +109,7 @@ _STELLAR_COLS = {
     'stellar_h3_0': np.nan, 'stellar_h4_0': np.nan, 'stellar_scale_0': np.nan,
     'stellar_V_fit': np.nan, 'stellar_sigma_fit': np.nan, 'stellar_h3_fit': np.nan,
     'stellar_h4_fit': np.nan, 'stellar_scale_fit': np.nan, 'stellar_moments': 2,
+    'stellar_mdegree': 10, 'stellar_degree': -1,
     'stellar_chi2': np.nan,
 }
 
@@ -159,6 +160,170 @@ def _prepare_feii_template(name, z, fit_range):
         return None
 
 
+def _build_type1_bundle(components, lines, z, region_bounds, wl=None):
+    """Freeze the unresolved AGN bundle at a nucleus spaxel: sum the FITTED
+    unresolved continuum components (power law / Fe II / linear) and the FITTED
+    unresolved BLR emission lines over the wavelength grid, returning the frozen
+    bundle flux (physical units == the nucleus). This becomes the payload of a
+    'type1_agn' component whose only free param — agn_amp, =1 at the nucleus —
+    scales it across the cube (the amplitude map traces the PSF).
+
+    components    : fitted unresolved continuum component dicts (with *_fit fields).
+    lines         : fitted unresolved line dicts, each {'amp','cen','sigma'} (fit).
+    region_bounds : (x1, x2) of the region — sets the power-law pivot.
+    Returns (wl, bundle_flux) as numpy arrays.
+    """
+    wl = np.asarray(wavelengths if wl is None else wl, float)
+    x1, x2 = float(region_bounds[0]), float(region_bounds[1])
+    pivot = 0.5 * (x1 + x2)
+    bundle = np.zeros_like(wl)
+    for c in (components or []):
+        t = str(c.get('type'))
+        if t == 'powerlaw':
+            a, s = _safe_float(c.get('pl_amp_fit')), _safe_float(c.get('pl_slope_fit'))
+            if np.isfinite(a) and np.isfinite(s):
+                bundle = bundle + HyperCube_ModelFunctions.eval_power_law(s, a, wl, pivot)
+        elif t == 'feii':
+            a = _safe_float(c.get('feii_amp_fit'))
+            v = _safe_float(c.get('feii_v_fit'))
+            sg = _safe_float(c.get('feii_sigma_fit'))
+            tmpl = _prepare_feii_template(str(c.get('feii_template', '') or ''), z, (x1, x2))
+            if tmpl is not None and np.isfinite(a) and np.isfinite(v) and np.isfinite(sg):
+                bundle = bundle + tmpl.eval(wl, a, v, sg)
+        elif t == 'linear':
+            m, b = _safe_float(c.get('slope_fit')), _safe_float(c.get('intercept_fit'))
+            if np.isfinite(m) and np.isfinite(b):
+                bundle = bundle + (m * wl + b)
+    for ln in (lines or []):
+        a = _safe_float(ln.get('amp'))
+        cen = _safe_float(ln.get('cen'))
+        sg = _safe_float(ln.get('sigma'))
+        if np.isfinite(a) and np.isfinite(cen) and np.isfinite(sg) and sg > 0:
+            bundle = bundle + a * np.exp(-(wl - cen) ** 2 / (2 * sg ** 2))
+    return wl, bundle
+
+
+def _type1_component_from_bundle(wl, bundle, nucleus_spaxel=None):
+    """Wrap a frozen bundle (wl, flux) as a 'type1_agn' component dict. The vector
+    is stored inline so the component is self-contained (session/CSV round-trip);
+    _build_fit_params attaches it as the eval payload."""
+    return {'type': 'type1_agn', 'agn_amp_0': 1.0, 'agn_amp_fit': np.nan,
+            'bundle_wl': [float(v) for v in np.asarray(wl, float)],
+            'bundle_flux': [float(v) for v in np.asarray(bundle, float)],
+            'nucleus_spaxel': (list(nucleus_spaxel)
+                               if nucleus_spaxel is not None else None)}
+
+
+def _region_bundle(row):
+    """The region's frozen type1_agn bundle component dict, or None if unlocked."""
+    b = row.get('type1_bundle') if hasattr(row, 'get') else None
+    return b if (isinstance(b, dict) and str(b.get('type')) == 'type1_agn') else None
+
+
+def _total_locked_bundle(df_cont, wl):
+    """Summed frozen Type 1 AGN bundle (at agn_amp=1) over `wl`, or None if no
+    region is locked. Passed to every per-spaxel host (pPXF) fit as an additive
+    `sky` component so the host is deblended from the AGN instead of absorbing it."""
+    if not isinstance(df_cont, pd.DataFrame) or 'type1_bundle' not in df_cont.columns:
+        return None
+    lam = np.asarray(wl, float)
+    total = np.zeros_like(lam)
+    found = False
+    for _, r in df_cont.iterrows():
+        b = _region_bundle(r)
+        if b is None:
+            continue
+        wl_b = HyperCube_ModelFunctions.as_float_list(b.get('bundle_wl'))
+        fl_b = HyperCube_ModelFunctions.as_float_list(b.get('bundle_flux'))
+        if len(wl_b) >= 2 and len(wl_b) == len(fl_b):
+            total = total + np.interp(lam, wl_b, fl_b)
+            found = True
+    return total if found else None
+
+
+def _apply_type1_substitution(df, df_cont):
+    """Cube-fit VIEW of (df, df_cont) for the Type 1 resolved/unresolved split.
+    Non-destructive: inputs are untouched; new frames are returned.
+
+    For each region with a LOCKED bundle (df_cont 'type1_bundle' set):
+      - its continuum becomes [resolved components] + [the frozen type1_agn
+        bundle]; flagged UNRESOLVED continuum components (PL / Fe II) are dropped
+        (already baked into the bundle);
+      - its UNRESOLVED (BLR) lines are dropped from df — also baked into the
+        bundle — leaving only resolved host/narrow lines to fit per spaxel.
+    Regions with no bundle pass through unchanged. The interactive nucleus fit
+    does NOT call this (it fits every component/line freely).
+    """
+    if not isinstance(df_cont, pd.DataFrame) or 'type1_bundle' not in df_cont.columns:
+        return df, df_cont
+    locked_regions, new_components, any_locked = set(), [], False
+    for _, row in df_cont.iterrows():
+        bundle = _region_bundle(row)
+        comps = _region_components(row)
+        if bundle is None:
+            new_components.append(comps)
+            continue
+        any_locked = True
+        locked_regions.add(row['region_ID'])
+        resolved = [c for c in comps if not bool(c.get('unresolved'))]
+        new_components.append(resolved + [dict(bundle)])
+    if not any_locked:
+        return df, df_cont
+    df_cont_sub = df_cont.copy()
+    df_cont_sub['components'] = new_components
+
+    df_sub = df
+    if isinstance(df, pd.DataFrame) and len(df) and 'unresolved' in df.columns:
+        drop = (df['unresolved'] == True) & (df['region_ID'].isin(locked_regions))
+        if bool(np.any(drop)):
+            df_sub = df[~drop].reset_index(drop=True)
+    return df_sub, df_cont_sub
+
+
+def _type1_bundles_from_fit(df, df_cont, df_fit, cx, cy, z):
+    """Freeze the Type 1 AGN bundle(s) from the nucleus spaxel (cx, cy)'s FIT.
+    For each region with >=1 fitted unresolved item, sum its fitted unresolved
+    continuum components (read from df_fit's cont_region{r}_components, which
+    preserve the 'unresolved' flag) + its fitted unresolved (BLR) lines into a
+    frozen bundle. Returns {df_cont_index: type1_agn component dict}. Pure —
+    the caller writes the results into df_cont['type1_bundle']."""
+    out = {}
+    if not (isinstance(df_fit, pd.DataFrame) and len(df_fit)
+            and 'spaxel_x' in df_fit.columns):
+        return out
+    _sx = pd.to_numeric(df_fit['spaxel_x'], errors='coerce')
+    _sy = pd.to_numeric(df_fit['spaxel_y'], errors='coerce')
+    spx = df_fit[(_sx == int(cx)) & (_sy == int(cy))]
+    if len(spx) == 0:
+        return out
+    unresolved_ids = set()
+    if isinstance(df, pd.DataFrame) and 'unresolved' in df.columns:
+        unresolved_ids = set(pd.to_numeric(
+            df.loc[df['unresolved'] == True, 'Line_ID'], errors='coerce').dropna().tolist())
+    _rrid = (pd.to_numeric(spx['region_ID'], errors='coerce')
+             if 'region_ID' in spx.columns else pd.Series(np.nan, index=spx.index))
+    for idx, crow in df_cont.iterrows():
+        rid = crow['region_ID']
+        region_index = df_cont[df_cont['region_ID'] == rid].index[0] + 1
+        reg_rows = spx[_rrid == rid]
+        comps_fit = (HyperCube_ModelFunctions.coerce_components(
+                         reg_rows.iloc[0].get(f'cont_region{region_index}_components'))
+                     if len(reg_rows) else [])
+        unres_comps = [c for c in comps_fit if bool(c.get('unresolved'))]
+        unres_lines = []
+        for _, lr in reg_rows.iterrows():
+            if _safe_float(lr.get('LineID')) in unresolved_ids:
+                unres_lines.append({'amp': _safe_float(lr.get('amp_fit')),
+                                    'cen': _safe_float(lr.get('cen_fit')),
+                                    'sigma': _safe_float(lr.get('sigma_fit'))})
+        if not unres_comps and not unres_lines:
+            continue
+        wl, bundle = _build_type1_bundle(unres_comps, unres_lines, z,
+                                         (crow['x1'], crow['x2']))
+        out[idx] = _type1_component_from_bundle(wl, bundle, (cx, cy))
+    return out
+
+
 def _region_components(row):
     """Ordered list of continuum component dicts for a df_cont row (Series/dict).
     Reads the authoritative 'components' cell; if absent/empty, synthesizes a
@@ -178,12 +343,39 @@ def _materialize_components(cont):
     Call on every df_cont load path so the composite panel/fit have a clean list."""
     if not isinstance(cont, pd.DataFrame):
         return cont
+    # Type 1 AGN: ensure the frozen-bundle column exists (older sessions/CSVs
+    # predate it) and coerce any CSV repr-string cells back to dicts.
+    if 'type1_bundle' not in cont.columns:
+        cont['type1_bundle'] = None
+    else:
+        cont['type1_bundle'] = [_coerce_type1_bundle(v) for v in cont['type1_bundle']]
     if len(cont) == 0:
         if 'components' not in cont.columns:
             cont['components'] = pd.Series(dtype=object)
         return cont
     cont['components'] = [_region_components(r) for _, r in cont.iterrows()]
     return cont
+
+
+def _coerce_type1_bundle(value):
+    """A df_cont 'type1_bundle' cell -> a type1_agn component dict or None. Handles
+    a real dict (session pickle) and a repr string (CSV round-trip)."""
+    if isinstance(value, dict):
+        return value if str(value.get('type')) == 'type1_agn' else None
+    if isinstance(value, str) and value.strip() and value.strip().lower() != 'nan':
+        try:
+            v = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            # repr() of a dict holding np.nan / np.inf writes bare `nan`/`inf`,
+            # which ast.literal_eval rejects — map them to None and retry (same
+            # fix as coerce_components).
+            try:
+                _clean = re.sub(r'[-+]?\b(?:nan|inf|Infinity)\b', 'None', value)
+                v = ast.literal_eval(_clean)
+            except (ValueError, SyntaxError):
+                return None
+        return v if isinstance(v, dict) and str(v.get('type')) == 'type1_agn' else None
+    return None
 
 
 global spectrum
@@ -225,7 +417,12 @@ data_cont_init = {'Continuum Name': [],
              # Composite continuum: ordered, additive list of component dicts (the
              # authoritative continuum spec). The cont_type / flat columns above are
              # retained only for back-compat migration (see _region_components).
-             'components': []}
+             'components': [],
+             # Type 1 AGN: the frozen unresolved-bundle component dict for this
+             # region (a 'type1_agn' component with the inline bundle vector), or
+             # None. Derived, non-destructive snapshot set by "Lock nucleus"; the
+             # cube fit substitutes it for the region's flagged unresolved items.
+             'type1_bundle': []}
 
 df_cont = pd.DataFrame(data_cont_init)
 
@@ -248,6 +445,11 @@ data_lines_init = {'Line_ID': [],
         'Centroid_fit': [],
         'Sigma_fit': [],
         'region_ID': [],
+        # Type 1 AGN: True marks this line as part of the spatially UNRESOLVED
+        # bundle (a BLR broad line) — fit freely at the nucleus, then frozen into
+        # the type1_agn bundle and dropped from the per-spaxel free-line set in the
+        # cube fit. Absent/False = a resolved (host / narrow) line fit per spaxel.
+        'unresolved': [],
         'curveactor': []}
 
 df = pd.DataFrame(data_lines_init)
@@ -505,6 +707,48 @@ def _constraint_number(s):
         return float(str(s).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _break_constraint_cycles(params):
+    """Break circular constraint expressions in `params`. A user tying two lines
+    to each OTHER (e.g. velA==velB on line A AND velB==velA on line B) produces
+    exprs cenA=f(cenB) and cenB=g(cenA) — a cycle lmfit evaluates by infinite
+    recursion (RecursionError, which fails the whole spaxel). A tie is symmetric,
+    so one direction is redundant: detect any parameter whose expr chain returns
+    to itself and drop that expr (make it free), keeping the other direction as a
+    valid one-way tie. Warns so the redundant/contradictory constraint is visible."""
+    import re as _re
+
+    def _refs(expr):
+        return [n for n in _re.findall(r'[A-Za-z_][A-Za-z0-9_]*', expr or '')
+                if n in params]
+
+    changed = True
+    while changed:
+        changed = False
+        for name in list(params.keys()):
+            expr = params[name].expr
+            if not expr:
+                continue
+            seen, stack, cyclic = set(), list(_refs(expr)), False
+            while stack:
+                r = stack.pop()
+                if r == name:
+                    cyclic = True
+                    break
+                if r in seen:
+                    continue
+                seen.add(r)
+                stack.extend(_refs(params[r].expr))
+            if cyclic:
+                print(f"Warning: circular constraint on '{name}' (expr={expr!r}) — "
+                      f"dropping it to avoid infinite recursion. A line-to-line tie "
+                      f"only needs to be set in ONE direction.")
+                params[name].expr = None
+                params[name].vary = True
+                changed = True
+                break   # params mutated; restart the scan
+    return params
 
 
 def add_dataframe_constraints_to_params(df, params):
@@ -838,6 +1082,125 @@ def add_dataframe_constraints_to_params(df, params):
         except (ValueError, SyntaxError) as e:
             print(f"Warning: Could not parse constraints string for Line_ID {line_id} ({line_name}): {constraints_list_str} - {e}")
 
+    # Break any circular tie a user may have set in both directions before it
+    # reaches lmfit (a cycle => RecursionError that fails the whole spaxel).
+    _break_constraint_cycles(params)
+
+
+def _build_fit_params(df, df_cont, z):
+    """Build the lmfit Parameters + per-region in-model component descriptors for
+    a fit. SHARED by the interactive single-spaxel path and the serial/parallel
+    cube path so the two never drift (they used to diverge: the cube path built
+    legacy flat continuum params and NO component descriptors, which is exactly
+    why composite continua could not be cube-fit).
+
+    Conventions the rest of the fit relies on:
+    - Line params are named by ROW POSITION (amp{j}/cen{j}/sigma{j}, j=1..N in df
+      order) — the same scheme add_dataframe_constraints_to_params maps onto.
+    - Each region's continuum is the SUM of its in-model components, whose params
+      are c{r}_{k}_<sub> (k = in-model index). Stellar components are
+      pre-subtracted and contribute no in-model params. Fe II components carry a
+      prepared template payload in their structural descriptor.
+
+    Returns (params, region_components, n_regions, n_lines, df). `df` is returned
+    because velocity-tie constraints are converted in place
+    (update_constraints_with_velocity rewrites df['constraints']); the caller must
+    pick up the returned df.
+    """
+    params = Parameters()
+    region_components = {}   # {1-based region -> [in-model component descriptors]}
+    any_rest = False
+    for i, row in df_cont.iterrows():
+        region_id = row['region_ID']
+        params.add(f'x{i + 1}_start', value=row['x1'], vary=False)
+        params.add(f'x{i + 1}_end', value=row['x2'], vary=False)
+
+        # Composite continuum: one lmfit sub-block per IN-MODEL component plus the
+        # structural descriptors PiecewiseModel sums. k counts in-model components
+        # only, matching PiecewiseModel + the fit kernel.
+        _x1r, _x2r = float(row['x1']), float(row['x2'])
+        _descs, _k = [], 0
+        for comp in _region_components(row):
+            if not HyperCube_ModelFunctions.is_in_model(comp.get('type')):
+                continue
+            desc = HyperCube_ModelFunctions.add_component_params(params, i + 1, _k, comp)
+            if comp.get('type') == 'feii':
+                desc['payload'] = _prepare_feii_template(
+                    str(comp.get('feii_template', '') or ''), z, (_x1r, _x2r))
+            elif comp.get('type') == 'type1_agn':
+                # Frozen bundle vector stored inline on the component (see
+                # _type1_component_from_bundle) -> eval payload (wl, flux).
+                desc['payload'] = (np.asarray(comp.get('bundle_wl', []), float),
+                                   np.asarray(comp.get('bundle_flux', []), float))
+            _descs.append(desc)
+            _k += 1
+        region_components[i + 1] = _descs
+
+        region_lines = df[df['region_ID'] == region_id]
+        for j, line in enumerate(df.itertuples(), start=1):
+            _amp   = np.float64(line.Amp_0)
+            _cen   = np.float64(line.Centroid_0)
+            _sigma = np.float64(line.Sigma_0)
+            _amp_lo  = np.float64(line.Amp_0_lowlim)   if np.isfinite(np.float64(line.Amp_0_lowlim))  else None
+            _amp_hi  = np.float64(line.Amp_0_highlim)  if np.isfinite(np.float64(line.Amp_0_highlim)) else None
+            _cen_lo  = np.float64(line.Centroid_0_lowlim)  if np.isfinite(np.float64(line.Centroid_0_lowlim))  else None
+            _cen_hi  = np.float64(line.Centroid_0_highlim) if np.isfinite(np.float64(line.Centroid_0_highlim)) else None
+            _sig_lo  = np.float64(line.Sigma_0_lowlim)  if np.isfinite(np.float64(line.Sigma_0_lowlim))  else None
+            _sig_hi  = np.float64(line.Sigma_0_highlim) if np.isfinite(np.float64(line.Sigma_0_highlim)) else None
+            if _amp == 0:
+                _amp = 1e-30
+            params.add(f'amp{j}',   value=_amp,   vary=True, min=_amp_lo,  max=_amp_hi)
+            params.add(f'cen{j}',   value=_cen,   vary=True, min=_cen_lo,  max=_cen_hi)
+            params.add(f'sigma{j}', value=_sigma, vary=True, min=_sig_lo,  max=_sig_hi)
+
+            _rw = df.iloc[j - 1]['Rest Wavelength']
+            if _rw:
+                _rw = ast.literal_eval(_rw) if isinstance(_rw, str) else _rw
+            else:
+                _rw = np.nan
+            if np.isfinite(_rw):
+                any_rest = True
+
+        params.add(f'NR{i + 1}', value=len(region_lines), vary=False)
+
+    # Convert exact velocity ties (vel == vel_[B]) to centroid relations, then
+    # apply all relative line-to-line constraints. Once, after params exist.
+    if any_rest and 'constraints' in df.columns:
+        df = update_constraints_with_velocity(df, z)
+    add_dataframe_constraints_to_params(df, params)
+
+    n_regions = len(df_cont)
+    n_lines = len(np.unique(df['Line_ID']))
+    return params, region_components, n_regions, n_lines, df
+
+
+def _stellar_specs_from_components(df_cont):
+    """Lightweight stellar-region specs for the cube fit, derived from the
+    composite `components` list. Covers BOTH a composite stellar component and a
+    legacy cont_type=='stellar' region (the latter surfaces as a synthesized
+    stellar component through _region_components). Returns a list of dicts
+    {rid, library, moments, x1, x2}; regions with no usable library are skipped."""
+    specs = []
+    if not isinstance(df_cont, pd.DataFrame):
+        return specs
+    for _, r in df_cont.iterrows():
+        for comp in _region_components(r):
+            if str(comp.get('type')) != 'stellar':
+                continue
+            library = str(comp.get('stellar_library', '') or '')
+            if not library:
+                continue
+            _m = _safe_float(comp.get('stellar_moments'))
+            _md = _safe_float(comp.get('stellar_mdegree'))
+            _dg = _safe_float(comp.get('stellar_degree'))
+            specs.append(dict(
+                rid=int(np.int64(r['region_ID'])),
+                library=library,
+                moments=int(_m) if np.isfinite(_m) else 2,
+                mdegree=int(_md) if np.isfinite(_md) else 10,
+                degree=int(_dg) if np.isfinite(_dg) else -1,
+                x1=float(r['x1']), x2=float(r['x2'])))
+    return specs
 
 
 def generalized_model(x, slope, intercept, *gaussian_params):
@@ -5107,7 +5470,9 @@ class ViewerWindow(QMainWindow):
     # Per-component breakdown-curve colours (power law orange, Fe II magenta,
     # host/stellar cyan, poly/spline blue, linear grey).
     _COMPONENT_COLORS = {'powerlaw': '#d7801a', 'feii': '#c840c8', 'stellar': '#00bcd4',
-                         'poly': '#6d8fff', 'spline': '#6d8fff', 'linear': '#8a8a8a'}
+                         'poly': '#6d8fff', 'spline': '#6d8fff', 'linear': '#8a8a8a',
+                         # frozen unresolved Type 1 AGN bundle
+                         'type1_agn': '#8e24aa'}
     # Total continuum (sum of all continuum components, incl. Fe II).
     _TOTAL_CONT_COLOR = '#5b8fc9'
 
@@ -5122,6 +5487,36 @@ class ViewerWindow(QMainWindow):
                                           xy=xy, region=region_slice)
             col = self._COMPONENT_COLORS.get(str(comp.get('type')), '#8a8a8a')
             self.spectrum_ax.plot(x_vals, yc, color=col, lw=0.8, linestyle=':')
+
+    # Host continuum (sum of resolved components, i.e. everything but the AGN bundle).
+    _HOST_CONT_COLOR = '#2e8b57'
+
+    def _draw_type1_split(self, comps, x_vals, x1, x2, use_fit, xy, region_slice):
+        """When a region carries a frozen Type 1 AGN bundle, draw the unresolved
+        AGN (purple) and the resolved HOST continuum (green = sum of every other
+        component, e.g. stellar template + any linear/poly) as two separate,
+        clearly-visible curves — the decomposition the user cares about. Returns
+        True if an AGN bundle was present (so the caller can skip the generic,
+        fainter per-component breakdown)."""
+        comps = [c for c in comps if isinstance(c, dict)]
+        agn = [c for c in comps if str(c.get('type')) == 'type1_agn']
+        if not agn:
+            return False
+
+        def _sum(cs):
+            y = np.zeros_like(x_vals)
+            for c in cs:
+                y = y + self._component_baseline(c, x_vals, x1, x2, use_fit=use_fit,
+                                                 xy=xy, region=region_slice)
+            return y
+
+        self.spectrum_ax.plot(x_vals, _sum(agn), lw=1.4, linestyle='-',
+                              color=self._COMPONENT_COLORS['type1_agn'])
+        host = [c for c in comps if str(c.get('type')) != 'type1_agn']
+        if host:
+            self.spectrum_ax.plot(x_vals, _sum(host), lw=1.4, linestyle='-',
+                                  color=self._HOST_CONT_COLOR)
+        return True
 
     def _component_baseline(self, comp, x_vals, x1, x2, use_fit=False, xy=None, region=None):
         """Baseline y over x_vals for ONE continuum component dict. `use_fit`
@@ -5168,6 +5563,15 @@ class ViewerWindow(QMainWindow):
                 else np.zeros_like(x_vals)
         if t == 'stellar' and region is not None:
             return np.nan_to_num(self._stellar_baseline(region, x_vals, use_fit=use_fit, xy=xy))
+        if t == 'type1_agn':
+            # Frozen unresolved bundle scaled by its amplitude (agn_amp_fit for the
+            # per-spaxel fit, else the nucleus reference agn_amp_0 = 1).
+            amp = _g('agn_amp')
+            wl_b = HyperCube_ModelFunctions.as_float_list(comp.get('bundle_wl'))
+            fl_b = HyperCube_ModelFunctions.as_float_list(comp.get('bundle_flux'))
+            if not np.isfinite(amp) or len(wl_b) < 2 or len(wl_b) != len(fl_b):
+                return np.zeros_like(x_vals)
+            return amp * np.interp(x_vals, wl_b, fl_b)
         return np.zeros_like(x_vals)
 
     def _region_baseline(self, region, x_vals, use_fit=False, xy=None):
@@ -5208,6 +5612,10 @@ class ViewerWindow(QMainWindow):
             fit_range = (float(r['x1']), float(r['x2']))
             _m = _safe_float(comp.get('stellar_moments'))
             moments = int(_m) if np.isfinite(_m) else 2
+            _md = _safe_float(comp.get('stellar_mdegree'))
+            mdegree = int(_md) if np.isfinite(_md) else 10
+            _dg = _safe_float(comp.get('stellar_degree'))
+            degree = int(_dg) if np.isfinite(_dg) else -1
             z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
             z = 0.0 if not np.isfinite(z) else z
             R = _safe_float(df_obs.loc[0, 'resolvingpower']) if len(df_obs) else np.nan
@@ -5219,10 +5627,13 @@ class ViewerWindow(QMainWindow):
             lib.prepare(velscale, R, lam_rest)
             mask = (df['Centroid_0'].astype(float).to_numpy()
                     if len(df) > 0 and 'Centroid_0' in df.columns else ())
+            # Deblend the rendered host from any locked AGN bundle (pPXF sky), so
+            # the overlay host matches the cube fit instead of absorbing the AGN.
+            _agn_sky = _total_locked_bundle(df_cont, wavelengths)
             res = hcppxf.fit_stellar(spectrum, wavelengths, z, R, lib,
                                      fit_range=fit_range, mask_centroids=mask,
-                                     moments=moments, degree=-1, mdegree=10,
-                                     sigma_guess=150.0, velscale=velscale)
+                                     moments=moments, degree=degree, mdegree=mdegree,
+                                     sigma_guess=150.0, velscale=velscale, agn_sky=_agn_sky)
             STELLAR_CACHE[key] = res['cache']
         except Exception as e:
             print(f"lazy stellar cache failed for ({x},{y},{rid}): {e}")
@@ -5291,8 +5702,10 @@ class ViewerWindow(QMainWindow):
             x_vals = np.linspace(self.x1, self.x2, 1000)
             _icomps = _region_components(region.iloc[0])
             y_line = self._region_baseline(region, x_vals, use_fit=False, xy=(x, y))
-            self._draw_component_breakdown(_icomps, x_vals, self.x1, self.x2,
-                                           False, (x, y), region)
+            if not self._draw_type1_split(_icomps, x_vals, self.x1, self.x2,
+                                          False, (x, y), region):
+                self._draw_component_breakdown(_icomps, x_vals, self.x1, self.x2,
+                                               False, (x, y), region)
             self.spectrum_ax.plot(x_vals, y_line, color=self._TOTAL_CONT_COLOR,
                                   lw=1.0, linestyle='-')
 
@@ -5334,9 +5747,16 @@ class ViewerWindow(QMainWindow):
             _model_reg = df_cont.loc[np.int64(df_cont['region_ID']) == int(region_ID)]
             # Fitted emission-line rows for this spaxel/region (may be empty).
             if isinstance(df_fit, pd.DataFrame) and len(df_fit) > 0 and 'spaxel_x' in df_fit.columns:
-                region = df_fit.loc[(df_fit['spaxel_x'].astype(int) == int(x)) &
-                                    (df_fit['spaxel_y'].astype(int) == int(y)) &
-                                    (df_fit['region_ID'].astype(int) == int(region_ID))]
+                # NaN-safe: failed-fit rows carry only spaxel_x/y (no region_ID),
+                # so region_ID is NaN there — coerce instead of astype(int), which
+                # raises IntCastingNaNError on NaN and crashed the app.
+                _sx = pd.to_numeric(df_fit['spaxel_x'], errors='coerce')
+                _sy = pd.to_numeric(df_fit['spaxel_y'], errors='coerce')
+                _rid = (pd.to_numeric(df_fit['region_ID'], errors='coerce')
+                        if 'region_ID' in df_fit.columns
+                        else pd.Series(np.nan, index=df_fit.index))
+                region = df_fit.loc[(_sx == int(x)) & (_sy == int(y))
+                                    & (_rid == int(region_ID))]
             else:
                 region = df_fit.iloc[0:0] if isinstance(df_fit, pd.DataFrame) else pd.DataFrame()
 
@@ -5372,8 +5792,10 @@ class ViewerWindow(QMainWindow):
                 y_line = y_line + self._component_baseline(
                     comp, x_vals, self.x1, self.x2, use_fit=_use_fit, xy=(x, y),
                     region=_model_reg)
-            self._draw_component_breakdown(_comps, x_vals, self.x1, self.x2,
-                                           _use_fit, (x, y), _model_reg)
+            if not self._draw_type1_split(_comps, x_vals, self.x1, self.x2,
+                                          _use_fit, (x, y), _model_reg):
+                self._draw_component_breakdown(_comps, x_vals, self.x1, self.x2,
+                                               _use_fit, (x, y), _model_reg)
             self.spectrum_ax.plot(x_vals, y_line, color=self._TOTAL_CONT_COLOR,
                                   lw=1.0, linestyle='-')
 
@@ -7021,6 +7443,23 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.feii_template_button.setToolTip(
             'Add an Fe II template continuum region (amp + velocity + dispersion) — for Type 1 AGN')
 
+        # Type 1 AGN: mark unresolved features, freeze them at the nucleus, or clear.
+        self.type1_button = QPushButton('Type 1 AGN ▾')
+        self.type1_button.setToolTip(
+            'Resolved/unresolved decomposition for a Type 1 AGN:\n'
+            '• Mark Unresolved… — flag the power law / Fe II / broad lines that make up\n'
+            '  the spatially unresolved (point-source) AGN.\n'
+            '• Lock Nucleus — freeze those FITTED features at the current spaxel into one\n'
+            '  bundle; Fit Cube then scales it by a single amplitude per spaxel (PSF).\n'
+            '• Unlock — clear the frozen bundle and fit the AGN freely again.')
+        _t1menu = QMenu(self.type1_button)
+        _t1menu.addAction('Mark Unresolved Features…', self.open_type1_unresolved_dialog)
+        _t1menu.addAction('Lock Nucleus', self.lock_type1_nucleus)
+        _t1menu.addAction('Unlock (clear bundle)', self.unlock_type1_nucleus)
+        _t1menu.addSeparator()
+        _t1menu.addAction('AGN Amplitude Map', self.agn_amp_map)
+        self.type1_button.setMenu(_t1menu)
+
         self.fit_spaxel_button.clicked.connect(self.fit_single_spaxel)
         self.clear_spaxel_fit_button.clicked.connect(self.clear_spaxel_fit)
         self.cancel_edit_button.clicked.connect(self.cancel_spaxel_edit)
@@ -7034,7 +7473,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         for btn in [self.fit_spaxel_button, self.clear_spaxel_fit_button,
                     self.cancel_edit_button, self.toggle_edited_button,
                     self.stellar_template_button, self.power_law_button,
-                    self.feii_template_button]:
+                    self.feii_template_button, self.type1_button]:
             btn.setFixedHeight(28)
             row1.addWidget(btn)
         row1.addStretch()
@@ -9279,7 +9718,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         if component_rid is not None:
             rid = int(np.int64(component_rid))
             comp = {'type': 'stellar', 'stellar_library': settings['library'],
-                    'stellar_moments': int(settings['moments'])}
+                    'stellar_moments': int(settings['moments']),
+                    # Persist the pPXF polynomial choice so the cube / per-spaxel
+                    # fits use the SAME (physical) model as this reference fit —
+                    # mdegree=0 keeps the host physical (no multiplicative poly that
+                    # would otherwise absorb an AGN power law / Fe II).
+                    'stellar_mdegree': int(settings.get('mdegree', 10)),
+                    'stellar_degree': int(settings.get('degree', -1))}
             for _col, _key in (('stellar_V', 'V'), ('stellar_sigma', 'sigma'),
                                ('stellar_h3', 'h3'), ('stellar_h4', 'h4'),
                                ('stellar_scale', 'scale')):
@@ -9335,6 +9780,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             'stellar_V_fit': res['V'], 'stellar_sigma_fit': res['sigma'],
             'stellar_h3_fit': res['h3'], 'stellar_h4_fit': res['h4'],
             'stellar_scale_fit': res['scale'], 'stellar_moments': settings['moments'],
+            'stellar_mdegree': int(settings.get('mdegree', 10)),
+            'stellar_degree': int(settings.get('degree', -1)),
             'stellar_chi2': res['chi2'],
         }
         # Refit: update the targeted region in place.
@@ -9365,12 +9812,16 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         if len(reg) == 0:
             return
         r = reg.iloc[0]
+        _md = _safe_float(r.get('stellar_mdegree'))
+        _dg = _safe_float(r.get('stellar_degree'))
         settings = dict(
             library=str(r.get('stellar_library', '') or
                         next(iter(hcppxf.list_libraries()), '')),
             fit_range=(float(r['x1']), float(r['x2'])),
             moments=int(r['stellar_moments']) if pd.notna(r.get('stellar_moments')) else 2,
-            degree=-1, mdegree=10, sigma_guess=150.0, mask_lines=True)
+            degree=int(_dg) if np.isfinite(_dg) else -1,
+            mdegree=int(_md) if np.isfinite(_md) else 10,
+            sigma_guess=150.0, mask_lines=True)
         self._fit_stellar_for_spaxel(settings, target_rid=int(np.int64(regionID)))
 
     def fit_stellar_cube(self):
@@ -9443,15 +9894,18 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         return _stellar_rows
 
     def _fit_cube_parallel(self, gated, params, z, n_regions, n_lines, n_workers,
-                           progress_bar, status_label, total):
+                           progress_bar, status_label, total, region_components=None,
+                           agn_sky=None):
         """Fit `gated` spaxels across `n_workers` processes. Line rows are
         appended to the global fit_results; returns the stellar-kinematics rows.
 
         The cube is shared read-only via shared memory; the constant context
-        (params, df/df_cont, model spec, stellar specs) is pickled once per
-        worker. Workers compute each spaxel's stellar fit + baseline and the
-        full line fit, returning only small row dicts (kinematics-only — no
-        per-spaxel optimal templates; those recompute lazily on view)."""
+        (params, df/df_cont, model spec, region_components incl. Fe II payloads,
+        stellar specs) is pickled once per worker. Workers rebuild the composite
+        PiecewiseModel from region_components, compute each spaxel's stellar fit +
+        baseline and the full line fit, returning only small row dicts
+        (kinematics-only — no per-spaxel optimal templates; those recompute lazily
+        on view)."""
         global fit_results
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -9464,16 +9918,16 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             shm_arr[:] = cube[:]
 
             # Lightweight stellar region specs (workers load/prepare the libs).
+            # Derived from the composite components list so both composite stellar
+            # components and legacy cont_type=='stellar' regions are covered.
             stellar_specs, stellar_mask = [], ()
-            if 'cont_type' in df_cont.columns:
-                for _, r in df_cont[df_cont['cont_type'] == 'stellar'].iterrows():
-                    stellar_specs.append(dict(
-                        rid=int(np.int64(r['region_ID'])),
-                        library=str(r['stellar_library']),
-                        fit_range=(float(r['x1']), float(r['x2'])),
-                        moments=int(r['stellar_moments']) if pd.notna(r.get('stellar_moments')) else 2))
-                if stellar_specs and len(df) > 0 and 'Centroid_0' in df.columns:
-                    stellar_mask = df['Centroid_0'].astype(float).to_numpy()
+            for _s in _stellar_specs_from_components(df_cont):
+                stellar_specs.append(dict(
+                    rid=_s['rid'], library=_s['library'],
+                    fit_range=(_s['x1'], _s['x2']), moments=_s['moments'],
+                    mdegree=_s['mdegree'], degree=_s['degree']))
+            if stellar_specs and len(df) > 0 and 'Centroid_0' in df.columns:
+                stellar_mask = df['Centroid_0'].astype(float).to_numpy()
 
             R = _safe_float(df_obs.loc[0, 'resolvingpower']) if len(df_obs) else np.nan
             R = 3000.0 if not np.isfinite(R) or R <= 0 else R
@@ -9488,7 +9942,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 params_dumps=params.dumps(), n_regions=int(n_regions),
                 n_lines=int(n_lines), df=df_w, df_cont=df_cont_w, z=z, R=R,
                 sequential=bool(getattr(self, '_sequential_fit', False)),
-                max_nfev=512, stellar_specs=stellar_specs, stellar_mask=stellar_mask)
+                max_nfev=512, stellar_specs=stellar_specs, stellar_mask=stellar_mask,
+                # Composite continuum descriptors (incl. prepared Fe II payloads)
+                # so workers rebuild the SAME PiecewiseModel as the main process.
+                region_components=(region_components or {}),
+                # Frozen AGN bundle (agn_amp=1) -> pPXF `sky` in each worker's host
+                # fit, so the host is jointly deblended from the AGN. None = off.
+                agn_sky=(None if agn_sky is None else np.asarray(agn_sky, float)))
 
             # Precompute RA/Dec for all gated spaxels (keeps WCS out of workers).
             xs = np.array([ij[0] for ij in gated])
@@ -9558,10 +10018,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         pPXF is unavailable."""
         if hcppxf is None or FITS_DATA is None:
             return []
-        sreg = (df_cont[df_cont['cont_type'] == 'stellar']
-                if isinstance(df_cont, pd.DataFrame) and 'cont_type' in df_cont.columns
-                else None)
-        if sreg is None or len(sreg) == 0:
+        # Stellar regions come from the composite components list (covers a
+        # composite stellar component AND a legacy cont_type=='stellar' region).
+        sspecs = _stellar_specs_from_components(df_cont)
+        if not sspecs:
             return []
         z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
         z = 0.0 if not np.isfinite(z) else z
@@ -9570,17 +10030,18 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         mask = (df['Centroid_0'].astype(float).to_numpy()
                 if len(df) > 0 and 'Centroid_0' in df.columns else ())
         preps = []
-        for _, r in sreg.iterrows():
-            library = str(r['stellar_library'])
-            fit_range = (float(r['x1']), float(r['x2']))
-            moments = int(r['stellar_moments']) if pd.notna(r.get('stellar_moments')) else 2
+        for _s in sspecs:
+            library = _s['library']
+            fit_range = (_s['x1'], _s['x2'])
+            moments = _s['moments']
             velscale, lam_rest = hcppxf.galaxy_velscale(wavelengths, z, fit_range)
             lib = _STELLAR_LIBS.get(library) or hcppxf.TemplateLibrary(library).load()
             _STELLAR_LIBS[library] = lib
             lib.prepare(velscale, R, lam_rest)
-            preps.append(dict(rid=int(np.int64(r['region_ID'])), lib=lib,
+            preps.append(dict(rid=_s['rid'], lib=lib,
                               velscale=velscale, z=z, R=R, mask=mask,
-                              moments=moments, fit_range=fit_range, library=library))
+                              moments=moments, mdegree=_s['mdegree'],
+                              degree=_s['degree'], fit_range=fit_range, library=library))
         return preps
 
     def _stellar_fit_one(self, i, j, prep):
@@ -9589,12 +10050,15 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         global STELLAR_CACHE
         vw = self.viewer_window
         flux = np.nan_to_num(vw.get_spectrum_at_spaxel(i, j))
+        # Joint host/AGN deblend: feed any locked bundle to pPXF as a sky component.
+        _agn_sky = _total_locked_bundle(df_cont, wavelengths)
         try:
             res = hcppxf.fit_stellar(
                 flux, wavelengths, prep['z'], prep['R'], prep['lib'],
                 fit_range=prep['fit_range'], mask_centroids=prep['mask'],
-                moments=prep['moments'], degree=-1, mdegree=10,
-                sigma_guess=150.0, velscale=prep['velscale'])
+                moments=prep['moments'], degree=prep.get('degree', -1),
+                mdegree=prep.get('mdegree', 10),
+                sigma_guess=150.0, velscale=prep['velscale'], agn_sky=_agn_sky)
         except Exception:
             return None
         STELLAR_CACHE[(i, j, int(prep['rid']))] = res['cache']
@@ -9683,6 +10147,48 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             if b is not None:
                 b.setText(_fmt(cur_sig))
 
+    def agn_amp_map(self):
+        """Display the per-spaxel Type 1 AGN amplitude (agn_amp_fit) as a cube map —
+        the empirical PSF of the unresolved AGN. Read from each spaxel's fitted
+        type1_agn component in df_fit. Useful to sanity-check the PSF falloff and
+        spot spaxels whose amplitude looks off (candidates for a re-fit)."""
+        from PyQt5.QtWidgets import QMessageBox
+        if not (isinstance(df_fit, pd.DataFrame) and len(df_fit)
+                and 'spaxel_x' in df_fit.columns):
+            QMessageBox.information(self, 'AGN Amplitude Map',
+                'Run "Fit Cube" with a locked Type 1 bundle first.')
+            return
+        ny, nx = FITS_DATA.shape[1], FITS_DATA.shape[2]
+        arr = np.full((ny, nx), np.nan)
+        seen, found = set(), False
+        for _, row in df_fit.iterrows():
+            try:
+                x, y = int(row['spaxel_x']), int(row['spaxel_y'])
+            except (TypeError, ValueError):
+                continue
+            if (x, y) in seen:
+                continue
+            seen.add((x, y))
+            amp = np.nan
+            for key, val in row.items():
+                if not (isinstance(key, str) and key.endswith('_components')):
+                    continue
+                for c in HyperCube_ModelFunctions.coerce_components(val):
+                    if str(c.get('type')) == 'type1_agn':
+                        amp = _safe_float(c.get('agn_amp_fit'))
+                        break
+                if np.isfinite(amp):
+                    break
+            if np.isfinite(amp):
+                arr[y, x] = amp
+                found = True
+        if not found:
+            QMessageBox.information(self, 'AGN Amplitude Map',
+                'No Type 1 AGN amplitude found. Lock a nucleus (Type 1 AGN → Lock '
+                'Nucleus) and run "Fit Cube" first.')
+            return
+        self.viewer_window.draw_image(arr, cmap='plasma', scale='linear', from_fits=False)
+
     def _stellar_map(self, col, rid=None):
         """Display a per-spaxel stellar map (e.g. stellar_V / stellar_sigma) for
         stellar region `rid` (None = all rows, for back-compat)."""
@@ -9705,6 +10211,146 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         cmap = 'bwr' if col == 'stellar_V' else 'plasma'
         self.viewer_window.draw_image(arr, cmap=cmap, scale='linear', from_fits=False)
 
+
+    def open_type1_unresolved_dialog(self):
+        """Checkbox dialog to flag which emission lines and continuum components
+        are spatially UNRESOLVED (the Type 1 AGN bundle: power law + Fe II + BLR
+        broad lines). Writes df['unresolved'] and each component's 'unresolved'."""
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QCheckBox,
+                                     QLabel, QPushButton, QGroupBox, QScrollArea, QWidget)
+        global df, df_cont
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Mark Unresolved Features (Type 1 AGN)')
+        outer = QVBoxLayout(dlg)
+        outer.addWidget(QLabel(
+            'Check the spatially UNRESOLVED (point-source AGN) features — the power\n'
+            'law, Fe II, and broad emission lines. "Lock Nucleus" freezes these,\n'
+            'as fitted at the current spaxel, into one bundle scaled per spaxel.'))
+        _scroll = QScrollArea(); _scroll.setWidgetResizable(True)
+        _inner = QWidget(); lay = QVBoxLayout(_inner)
+        _scroll.setWidget(_inner); outer.addWidget(_scroll)
+
+        line_boxes, comp_boxes = {}, {}
+        gb_l = QGroupBox('Emission lines'); ll = QVBoxLayout(gb_l)
+        if isinstance(df, pd.DataFrame) and len(df):
+            _has = 'unresolved' in df.columns
+            for _, r in df.iterrows():
+                lid = int(r['Line_ID'])
+                cb = QCheckBox(f"{r.get('Line_Name', 'line')}   (region {int(r['region_ID'])})")
+                cb.setChecked(bool(r.get('unresolved')) if _has else False)
+                ll.addWidget(cb); line_boxes[lid] = cb
+        if not line_boxes:
+            ll.addWidget(QLabel('  (no lines yet)'))
+        lay.addWidget(gb_l)
+
+        gb_c = QGroupBox('Continuum components'); cl = QVBoxLayout(gb_c)
+        _any_c = False
+        for idx, cr in df_cont.iterrows():
+            for k, c in enumerate(_region_components(cr)):
+                cb = QCheckBox(f"region {int(cr['region_ID'])}:  {c.get('type')}")
+                cb.setChecked(bool(c.get('unresolved')))
+                cl.addWidget(cb); comp_boxes[(idx, k)] = cb; _any_c = True
+        if not _any_c:
+            cl.addWidget(QLabel('  (no continuum components yet)'))
+        lay.addWidget(gb_c)
+
+        brow = QHBoxLayout(); cancel = QPushButton('Cancel'); ok = QPushButton('Apply')
+        ok.setDefault(True); brow.addStretch(); brow.addWidget(cancel); brow.addWidget(ok)
+        outer.addLayout(brow)
+        cancel.clicked.connect(dlg.reject); ok.clicked.connect(dlg.accept)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        if isinstance(df, pd.DataFrame) and len(df):
+            if 'unresolved' not in df.columns:
+                df['unresolved'] = False
+            # A reindex/concat can leave 'unresolved' float64 (NaN), into which a
+            # bool assignment warns (future error). Normalise to a real bool column
+            # (missing -> False) first — build the list explicitly to avoid the
+            # fillna/downcast deprecation too.
+            df['unresolved'] = [bool(v) if pd.notna(v) else False
+                                for v in df['unresolved']]
+            for lid, cb in line_boxes.items():
+                df.loc[df['Line_ID'] == lid, 'unresolved'] = bool(cb.isChecked())
+        for idx, cr in df_cont.iterrows():
+            comps = [dict(c) for c in _region_components(cr)]
+            for k in range(len(comps)):
+                cb = comp_boxes.get((idx, k))
+                if cb is not None:
+                    comps[k]['unresolved'] = bool(cb.isChecked())
+            df_cont.at[idx, 'components'] = comps
+
+    def lock_type1_nucleus(self):
+        """Freeze the current spaxel's fitted unresolved features into per-region
+        type1_agn bundles (df_cont['type1_bundle']). Non-destructive: raw
+        components/lines are untouched; Fit Cube substitutes the bundle."""
+        from PyQt5.QtWidgets import QMessageBox
+        vw = self.viewer_window
+        if vw is None or getattr(vw, 'current_spaxel', None) is None:
+            QMessageBox.warning(self, 'Lock Nucleus', 'Select and fit a nucleus spaxel first.')
+            return
+        _flagged_line = (isinstance(df, pd.DataFrame) and 'unresolved' in df.columns
+                         and bool((df['unresolved'] == True).any()))
+        _flagged_comp = any(bool(c.get('unresolved'))
+                            for _, r in df_cont.iterrows() for c in _region_components(r))
+        if not (_flagged_line or _flagged_comp):
+            QMessageBox.warning(self, 'Lock Nucleus',
+                'Nothing is marked unresolved. Use "Mark Unresolved Features…" to flag the '
+                'AGN power law / Fe II / broad lines, fit this spaxel, then lock.')
+            return
+        cx, cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
+        z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
+        z = 0.0 if not np.isfinite(z) else z
+        try:
+            bundles = _type1_bundles_from_fit(df, df_cont, df_fit, cx, cy, z)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, 'Lock Nucleus', f'Failed to build the bundle:\n{e}')
+            return
+        if not bundles:
+            QMessageBox.warning(self, 'Lock Nucleus',
+                f'No fitted unresolved components/lines found for spaxel ({cx},{cy}). '
+                'Fit THIS spaxel (with the AGN features marked unresolved) before locking.')
+            return
+        # Store the (dict) bundle cells robustly: df.at with a dict value trips
+        # pandas' Series-alignment path, and an all-None column can be inferred as
+        # float64 (dict -> LossySetitemError -> crash). Rebuild the whole column as
+        # an explicit object Series instead.
+        _col = (list(df_cont['type1_bundle']) if 'type1_bundle' in df_cont.columns
+                else [None] * len(df_cont))
+        _pos = {ix: i for i, ix in enumerate(df_cont.index)}
+        for idx, comp in bundles.items():
+            _col[_pos[idx]] = comp
+        df_cont['type1_bundle'] = pd.Series(_col, index=df_cont.index, dtype=object)
+        QMessageBox.information(self, 'Lock Nucleus',
+            f'Locked the Type 1 AGN bundle at spaxel ({cx},{cy}) for {len(bundles)} region(s).\n'
+            'Fit Cube will now scale this frozen bundle by one amplitude per spaxel.')
+        self._refresh_type1_overlay(cx, cy)
+
+    def unlock_type1_nucleus(self):
+        """Clear all frozen Type 1 bundles so the AGN continuum fits freely again."""
+        from PyQt5.QtWidgets import QMessageBox
+        if 'type1_bundle' not in df_cont.columns or df_cont['type1_bundle'].isna().all():
+            QMessageBox.information(self, 'Unlock', 'No Type 1 bundle is locked.')
+            return
+        df_cont['type1_bundle'] = None
+        QMessageBox.information(self, 'Unlock',
+            'Cleared the Type 1 AGN bundle(s). Cube fits will fit the AGN continuum '
+            'freely per spaxel again.')
+        vw = self.viewer_window
+        if vw is not None and getattr(vw, 'current_spaxel', None) is not None:
+            self._refresh_type1_overlay(int(vw.current_spaxel[0]), int(vw.current_spaxel[1]))
+
+    def _refresh_type1_overlay(self, cx, cy):
+        """Redraw the current spaxel's model after a lock/unlock state change."""
+        vw = self.viewer_window
+        try:
+            for region_ID in np.unique(np.int64(df_cont['region_ID'])):
+                vw.rebuild_plot(region_ID, from_file=True, show_init=False,
+                                show_fit=True, x=cx, y=cy)
+            vw.spectrum_canvas.draw_idle()
+        except Exception:
+            pass
 
     def fit_single_spaxel(self):
         try:
@@ -9735,65 +10381,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         else:
             z = df_obs['redshift'].item()
 
-        params = Parameters()
-        region_components = {}   # {1-based region -> [in-model component descriptors]}
-        for i, row in df_cont.iterrows():
-            region_id = row['region_ID']
-            params.add(f'x{i + 1}_start', value=row['x1'], vary=False)
-            params.add(f'x{i + 1}_end', value=row['x2'], vary=False)
-
-            # Composite continuum: add lmfit params for each IN-MODEL component
-            # (stellar is pre-subtracted, so it contributes no in-model params) and
-            # collect the structural descriptors the model sums. k counts in-model
-            # components only, matching the fit kernel + PiecewiseModel.
-            _x1r, _x2r = float(row['x1']), float(row['x2'])
-            _descs, _k = [], 0
-            for comp in _region_components(row):
-                if not HyperCube_ModelFunctions.is_in_model(comp.get('type')):
-                    continue
-                desc = HyperCube_ModelFunctions.add_component_params(params, i + 1, _k, comp)
-                if comp.get('type') == 'feii':
-                    desc['payload'] = _prepare_feii_template(
-                        str(comp.get('feii_template', '') or ''), z, (_x1r, _x2r))
-                _descs.append(desc)
-                _k += 1
-            region_components[i + 1] = _descs
-
-            region_lines = df[df['region_ID'] == region_id]
-            for j, line in enumerate(df.itertuples(), start=1):
-                _amp   = np.float64(line.Amp_0)
-                _cen   = np.float64(line.Centroid_0)
-                _sigma = np.float64(line.Sigma_0)
-                _amp_lo  = np.float64(line.Amp_0_lowlim)   if np.isfinite(np.float64(line.Amp_0_lowlim))  else None
-                _amp_hi  = np.float64(line.Amp_0_highlim)  if np.isfinite(np.float64(line.Amp_0_highlim)) else None
-                _cen_lo  = np.float64(line.Centroid_0_lowlim)  if np.isfinite(np.float64(line.Centroid_0_lowlim))  else None
-                _cen_hi  = np.float64(line.Centroid_0_highlim) if np.isfinite(np.float64(line.Centroid_0_highlim)) else None
-                _sig_lo  = np.float64(line.Sigma_0_lowlim)  if np.isfinite(np.float64(line.Sigma_0_lowlim))  else None
-                _sig_hi  = np.float64(line.Sigma_0_highlim) if np.isfinite(np.float64(line.Sigma_0_highlim)) else None
-                if _amp == 0:
-                    _amp = 1e-30
-                params.add(f'amp{j}',   value=_amp,   vary=True, min=_amp_lo,  max=_amp_hi)
-                params.add(f'cen{j}',   value=_cen,   vary=True, min=_cen_lo,  max=_cen_hi)
-                params.add(f'sigma{j}', value=_sigma, vary=True, min=_sig_lo,  max=_sig_hi)
-
-                if df.iloc[j-1]['Rest Wavelength']:
-                    if type(df.iloc[j-1]['Rest Wavelength']) == str:
-                        rest_wavelength = ast.literal_eval(df.iloc[j-1]['Rest Wavelength'])
-                    else:
-                        rest_wavelength = df.iloc[j-1]['Rest Wavelength']
-                else:
-                    rest_wavelength = np.nan
-                if np.isfinite(rest_wavelength) and 'constraints' in df.columns:
-                    df = update_constraints_with_velocity(df, z)
-
-            params.add(f'NR{i + 1}', value=len(region_lines), vary=False)
-
-        Nregions = len(df_cont)
-        Nlines = len(np.unique(df['Line_ID']))
-        add_dataframe_constraints_to_params(df, params)
+        # Shared builder (identical params/model to the cube path — see
+        # _build_fit_params). Reassign df to pick up velocity-tie conversion.
+        params, region_components, Nregions, Nlines, df = _build_fit_params(df, df_cont, z)
         print(f'Nregions={Nregions}, Nlines={Nlines}')
-        # The additive component descriptors (built above, incl. prepared Fe II
-        # templates) are baked into the model so model_function can sum them.
+        # The additive component descriptors (incl. prepared Fe II templates) are
+        # baked into the model so model_function can sum them.
         model_maker = HyperCube_ModelFunctions.PiecewiseModel(
             n_regions=Nregions, n_gaussians=Nlines, region_components=region_components)
         piecewise_model = Model(model_maker.model_function)
@@ -9865,32 +10458,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
     def fit_cube(self, refit=False, rchisq_thresh=None, qual_col=None, qual_op='>',
                  bad_spaxels_override=None):
-        global df, df_fit, fit_results, snr_mask, piecewise_model, line, new_results#,params
+        global df, df_cont, df_fit, fit_results, snr_mask, piecewise_model, line, new_results#,params
         global base_df_cont, base_df, spaxel_overrides, df_stellar
 
-        # Composite continua (multi-component regions, power-law / Fe II, or any
-        # component that differs from the region's legacy flat columns) are only
-        # wired into the interactive single-spaxel fit so far; the parallel worker
-        # builds its model from the legacy flat params and would silently mis-fit
-        # them. Block the cube fit here. (Parallel composite continuum is a
-        # planned follow-up.)
-        if isinstance(df_cont, pd.DataFrame):
-            _composite = False
-            for _, _r in df_cont.iterrows():
-                _cl = _region_components(_r)
-                _ct0 = str(_cl[0].get('type')) if _cl else 'linear'
-                if (len(_cl) != 1 or _ct0 in ('powerlaw', 'feii')
-                        or _ct0 != (str(_r.get('cont_type')) if pd.notna(_r.get('cont_type')) else 'linear')):
-                    _composite = True
-                    break
-            if _composite:
-                from PyQt5.QtWidgets import QMessageBox
-                QMessageBox.warning(
-                    self, 'Fit Cube',
-                    'Cube fitting of composite / power-law / Fe II continuum regions '
-                    'is not supported yet — use "Fit Spaxel" for these. Reduce regions '
-                    'to a single legacy continuum type to run a cube fit.')
-                return
+        # Composite continua (multi-component regions, power-law / Fe II, stellar
+        # components) are now cube-fit through the SAME shared builder as the
+        # interactive fit (_build_fit_params) — the workers rebuild the composite
+        # PiecewiseModel from region_components threaded through ctx. No guard.
 
         # A fresh cube fit (re)defines the locked schema template that all
         # per-spaxel overrides must conform to, and invalidates old overrides.
@@ -9931,132 +10505,30 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         else:
             z = df_obs['redshift'].item()
     
-        # Model parameters
-        params = Parameters()
-        
-        # Sort continuum regions by x1 (start wavelength)
-        df_cont_sort = df_cont.sort_values(by='x1').reset_index(drop=True)
-        
-        # Ensure lines are sorted by Centroid_0 within each region
-        df_sort = df.sort_values(by=['region_ID', 'Centroid_0']).reset_index(drop=True)
-    
-        # Loop through each continuum region and add parameters
-        for i, row in df_cont.iterrows():
-            region_id = row['region_ID']
-    
-            # Set x-limits for each region (fixed)
-            params.add(f'x{i + 1}_start', value=row['x1'], vary=False)
-            params.add(f'x{i + 1}_end', value=row['x2'], vary=False)
+        # Type 1 AGN: cube-fit on the resolved/unresolved VIEW. For any region
+        # with a LOCKED bundle, _apply_type1_substitution swaps its flagged
+        # unresolved components + broad lines for the single frozen type1_agn
+        # bundle (one free agn_amp/spaxel). Non-destructive — we rebind the
+        # globals to the view only for the fit and restore the raw df/df_cont
+        # afterward (below), so overlays / editing / re-fitting see the full data.
+        # No-op (view is the raw frames) when nothing is locked.
+        _type1_raw_df, _type1_raw_dfc = df, df_cont
+        df, df_cont = _apply_type1_substitution(df, df_cont)
+        _type1_swapped = (df is not _type1_raw_df) or (df_cont is not _type1_raw_dfc)
+        # Frozen AGN bundle (agn_amp=1) fed to every per-spaxel host fit as a pPXF
+        # `sky` so the host is jointly deblended from the AGN (see _fit_cube_parallel).
+        _agn_sky = _total_locked_bundle(df_cont, wavelengths) if _type1_swapped else None
 
-            # Continuum: poly (Chebyshev coeffs free), spline (knot-Y free), or
-            # linear (slope/intercept free).
-            _ctype = str(row['cont_type']) if ('cont_type' in df_cont.columns
-                                               and pd.notna(row['cont_type'])) else 'linear'
-            _kx = _as_float_list(row['knots_x']) if 'knots_x' in df_cont.columns else []
-            _ky = _as_float_list(row['knots_y_0']) if 'knots_y_0' in df_cont.columns else []
-            _pc = _as_float_list(row['poly_coef_0']) if 'poly_coef_0' in df_cont.columns else []
-            is_poly = (_ctype == 'poly' and len(_pc) >= 1)
-            is_spline = (_ctype == 'spline' and len(_kx) >= 2 and len(_kx) == len(_ky))
-
-            # Linear continuum parameters (also added for spline/poly regions so
-            # the existing result-extraction code finds them; held fixed & unused
-            # by the model when this region is a spline or polynomial).
-            slope = row['Slope_0'] if np.isfinite(row['Slope_0']) else 0
-            intercept = row['Intercept_0'] if np.isfinite(row['Intercept_0']) else 0
-
-            params.add(f'slope{i + 1}', value=slope, vary=not (is_spline or is_poly))
-            params.add(f'intercept{i + 1}', value=intercept, vary=not (is_spline or is_poly))
-
-            if is_poly:
-                # NP signals the model to use a Chebyshev polynomial for this
-                # region; the coefficients are free, seeded from the initial fit.
-                params.add(f'NP{i + 1}', value=len(_pc), vary=False)
-                for j in range(len(_pc)):
-                    params.add(f'polyc{i + 1}_{j}', value=float(_pc[j]), vary=True)
-            else:
-                params.add(f'NP{i + 1}', value=0, vary=False)
-
-            if is_spline:
-                # Knot count (signals the model to use a spline for this region),
-                # fixed knot-x, and free knot-y seeded from the user's clicks.
-                # Bound each knot-y to init ± 0.5·(peak-to-peak of the knots) to
-                # curb the spline from absorbing emission lines.
-                ptp = (max(_ky) - min(_ky)) if len(_ky) > 1 else 0.0
-                _delta = 0.5 * ptp if ptp > 0 else max(abs(np.mean(_ky)), 1.0)
-                params.add(f'NK{i + 1}', value=len(_kx), vary=False)
-                for k in range(len(_kx)):
-                    params.add(f'knotx{i + 1}_{k}', value=float(_kx[k]), vary=False)
-                    params.add(f'knoty{i + 1}_{k}', value=float(_ky[k]), vary=True,
-                               min=float(_ky[k]) - _delta, max=float(_ky[k]) + _delta)
-            else:
-                params.add(f'NK{i + 1}', value=0, vary=False)
-
-            # Add parameters for the linear region between this and the next region
-            if i < len(df_cont) - 1:
-                next_row = df_cont.iloc[i + 1]
-                params.add(f'x_int_{i + 1}_start', value=row['x2'], vary=False)
-                params.add(f'x_int_{i + 1}_end', value=next_row['x1'], vary=False)
-    
-                params.add(f'slope_int_{i + 1}', value=slope, vary=True)
-                params.add(f'intercept_int_{i + 1}', value=intercept, vary=True)
-    
-            # Extract Gaussians associated with this region
-            region_lines = df[df['region_ID'] == region_id]
-    
-            # Add Gaussian parameters for this region
-            for j, line in enumerate(df.itertuples(), start=1):
-                # Cast all parameter values to float64 explicitly.
-                # After pd.concat operations, columns can be object dtype;
-                # lmfit silently misbehaves when given non-float initial values.
-                _amp   = np.float64(line.Amp_0)
-                _cen   = np.float64(line.Centroid_0)
-                _sigma = np.float64(line.Sigma_0)
-                _amp_lo  = np.float64(line.Amp_0_lowlim)   if np.isfinite(np.float64(line.Amp_0_lowlim))  else None
-                _amp_hi  = np.float64(line.Amp_0_highlim)  if np.isfinite(np.float64(line.Amp_0_highlim)) else None
-                _cen_lo  = np.float64(line.Centroid_0_lowlim)  if np.isfinite(np.float64(line.Centroid_0_lowlim))  else None
-                _cen_hi  = np.float64(line.Centroid_0_highlim) if np.isfinite(np.float64(line.Centroid_0_highlim)) else None
-                _sig_lo  = np.float64(line.Sigma_0_lowlim)  if np.isfinite(np.float64(line.Sigma_0_lowlim))  else None
-                _sig_hi  = np.float64(line.Sigma_0_highlim) if np.isfinite(np.float64(line.Sigma_0_highlim)) else None
-                # Guard: if initial value is exactly 0, use a small non-zero starting point
-                # so the optimizer has something to scale against
-                if _amp == 0:
-                    _amp = 1e-30
-                params.add(f'amp{j}',   value=_amp,   vary=True, min=_amp_lo,  max=_amp_hi)
-                params.add(f'cen{j}',   value=_cen,   vary=True, min=_cen_lo,  max=_cen_hi)
-                params.add(f'sigma{j}', value=_sigma, vary=True, min=_sig_lo,  max=_sig_hi)
-                
-                
-                # Add velocity parameter for this line
-                if df.iloc[j-1]['Rest Wavelength']:
-                    if type(df.iloc[j-1]['Rest Wavelength']) == str:
-                        rest_wavelength = ast.literal_eval(df.iloc[j-1]['Rest Wavelength'])
-                    else:
-                        rest_wavelength = df.iloc[j-1]['Rest Wavelength']
-                    
-                else:
-                    rest_wavelength = np.nan
-                
-                if (np.isfinite(rest_wavelength)) & ('constraints' in df.columns):
-                    # Update constraints in df
-                    df = update_constraints_with_velocity(df, z)
-    
-            # Add a "fake" parameter to store the number of Gaussians in this region
-            params.add(f'NR{i + 1}', value=len(region_lines), vary=False)
-    
-        # choose the model based on parameters
-        Nregions = len(df_cont)
-        Nlines = len(np.unique(df['Line_ID']))
-        
-        # parameter constraints 
-        add_dataframe_constraints_to_params(df, params)
-    
-        # print("\nParameters with Constraints:")
-        # params.pretty_print()
+        # Model parameters — SAME shared builder as the interactive path, so a
+        # composite continuum cube-fits identically to a single-spaxel fit. The
+        # region_components (incl. prepared Fe II payloads) are threaded to the
+        # workers below and used to build their PiecewiseModel.
+        params, region_components, Nregions, Nlines, df = _build_fit_params(df, df_cont, z)
         print(f'Nregions={Nregions}, Nlines={Nlines}')
-        model_maker = HyperCube_ModelFunctions.PiecewiseModel(n_regions=Nregions, n_gaussians=Nlines)
+        model_maker = HyperCube_ModelFunctions.PiecewiseModel(
+            n_regions=Nregions, n_gaussians=Nlines, region_components=region_components)
         piecewise_model = Model(model_maker.model_function)
-        # piecewise_model = Model(HyperCube_ModelFunctions.model_chooser(Nregions, Nlines))
-        
+
         # Save the spaxel the user has locked before the loop mutates current_spaxel
         _locked_spaxel = self.viewer_window.current_spaxel
 
@@ -10214,8 +10686,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             # region is fit per spaxel in the same pass (kinematics → V/σ maps;
             # baseline subtracted before the line fit).
             self._fit_cancelled = False
-            _has_stellar = ('cont_type' in df_cont.columns and
-                            bool((df_cont['cont_type'] == 'stellar').any()))
+            _has_stellar = bool(_stellar_specs_from_components(df_cont))
             gated = [(i, j) for i in range(nx) for j in range(ny)
                      if snr_map[j, i] >= snr_value]
             total = max(len(gated), 1)
@@ -10228,7 +10699,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 try:
                     _stellar_rows = self._fit_cube_parallel(
                         gated, params, z, Nregions, Nlines, n_workers,
-                        progress_bar, status_label, total)
+                        progress_bar, status_label, total,
+                        region_components=region_components,
+                        agn_sky=_agn_sky)
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
@@ -10245,7 +10718,14 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 df_stellar = pd.DataFrame(_stellar_rows)
             # After fitting, create the results dataframe
             df_fit = pd.DataFrame(fit_results)
-        
+
+        # Type 1: restore the raw (un-substituted) df/df_cont now the fit is done.
+        # The per-spaxel overlay below reads fitted components from df_fit (which
+        # already hold the fitted type1_agn/agn_amp), so it renders correctly on
+        # the raw frames; editing / re-fitting again see the full component list.
+        if _type1_swapped:
+            df, df_cont = _type1_raw_df, _type1_raw_dfc
+
         # Clean up the dataframe
         if 'fit_success' in df_fit.columns:
             # Handle failed fits
@@ -11630,6 +12110,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         global df
         if 'kgroup' not in df.columns:
             df['kgroup'] = ['' for _ in range(len(df))]
+        # kgroup holds label strings ('K1', ''); a reindex can leave the column
+        # float64 (NaN), into which a string assignment warns (and will error in
+        # future pandas). Ensure object dtype first.
+        if df['kgroup'].dtype != object:
+            df['kgroup'] = df['kgroup'].astype(object)
         df.loc[df['Line_Name'] == line_name, 'kgroup'] = group
         if not group:
             # A line just removed from its group is no longer rebuilt by the

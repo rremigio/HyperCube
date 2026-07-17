@@ -87,13 +87,18 @@ def sum_gaussians(x, params, num_gaussians):
 # k (0-based) -> c{r}_{k}_<sub>  (vectors: c{r}_{k}_polyc_{j} / c{r}_{k}_knoty_{i},
 # fixed knot abscissae c{r}_{k}_knotx_{i}).
 
-COMPONENT_TYPES = ('linear', 'poly', 'spline', 'powerlaw', 'feii', 'stellar')
+COMPONENT_TYPES = ('linear', 'poly', 'spline', 'powerlaw', 'feii', 'stellar',
+                   'type1_agn')
 
 # Types evaluated INSIDE the joint lmfit model. 'stellar' is currently
 # pre-subtracted (in_model=False); flipping it True (+ a scale param + a stellar
 # branch in eval_component) folds it into the joint fit later.
+# 'type1_agn' = a FROZEN unresolved AGN bundle (power law + Fe II + BLR lines)
+# whose SHAPE was locked at a nucleus spaxel; the only free param is one overall
+# amplitude agn_amp that traces the PSF across the cube. Its payload is the frozen
+# bundle spectrum (wl, flux) in physical units; see eval_component.
 _IN_MODEL = {'linear': True, 'poly': True, 'spline': True,
-             'powerlaw': True, 'feii': True, 'stellar': False}
+             'powerlaw': True, 'feii': True, 'stellar': False, 'type1_agn': True}
 
 # Scalar sub-parameters per type: (subname, default, min, max). poly/spline carry
 # variable-length vectors instead (handled explicitly).
@@ -102,13 +107,16 @@ _SCALAR_SUBPARAMS = {
     'powerlaw': [('pl_amp', 1.0, None, None), ('pl_slope', -1.5, None, None)],
     'feii':     [('feii_amp', 1.0, 0.0, None), ('feii_v', 0.0, -3000.0, 3000.0),
                  ('feii_sigma', 2000.0, 100.0, 10000.0)],
+    'type1_agn': [('agn_amp', 1.0, 0.0, None)],
     'poly': [], 'spline': [], 'stellar': [],
 }
 
 # Sub-parameter bases whose values scale with the spectrum flux. For a linear
 # component y = slope*x + intercept, y is flux and x is wavelength (fixed), so
-# BOTH slope and intercept scale. pl_slope / feii_v / feii_sigma do NOT.
-FLUX_SCALED = {'slope', 'intercept', 'pl_amp', 'feii_amp', 'polyc', 'knoty'}
+# BOTH slope and intercept scale. pl_slope / feii_v / feii_sigma do NOT. agn_amp
+# multiplies a physical-unit frozen bundle, so it scales with flux too (init 1.0
+# at the nucleus -> recovers to ~1.0 there under the scaled fit).
+FLUX_SCALED = {'slope', 'intercept', 'pl_amp', 'feii_amp', 'polyc', 'knoty', 'agn_amp'}
 
 _CPARAM_RE = re.compile(r'^c\d+_\d+_(.+)$')
 
@@ -190,8 +198,12 @@ def legacy_to_component(cont_type, row):
                 'feii_v_fit': _cf(g('feii_v_fit')), 'feii_sigma_fit': _cf(g('feii_sigma_fit'))}
     if ct == 'stellar':
         mom = _cf(g('stellar_moments'))
+        _md = _cf(g('stellar_mdegree'))
+        _dg = _cf(g('stellar_degree'))
         comp = {'type': 'stellar', 'stellar_library': str(g('stellar_library', '') or ''),
-                'stellar_moments': int(mom) if np.isfinite(mom) else 2}
+                'stellar_moments': int(mom) if np.isfinite(mom) else 2,
+                'stellar_mdegree': int(_md) if np.isfinite(_md) else 10,
+                'stellar_degree': int(_dg) if np.isfinite(_dg) else -1}
         for f in ('stellar_V', 'stellar_sigma', 'stellar_h3', 'stellar_h4', 'stellar_scale'):
             comp[f + '_0'] = _cf(g(f + '_0'))
             comp[f + '_fit'] = _cf(g(f + '_fit'))
@@ -277,6 +289,14 @@ def eval_component(desc, x, x1, x2, kwargs, r, k):
             return np.zeros_like(x)
         return tmpl.eval(x, kwargs[pfx + 'feii_amp'], kwargs[pfx + 'feii_v'],
                          kwargs[pfx + 'feii_sigma'])
+    if t == 'type1_agn':
+        # Frozen unresolved bundle: payload = (wl_bundle, flux_bundle) in physical
+        # units (agn_amp=1 == the nucleus). Only the overall amplitude varies.
+        payload = desc.get('payload')
+        if payload is None:
+            return np.zeros_like(x)
+        wl_b, fl_b = payload
+        return kwargs[pfx + 'agn_amp'] * np.interp(x, wl_b, fl_b)
     return np.zeros_like(x)
 
 
@@ -304,6 +324,10 @@ def component_fit_from_params(comp, r, k, result_params, flux_scale):
         out['feii_amp_fit'] = result_params[pfx + 'feii_amp'].value * flux_scale
         out['feii_v_fit'] = result_params[pfx + 'feii_v'].value
         out['feii_sigma_fit'] = result_params[pfx + 'feii_sigma'].value
+    elif t == 'type1_agn':
+        # agn_amp is dimensionless (=1 at the nucleus) but multiplies a physical
+        # bundle, so it is flux-scaled like an amplitude.
+        out['agn_amp_fit'] = result_params[pfx + 'agn_amp'].value * flux_scale
     return out
 
 

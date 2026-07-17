@@ -377,7 +377,7 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
 
 
 # ── stellar (pPXF) per-spaxel fit: kinematics + baseline only ────────────────
-def fit_stellar_one(spectrum, wavelengths, z, R, prep):
+def fit_stellar_one(spectrum, wavelengths, z, R, prep, agn_sky=None):
     """Run pPXF for one spaxel/region. Returns (kin, baseline):
       kin      : {'region_ID','V','sigma','h3','h4','scale','chi2'} or None on failure
       baseline : the stellar continuum over `wavelengths` to subtract (zeros on failure)
@@ -391,8 +391,9 @@ def fit_stellar_one(spectrum, wavelengths, z, R, prep):
         res = hcppxf.fit_stellar(
             flux, wavelengths, z, R, prep['lib'],
             fit_range=prep['fit_range'], mask_centroids=prep['mask'],
-            moments=prep['moments'], degree=-1, mdegree=10,
-            sigma_guess=150.0, velscale=prep['velscale'])
+            moments=prep['moments'], degree=prep.get('degree', -1),
+            mdegree=prep.get('mdegree', 10),
+            sigma_guess=150.0, velscale=prep['velscale'], agn_sky=agn_sky)
     except Exception:
         return None, np.zeros_like(lam)
 
@@ -431,7 +432,11 @@ def _worker_init(ctx):
 
     params = Parameters()
     params.loads(ctx['params_dumps'])
-    model = build_model(ctx['n_regions'], ctx['n_lines'])
+    # Rebuild the SAME composite model the main process used — region_components
+    # carries each region's in-model component descriptors (incl. prepared Fe II
+    # payloads). Falls back to the legacy flat model when absent (empty dict).
+    model = build_model(ctx['n_regions'], ctx['n_lines'],
+                        region_components=ctx.get('region_components') or None)
 
     # Prepare a stellar template library per region spec (once per worker).
     preps = []
@@ -444,6 +449,8 @@ def _worker_init(ctx):
                 lib.prepare(velscale, R, lam_rest)
                 preps.append(dict(rid=spec['rid'], lib=lib, velscale=velscale,
                                   mask=ctx['stellar_mask'], moments=spec['moments'],
+                                  mdegree=spec.get('mdegree', 10),
+                                  degree=spec.get('degree', -1),
                                   fit_range=spec['fit_range'], library=spec['library']))
             except Exception as e:
                 print(f"worker stellar prep failed ({spec.get('library')}): {e}")
@@ -451,7 +458,7 @@ def _worker_init(ctx):
     _W.update(shm=shm, cube=cube, params=params, model=model, df=ctx['df'],
               df_cont=ctx['df_cont'], wavelengths=ctx['wavelengths'], z=ctx['z'],
               R=ctx['R'], sequential=ctx['sequential'], max_nfev=ctx['max_nfev'],
-              preps=preps)
+              preps=preps, agn_sky=ctx.get('agn_sky'))
 
 
 def _worker_fit_one(task):
@@ -460,11 +467,13 @@ def _worker_fit_one(task):
     i, j, ra, dec = task
     wl = _W['wavelengths']
     flux = np.nan_to_num(_W['cube'][:, j, i].astype(float))
+    # Frozen AGN bundle -> pPXF sky so the host fit is deblended from the AGN.
+    agn_sky = _W.get('agn_sky')
 
     stellar_baseline = np.zeros_like(wl, dtype=float)
     stellar_kin, stellar_rows = {}, []
     for prep in _W['preps']:
-        kin, base = fit_stellar_one(flux, wl, _W['z'], _W['R'], prep)
+        kin, base = fit_stellar_one(flux, wl, _W['z'], _W['R'], prep, agn_sky=agn_sky)
         if kin is not None:
             stellar_baseline = stellar_baseline + base
             stellar_kin[kin['region_ID']] = kin
