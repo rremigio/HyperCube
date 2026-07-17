@@ -220,6 +220,27 @@ def _region_bundle(row):
     return b if (isinstance(b, dict) and str(b.get('type')) == 'type1_agn') else None
 
 
+def _total_locked_bundle(df_cont, wl):
+    """Summed frozen Type 1 AGN bundle (at agn_amp=1) over `wl`, or None if no
+    region is locked. Passed to every per-spaxel host (pPXF) fit as an additive
+    `sky` component so the host is deblended from the AGN instead of absorbing it."""
+    if not isinstance(df_cont, pd.DataFrame) or 'type1_bundle' not in df_cont.columns:
+        return None
+    lam = np.asarray(wl, float)
+    total = np.zeros_like(lam)
+    found = False
+    for _, r in df_cont.iterrows():
+        b = _region_bundle(r)
+        if b is None:
+            continue
+        wl_b = HyperCube_ModelFunctions.as_float_list(b.get('bundle_wl'))
+        fl_b = HyperCube_ModelFunctions.as_float_list(b.get('bundle_flux'))
+        if len(wl_b) >= 2 and len(wl_b) == len(fl_b):
+            total = total + np.interp(lam, wl_b, fl_b)
+            found = True
+    return total if found else None
+
+
 def _apply_type1_substitution(df, df_cont):
     """Cube-fit VIEW of (df, df_cont) for the Type 1 resolved/unresolved split.
     Non-destructive: inputs are untouched; new frames are returned.
@@ -5606,10 +5627,13 @@ class ViewerWindow(QMainWindow):
             lib.prepare(velscale, R, lam_rest)
             mask = (df['Centroid_0'].astype(float).to_numpy()
                     if len(df) > 0 and 'Centroid_0' in df.columns else ())
+            # Deblend the rendered host from any locked AGN bundle (pPXF sky), so
+            # the overlay host matches the cube fit instead of absorbing the AGN.
+            _agn_sky = _total_locked_bundle(df_cont, wavelengths)
             res = hcppxf.fit_stellar(spectrum, wavelengths, z, R, lib,
                                      fit_range=fit_range, mask_centroids=mask,
                                      moments=moments, degree=degree, mdegree=mdegree,
-                                     sigma_guess=150.0, velscale=velscale)
+                                     sigma_guess=150.0, velscale=velscale, agn_sky=_agn_sky)
             STELLAR_CACHE[key] = res['cache']
         except Exception as e:
             print(f"lazy stellar cache failed for ({x},{y},{rid}): {e}")
@@ -9868,7 +9892,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         return _stellar_rows
 
     def _fit_cube_parallel(self, gated, params, z, n_regions, n_lines, n_workers,
-                           progress_bar, status_label, total, region_components=None):
+                           progress_bar, status_label, total, region_components=None,
+                           agn_sky=None):
         """Fit `gated` spaxels across `n_workers` processes. Line rows are
         appended to the global fit_results; returns the stellar-kinematics rows.
 
@@ -9918,7 +9943,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 max_nfev=512, stellar_specs=stellar_specs, stellar_mask=stellar_mask,
                 # Composite continuum descriptors (incl. prepared Fe II payloads)
                 # so workers rebuild the SAME PiecewiseModel as the main process.
-                region_components=(region_components or {}))
+                region_components=(region_components or {}),
+                # Frozen AGN bundle (agn_amp=1) -> pPXF `sky` in each worker's host
+                # fit, so the host is jointly deblended from the AGN. None = off.
+                agn_sky=(None if agn_sky is None else np.asarray(agn_sky, float)))
 
             # Precompute RA/Dec for all gated spaxels (keeps WCS out of workers).
             xs = np.array([ij[0] for ij in gated])
@@ -10020,13 +10048,15 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         global STELLAR_CACHE
         vw = self.viewer_window
         flux = np.nan_to_num(vw.get_spectrum_at_spaxel(i, j))
+        # Joint host/AGN deblend: feed any locked bundle to pPXF as a sky component.
+        _agn_sky = _total_locked_bundle(df_cont, wavelengths)
         try:
             res = hcppxf.fit_stellar(
                 flux, wavelengths, prep['z'], prep['R'], prep['lib'],
                 fit_range=prep['fit_range'], mask_centroids=prep['mask'],
                 moments=prep['moments'], degree=prep.get('degree', -1),
                 mdegree=prep.get('mdegree', 10),
-                sigma_guess=150.0, velscale=prep['velscale'])
+                sigma_guess=150.0, velscale=prep['velscale'], agn_sky=_agn_sky)
         except Exception:
             return None
         STELLAR_CACHE[(i, j, int(prep['rid']))] = res['cache']
@@ -10441,6 +10471,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         _type1_raw_df, _type1_raw_dfc = df, df_cont
         df, df_cont = _apply_type1_substitution(df, df_cont)
         _type1_swapped = (df is not _type1_raw_df) or (df_cont is not _type1_raw_dfc)
+        # Frozen AGN bundle (agn_amp=1) fed to every per-spaxel host fit as a pPXF
+        # `sky` so the host is jointly deblended from the AGN (see _fit_cube_parallel).
+        _agn_sky = _total_locked_bundle(df_cont, wavelengths) if _type1_swapped else None
 
         # Model parameters — SAME shared builder as the interactive path, so a
         # composite continuum cube-fits identically to a single-spaxel fit. The
@@ -10623,7 +10656,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     _stellar_rows = self._fit_cube_parallel(
                         gated, params, z, Nregions, Nlines, n_workers,
                         progress_bar, status_label, total,
-                        region_components=region_components)
+                        region_components=region_components,
+                        agn_sky=_agn_sky)
                 except Exception as e:
                     import traceback
                     traceback.print_exc()

@@ -236,7 +236,7 @@ def _goodpixels(ln_lam_gal, ln_lam_temp, mask_centroids, z, mask_dv=500.0):
 
 def fit_stellar(flux, wavelengths, z, R, library, *, fit_range,
                 mask_centroids=(), moments=2, degree=-1, mdegree=10,
-                sigma_guess=150.0, velscale=None):
+                sigma_guess=150.0, velscale=None, agn_sky=None):
     """Run pPXF on one spaxel.
 
     flux         : 1D galaxy spectrum (cube units), same length as wavelengths
@@ -245,6 +245,12 @@ def fit_stellar(flux, wavelengths, z, R, library, *, fit_range,
     library      : a prepared TemplateLibrary (call .prepare(velscale,...) first)
     fit_range    : (λ1, λ2) in OBSERVED wavelength
     mask_centroids : observed-frame emission-line centroids to mask
+    agn_sky      : optional frozen Type 1 AGN bundle (observed-frame, same length
+                   as wavelengths, at agn_amp=1). Passed to pPXF as an additive
+                   `sky` component so the host templates + AGN are fit JOINTLY
+                   (the host can't absorb the AGN continuum). It is EXCLUDED from
+                   the returned host baseline (temp_opt), so the caller's agn_amp
+                   fit still recovers the AGN.
     Returns a dict: V, sigma, h3, h4, scale, chi2, success, cache, bestfit.
     """
     flux = np.nan_to_num(np.asarray(flux, float))
@@ -262,20 +268,39 @@ def fit_stellar(flux, wavelengths, z, R, library, *, fit_range,
     galaxy = galaxy / norm
     noise = np.full_like(galaxy, _mad_noise(galaxy))
 
+    # Frozen AGN bundle as a pPXF additive sky component (same log grid + norm).
+    sky = None
+    if agn_sky is not None:
+        try:
+            agn_f = np.nan_to_num(np.asarray(agn_sky, float))[sel]
+            sky_log, _, _ = util.log_rebin([lam_f[0], lam_f[-1]], agn_f, velscale=velscale)
+            sky = np.asarray(sky_log, float) / norm
+            if sky.shape[0] != galaxy.shape[0]:      # length safeguard
+                sky = np.interp(np.linspace(0.0, 1.0, galaxy.shape[0]),
+                                np.linspace(0.0, 1.0, sky.shape[0]), sky)
+        except Exception:
+            sky = None
+
     templates = library.templates
     ln_lam_temp = library.ln_lam_temp
     good = _goodpixels(ln_lam_gal, ln_lam_temp, mask_centroids, z)
 
     pp = ppxf(templates, galaxy, noise, velscale, [0.0, float(sigma_guess)],
               goodpixels=good, moments=moments, degree=degree, mdegree=mdegree,
-              lam=np.exp(ln_lam_gal), lam_temp=np.exp(ln_lam_temp), quiet=True)
+              lam=np.exp(ln_lam_gal), lam_temp=np.exp(ln_lam_temp), quiet=True,
+              sky=sky)
 
     sol = list(np.atleast_1d(pp.sol)) + [0.0, 0.0, 0.0, 0.0]
     V, sigma = float(sol[0]), float(sol[1])
     h3 = float(sol[2]) if moments >= 3 else 0.0
     h4 = float(sol[3]) if moments >= 4 else 0.0
 
-    temp_opt = templates @ pp.weights
+    # When a `sky` component is supplied, pp.weights is [template weights, sky
+    # weights] concatenated. Use ONLY the template weights so the host optimal
+    # template (temp_opt) EXCLUDES the AGN bundle — the whole point of the joint
+    # deblend: the host baseline is stellar-only, the AGN stays in the residual.
+    n_temp = templates.shape[1]
+    temp_opt = templates @ pp.weights[:n_temp]
     mpoly = pp.mpoly if (mdegree > 0 and getattr(pp, 'mpoly', None) is not None) \
         else np.ones_like(galaxy)
     mpoly_temp = np.interp(ln_lam_temp, ln_lam_gal, mpoly,
