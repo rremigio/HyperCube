@@ -7456,6 +7456,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         _t1menu.addAction('Mark Unresolved Features…', self.open_type1_unresolved_dialog)
         _t1menu.addAction('Lock Nucleus', self.lock_type1_nucleus)
         _t1menu.addAction('Unlock (clear bundle)', self.unlock_type1_nucleus)
+        _t1menu.addSeparator()
+        _t1menu.addAction('AGN Amplitude Map', self.agn_amp_map)
         self.type1_button.setMenu(_t1menu)
 
         self.fit_spaxel_button.clicked.connect(self.fit_single_spaxel)
@@ -10144,6 +10146,48 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             b = self.buttons_dict.get((rid, 'stellar~smap'))
             if b is not None:
                 b.setText(_fmt(cur_sig))
+
+    def agn_amp_map(self):
+        """Display the per-spaxel Type 1 AGN amplitude (agn_amp_fit) as a cube map —
+        the empirical PSF of the unresolved AGN. Read from each spaxel's fitted
+        type1_agn component in df_fit. Useful to sanity-check the PSF falloff and
+        spot spaxels whose amplitude looks off (candidates for a re-fit)."""
+        from PyQt5.QtWidgets import QMessageBox
+        if not (isinstance(df_fit, pd.DataFrame) and len(df_fit)
+                and 'spaxel_x' in df_fit.columns):
+            QMessageBox.information(self, 'AGN Amplitude Map',
+                'Run "Fit Cube" with a locked Type 1 bundle first.')
+            return
+        ny, nx = FITS_DATA.shape[1], FITS_DATA.shape[2]
+        arr = np.full((ny, nx), np.nan)
+        seen, found = set(), False
+        for _, row in df_fit.iterrows():
+            try:
+                x, y = int(row['spaxel_x']), int(row['spaxel_y'])
+            except (TypeError, ValueError):
+                continue
+            if (x, y) in seen:
+                continue
+            seen.add((x, y))
+            amp = np.nan
+            for key, val in row.items():
+                if not (isinstance(key, str) and key.endswith('_components')):
+                    continue
+                for c in HyperCube_ModelFunctions.coerce_components(val):
+                    if str(c.get('type')) == 'type1_agn':
+                        amp = _safe_float(c.get('agn_amp_fit'))
+                        break
+                if np.isfinite(amp):
+                    break
+            if np.isfinite(amp):
+                arr[y, x] = amp
+                found = True
+        if not found:
+            QMessageBox.information(self, 'AGN Amplitude Map',
+                'No Type 1 AGN amplitude found. Lock a nucleus (Type 1 AGN → Lock '
+                'Nucleus) and run "Fit Cube" first.')
+            return
+        self.viewer_window.draw_image(arr, cmap='plasma', scale='linear', from_fits=False)
 
     def _stellar_map(self, col, rid=None):
         """Display a per-spaxel stellar map (e.g. stellar_V / stellar_sigma) for
