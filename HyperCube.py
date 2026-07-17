@@ -241,6 +241,24 @@ def _total_locked_bundle(df_cont, wl):
     return total if found else None
 
 
+def _current_is_type1_nucleus(df_cont, cx, cy):
+    """True if spaxel (cx, cy) is the locked nucleus of any Type 1 bundle. The
+    nucleus keeps the FREE single-spaxel fit (all AGN components vary) so it can
+    be refined and re-locked; every other spaxel re-fits against the frozen
+    bundle. Unlock to force a free fit anywhere."""
+    if not isinstance(df_cont, pd.DataFrame) or 'type1_bundle' not in df_cont.columns:
+        return False
+    for _, r in df_cont.iterrows():
+        b = _region_bundle(r)
+        ns = b.get('nucleus_spaxel') if b else None
+        try:
+            if ns is not None and int(ns[0]) == int(cx) and int(ns[1]) == int(cy):
+                return True
+        except (TypeError, ValueError, IndexError):
+            continue
+    return False
+
+
 def _apply_type1_substitution(df, df_cont):
     """Cube-fit VIEW of (df, df_cont) for the Type 1 resolved/unresolved split.
     Non-destructive: inputs are untouched; new frames are returned.
@@ -10381,6 +10399,24 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         else:
             z = df_obs['redshift'].item()
 
+        # Type 1 AGN: on a spaxel OTHER than the locked nucleus, re-fit against the
+        # FROZEN AGN bundle (scale agn_amp; host + narrow lines free) instead of
+        # re-fitting the power law / Fe II / broad lines. The nucleus keeps the free
+        # fit so it can be refined and re-locked; Unlock forces a free fit anywhere.
+        # No-op (raw frames) when nothing is locked. Mirrors the cube path.
+        vw = self.viewer_window
+        cx, cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
+        _t1_raw_df, _t1_raw_dfc = df, df_cont
+        if not _current_is_type1_nucleus(df_cont, cx, cy):
+            df, df_cont = _apply_type1_substitution(df, df_cont)
+        _t1_swapped = (df is not _t1_raw_df) or (df_cont is not _t1_raw_dfc)
+        if _t1_swapped:
+            # Force a fresh (AGN-deblended) host fit for this spaxel rather than a
+            # possibly stale/non-deblended cached one.
+            for _k in [k for k in list(STELLAR_CACHE)
+                       if isinstance(k, tuple) and len(k) == 3 and k[0] == cx and k[1] == cy]:
+                STELLAR_CACHE.pop(_k, None)
+
         # Shared builder (identical params/model to the cube path — see
         # _build_fit_params). Reassign df to pick up velocity-tie conversion.
         params, region_components, Nregions, Nlines, df = _build_fit_params(df, df_cont, z)
@@ -10393,6 +10429,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         fit_results = []
         self.fit_spaxel(z, params_to_use=params)
+
+        # Restore the raw (un-substituted) df/df_cont now the fit is done. The
+        # overlay reads fitted components from df_fit (which already hold the frozen
+        # AGN + agn_amp), so it renders correctly on the raw frames; editing /
+        # re-fitting again see the full component list.
+        if _t1_swapped:
+            df, df_cont = _t1_raw_df, _t1_raw_dfc
 
         new_df = pd.DataFrame(fit_results)
         if len(new_df) == 0 or 'LineID' not in new_df.columns:
